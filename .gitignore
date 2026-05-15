@@ -1,0 +1,23 @@
+# Bot config (contains secrets)
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Logs
+logs/*.log
+
+# Screenshots (generated at runtime)
+screenshots/errors/*.png
+
+# OpenCV template images (large, binary)
+templates/
+
+# OS
+.DS_Store
+Thumbs.db
