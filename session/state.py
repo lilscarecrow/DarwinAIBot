@@ -19,7 +19,7 @@ VALID_COMMANDS: dict[BotState, list[str]] = {
     BotState.IDLE:              ["launch", "status", "end"],
     BotState.LAUNCHING:         ["status", "end"],
     BotState.IN_MENU:           ["deck", "custom", "status", "end"],
-    BotState.IN_CUSTOM:         ["start", "status", "end"],
+    BotState.IN_CUSTOM:         ["start", "menu", "status", "end"],
     BotState.MATCH_IN_PROGRESS: ["status", "end"],
     BotState.MATCH_ENDED:       ["status", "end"],
 }

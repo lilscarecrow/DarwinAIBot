@@ -39,7 +39,7 @@ DarwinAIBot/
 ├── requirements.txt
 ├── CLAUDE.md
 ├── bot/
-│   └── discord_bot.py          # DarwinBot + DirectorCog (all 6 slash commands)
+│   └── discord_bot.py          # DarwinBot + DirectorCog (all slash commands)
 ├── game/
 │   ├── launcher.py             # Launch game process, monitor for crashes
 │   ├── screen_detection.py     # OpenCV template matching, pixel sampling, screenshots
@@ -87,10 +87,13 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 |---|---|---|
 | `/launch` | IDLE | Launch game, poll for menu screen |
 | `/deck [cards]` | IN_MENU | Check/swap Director deck |
-| `/custom` | IN_MENU | Create private match, return lobby code |
+| `/custom <region>` | IN_MENU | Set region (NA/EU), create private match, return lobby code |
 | `/start` | IN_CUSTOM | Start match, responds with results when done |
+| `/menu` | IN_CUSTOM | Navigate back to main menu from any screen in the custom flow |
 | `/status` | Any | Current state + last/next action |
 | `/end [confirm]` | Any | Force close game; requires `confirm:True` if match in progress |
+
+All responses use `discord.Embed` with color-coded status (green=ok, red=fail, blue=active, orange=in-match, gray=neutral). State is shown in every embed footer.
 
 ### Match Runner (`game/match_runner.py`)
 
@@ -118,15 +121,127 @@ Zone strategy is pluggable via `config.json → zone_selection_strategy`. Adding
 
 ### Screen Detection (`game/screen_detection.py`)
 
-- `find_template()` — OpenCV normalized cross-correlation, returns center coords or None
-- `wait_for_template()` — polling wrapper with timeout
+- `find_template()` — OpenCV normalized cross-correlation, threshold 0.8, returns center coords or None
+- `wait_for_template_center()` — polling wrapper with timeout, returns center or None
+- `detect_current_screen()` — checks `_SCREEN_SIGNATURES` in order, returns first match name or None
 - `poll_for_match_end()` — single-shot check for placement badge
 - `sample_pixel_color()` — reads one pixel (R,G,B) for zone state detection
 - `save_error_screenshot()` — auto-saves to `screenshots/errors/` with timestamp + label
 
+**Known screens** (checked in priority order in `_SCREEN_SIGNATURES`):
+
+| Screen name | Signature template | Notes |
+|---|---|---|
+| `director_lobby` | `lobby_password_label.png` | Director waiting lobby with password |
+| `director_splash` | `latest_updates_continue.png` | Splash/news screen after launch |
+| `choose_role` | `choose_role_screen.png` | INMATE / DIRECTOR role selection |
+| `create_match` | `solo_classic_label.png` | Create custom match settings screen |
+| `custom_browser` | `create_custom_match.png` | Custom match browser |
+| `region_popup` | `region_popup_header.png` | "CHOOSE YOUR REGION" modal popup |
+| `play_screen` | `play_screen_region.png` | PLAY mode-selection screen with region button |
+| `main_menu` | `play_button.png` | Main menu with PLAY / CUSTOM / TRAINING |
+
 ### Card Actions (`game/card_actions.py`)
 
 `play_card()` shift-drags from a slot coordinate to a target coordinate, then optionally verifies the card left its slot via template match. All actions respect `bypass_mode` — when enabled, logs the action and waits for Enter instead of sending input to the game.
+
+## Custom Lobby Creation Flow (`_do_create_custom`)
+
+Complete sequence triggered by `/custom <region>` from `IN_MENU` state. All coordinates are for **1920×1080**.
+
+```
+Step 0 — Region setup
+  hover_click(355, 258)                          PLAY button on main menu
+  wait: play_screen_region.png                   confirms PLAY screen loaded
+  check region_na.png / region_eu.png            detect current region
+  if wrong:
+    hover_click(215, 1045)                       CHANGE REGION button (bottom-left)
+    wait: region_popup_header.png
+    moveTo(960, 700)                             move away — game highlights active row white
+    click_until(740,468 or 720,511)              NA row / EU row (hardcoded, not template)
+    verify: play_screen_region.png               popup closed, back on PLAY screen
+  click_until(1840, 1044)                        BACK → main menu
+  verify: play_button.png
+
+Step 1 — Enter custom flow
+  click(226, 333)                                CUSTOM button
+
+Step 2 — Match browser
+  wait + click: create_custom_match.png          CREATE NEW CUSTOM MATCH button
+
+Step 3 — Create Match screen gate
+  wait: solo_classic_label.png → center_sc       SOLO CLASSIC always visible here (privacy-agnostic)
+
+Step 4 — Privacy check
+  find: privacy_private.png                      if not found, click(90, 119) to toggle
+
+Step 5+6 — Mode + START (with retry)
+  click_until(*center_sc, start_button.png)      click SOLO CLASSIC, verify lit START appears
+  → center_start
+
+Step 6+7 — START → Choose Role (with retry)
+  click_until(*center_start, choose_role_screen.png)
+  → role_center
+
+Step 8 — Director role
+  click(role_center[0], role_center[1] - 175)   card body is ~175px above label center
+
+Step 9 — Lobby
+  wait: lobby_password_label.png (timeout=80s)  "SEARCHING FOR GAME" transition is normal
+  sleep(10.0)                                    wait for game lag before clipboard
+  click(center[0]+316, center[1]-9)             clipboard icon offset from label center
+  pyperclip.paste()                             → lobby code
+```
+
+**Key offsets calibrated at 1920×1080:**
+- Clipboard icon: `lobby_password_label` center + (316px right, 9px up)
+- DIRECTOR card click: `choose_role_screen` template center − 175px vertically
+- Region popup rows: NA=(740, 468), EU=(720, 511) — hardcoded, not template-matched (game highlights active row white which breaks matching)
+
+## `/menu` Navigation Flow (`_do_go_to_menu`)
+
+Loop up to 8 steps, 60s timeout. Each iteration calls `detect_current_screen()` then acts:
+
+| Screen | Action |
+|---|---|
+| `main_menu` | Done — return True |
+| `director_lobby` | `main_menu_button.png` → click → `yes_button.png` → click |
+| `director_splash` | `latest_updates_continue.png` → click |
+| `region_popup` | `play_screen_back.png` (also matches popup BACK, score 0.91) → click |
+| `play_screen` | `play_screen_back.png` → click, fallback (1840, 1044) |
+| anything else | `back_button.png` (orange) → click, fallback (1815, 1017) |
+
+After each action: `sleep(1.5)` to let screen transition settle before re-detecting.
+
+## Automation Patterns
+
+### hover_click (required for all game UI)
+
+The game requires a `MouseEnter` hover event before a click registers (button highlights white). **Never use `pyautogui.click(x, y)` directly** — always hover first:
+
+```python
+pyautogui.moveTo(x, y)
+time.sleep(0.2)   # let game register MouseEnter / highlight
+pyautogui.click()
+```
+
+### click_until (retry with re-hover)
+
+For critical clicks where the expected outcome can be verified by template:
+
+```python
+click_until(x, y, verify_template, verify_timeout=5, max_attempts=3)
+```
+
+On each retry, moves mouse to `(960, 300)` first to force a fresh `MouseEnter` on re-approach. Returns matched center on success, None on failure.
+
+### Template capture rules
+
+- Always capture from a **pyautogui screenshot** (native 1920×1080), never from MCP computer-use screenshots (which are 1456×816 and will produce wrong-resolution templates)
+- Self-match score must be ≥ 0.95 before using a template
+- Cross-test against screens where the template should NOT match (score must be < 0.8)
+- Templates with animation/glow (e.g. "CHOOSE ROLE" title) score poorly — crop a static element instead
+- Avoid including ping/ms values in region templates (they change between sessions)
 
 ## Config Reference (`config.json`)
 
@@ -175,27 +290,45 @@ Zone strategy is pluggable via `config.json → zone_selection_strategy`. Adding
 
 ## Templates Directory
 
-OpenCV template images live in `templates/` (not in the repo — capture from the game):
-- `templates/play_button.png` — orange PLAY button on main menu (used by `/launch`)
-- `templates/placement_badge.png` — colored placement badge on results screen (match end detection)
+All templates captured at **1920×1080** via pyautogui. Centers listed are for the current calibration machine.
 
-Capture these as cropped screenshots of the exact UI element at your game's native resolution.
+| Template | Purpose | Center (approx) |
+|---|---|---|
+| `play_button.png` | Main menu detection + PLAY button click | (355, 258) |
+| `play_screen_region.png` | PLAY mode-selection screen gate ("CHANGE REGION" label) | (105, 1014) |
+| `play_screen_back.png` | BACK button on PLAY screen and region popup (dark blue border) | (1840, 1044) |
+| `region_na.png` | Detects NA (US East) is currently selected | (130, 1045) |
+| `region_eu.png` | Detects EU (Frankfurt) is currently selected | (130, 1045) |
+| `region_popup_header.png` | "CHOOSE YOUR REGION" popup detection | (955, 416) |
+| `region_row_na.png` | NA row in popup (reference only — not used for matching) | (740, 468) |
+| `region_row_eu.png` | EU row in popup (reference only — not used for matching) | (720, 511) |
+| `create_custom_match.png` | CREATE NEW CUSTOM MATCH button | dynamic |
+| `solo_classic_label.png` | SOLO CLASSIC card / Create Match screen gate | dynamic |
+| `privacy_private.png` | Privacy setting is PRIVATE indicator | dynamic |
+| `start_button.png` | Lit START button (only lit after mode selected) | dynamic |
+| `choose_role_screen.png` | DIRECTOR label strip on Choose Role screen | (860, 575) |
+| `lobby_password_label.png` | MATCH PASSWORD label in Director lobby | dynamic |
+| `back_button.png` | Orange BACK button (Choose Role, Create Match, Custom Browser) | (1815, 1017) |
+| `main_menu_button.png` | MAIN MENU button in Director lobby | (1837, 1040) |
+| `quit_to_main_menu.png` | Quit confirmation popup header | (960, 457) |
+| `yes_button.png` | YES button in quit confirmation | (821, 583) |
+| `latest_updates_continue.png` | CONTINUE on director splash screen | dynamic |
+| `placement_badge.png` | Match end detection — **not yet captured** | — |
 
 ## Calibration Checklist
 
-Before the bot can run a real match, these must be filled in `config.json`:
-- [ ] `game_executable_path`
-- [ ] `discord_bot_token` + role created in server
+- [x] `game_executable_path`
+- [x] `discord_bot_token` + role created in server
+- [x] `templates/play_button.png` captured
+- [x] All custom lobby flow templates captured (see table above)
 - [ ] `card_slots` coordinates for Electromania and Beach Party slots
-- [ ] `cards.electromania.slot` and `cards.beach_party.slot` (which slot key)
-- [ ] `cards.electromania.drop_target` and `cards.beach_party.drop_target`
+- [ ] `cards.electromania.slot` / `drop_target` and `cards.beach_party.slot` / `drop_target`
 - [ ] `zone_close_card_slot`
 - [ ] `zone_sample_coordinates` (all 7 zones)
 - [ ] `zone_drop_coordinates` (all 7 zones)
 - [ ] `zone_color_thresholds` (open / closing / closed RGB values)
 - [ ] `results_ocr_regions` (x,y,w,h per column per row)
-- [ ] `templates/play_button.png` captured
-- [ ] `templates/placement_badge.png` captured
+- [ ] `templates/placement_badge.png` captured (requires a match to end)
 
 ## Testing Requirements
 
@@ -203,19 +336,17 @@ Custom matches in Darwin Project require **Director + minimum 2 players** to sta
 
 **Test phases (in order):**
 1. No game needed — zone logic, state machine, Discord commands, bypass mode all work now
-2. Director client only — menu navigation, deck check, custom match creation, lobby code capture
+2. Director client only — menu navigation, deck check, custom match creation, lobby code capture ✅ **complete**
 3. Director + 2 players on separate machines — first full live match test
 
 **EAC + VM note:** EAC actively detects and blocks virtualized environments. Running player clients in VMs on the same machine will not work. Players must be on separate physical machines.
 
 ## Pending Implementation (TODOs)
 
-These stubs exist in the code but need in-game calibration or implementation:
-
 - `game/match_runner.py` — `_pre_match_deck_check()`: navigate deck tab, screenshot, compare card list
 - `bot/discord_bot.py` — `_do_launch()`: replace template path placeholder with real captured template
-- `bot/discord_bot.py` — `_do_deck_check()`: UI navigation to deck tab
-- `bot/discord_bot.py` — `_do_create_custom()`: click Play → Custom → Create New → Solo Classic → Start → Director, capture lobby code from clipboard
+- `bot/discord_bot.py` — `_do_deck_check()`: UI navigation to deck tab, screenshot, parse current deck
+- In-game calibration: card slot coordinates, zone pixel coordinates, zone color thresholds, OCR regions (requires live Director match with 2+ players)
 
 ## Future Enhancements (from plan)
 

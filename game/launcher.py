@@ -5,7 +5,7 @@ import psutil
 
 logger = logging.getLogger(__name__)
 
-GAME_PROCESS_NAME = "DarwinProject.exe"
+GAME_PROCESS_NAME = "Darwin-Win64-Shipping.exe"
 
 
 def launch_game(exe_path: str, timeout: int = 60) -> bool:
@@ -13,6 +13,10 @@ def launch_game(exe_path: str, timeout: int = 60) -> bool:
     Start the game process and wait for it to appear.
     Returns True if the process appeared within timeout.
     """
+    if is_game_running():
+        logger.info("Game already running — skipping launch")
+        return True
+
     logger.info("Launching game: %s", exe_path)
     try:
         subprocess.Popen([exe_path])
@@ -35,8 +39,9 @@ def launch_game(exe_path: str, timeout: int = 60) -> bool:
 
 
 def is_game_running() -> bool:
+    target = GAME_PROCESS_NAME.lower()
     for proc in psutil.process_iter(["name"]):
-        if proc.info["name"] == GAME_PROCESS_NAME:
+        if (proc.info["name"] or "").lower() == target:
             return True
     return False
 

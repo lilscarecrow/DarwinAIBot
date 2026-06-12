@@ -1,11 +1,18 @@
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
 import pytesseract
 
+if os.name == "nt":
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 logger = logging.getLogger(__name__)
+
+_OCR_TIMEOUT_SECONDS = 10
 
 
 @dataclass
@@ -26,8 +33,16 @@ def _crop(image: np.ndarray, x: int, y: int, w: int, h: int) -> np.ndarray:
 def _ocr_region(image: np.ndarray, x: int, y: int, w: int, h: int, config: str = "") -> str:
     region = _crop(image, x, y, w, h)
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    text = pytesseract.image_to_string(gray, config=config).strip()
-    return text
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(pytesseract.image_to_string, gray, config=config)
+        try:
+            return future.result(timeout=_OCR_TIMEOUT_SECONDS).strip()
+        except FuturesTimeoutError:
+            logger.warning("OCR timed out on region (%d,%d,%d,%d)", x, y, w, h)
+            return ""
+        except Exception as e:
+            logger.warning("OCR failed on region (%d,%d,%d,%d): %s", x, y, w, h, e)
+            return ""
 
 
 def parse_results_screen(
