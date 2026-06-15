@@ -16,12 +16,12 @@ class BotState(Enum):
 
 # Which commands are valid in each state
 VALID_COMMANDS: dict[BotState, list[str]] = {
-    BotState.IDLE:              ["launch", "status", "end"],
-    BotState.LAUNCHING:         ["status", "end"],
-    BotState.IN_MENU:           ["deck", "custom", "status", "end"],
-    BotState.IN_CUSTOM:         ["start", "menu", "status", "end"],
-    BotState.MATCH_IN_PROGRESS: ["status", "end"],
-    BotState.MATCH_ENDED:       ["status", "end"],
+    BotState.IDLE:              ["launch", "deck", "status", "quit"],
+    BotState.LAUNCHING:         ["status", "quit"],
+    BotState.IN_MENU:           ["deck", "custom", "status", "quit"],
+    BotState.IN_CUSTOM:         ["start", "menu", "status", "quit"],
+    BotState.MATCH_IN_PROGRESS: ["status", "quit"],
+    BotState.MATCH_ENDED:       ["status", "quit"],
 }
 
 
@@ -31,6 +31,7 @@ class SessionState:
         self._last_action: str = "None"
         self._next_action: str = "None"
         self._match_start_time: float | None = None
+        self._state_entered_at: float = time.monotonic()
 
     @property
     def state(self) -> BotState:
@@ -47,10 +48,14 @@ class SessionState:
     def transition(self, new_state: BotState, last_action: str = "", next_action: str = ""):
         logger.info("State transition: %s -> %s", self._state.name, new_state.name)
         self._state = new_state
+        self._state_entered_at = time.monotonic()
         if last_action:
             self._last_action = last_action
         if next_action:
             self._next_action = next_action
+
+    def state_duration_seconds(self) -> float:
+        return time.monotonic() - self._state_entered_at
 
     def start_match_timer(self):
         self._match_start_time = time.monotonic()
@@ -79,6 +84,7 @@ class SessionState:
         self._last_action = "None"
         self._next_action = "None"
         self._match_start_time = None
+        self._state_entered_at = time.monotonic()
         logger.info("Session state reset to IDLE")
 
     def status_message(self) -> str:

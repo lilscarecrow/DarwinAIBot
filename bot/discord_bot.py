@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import os
 import threading
 from typing import Optional
 
@@ -10,12 +12,168 @@ from discord.ext import commands
 from game.match_runner import MatchRunner
 from session.state import SessionState, BotState
 
+# Path to noble-hopper state.json — one level up from bot/, into noble-hopper/
+_STATE_JSON = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "noble-hopper", "state.json")
+)
+
+# Director cards available in the deck builder (display label → ItemType value)
+_DIRECTOR_CARDS = [
+    ("Empty",               "ItemType_Null"),
+    ("Zone Closing",        "ItemType_SDP_ZoneClosing"),
+    ("Open Zone",           "ItemType_SDP_OpenZone"),
+    ("Lava Zone",           "ItemType_SDP_LavaZone"),
+    ("Nuclear Blast",       "ItemType_SDP_NuclearBlast"),
+    ("Anti-Grav Storm",     "ItemType_SDP_AntiGravStorm"),
+    ("Spawn Electronic",    "ItemType_SDP_ActivatePylon"),
+    ("Electromania",        "ItemType_SDP_ActivateAllPylons"),
+    ("Warm Up",             "ItemType_SDP_WarmUp"),
+    ("Speed Boost",         "ItemType_SDP_SpeedBoost"),
+    ("Beach Party",         "ItemType_SDP_NakedAll"),
+    ("Man Hunt",            "ItemType_SDP_ManHunt"),
+    ("Favorite Player",     "ItemType_SDP_FavoritePlayer"),
+    ("Give Wood",           "ItemType_SDP_GiveWood"),
+    ("Give Leather",        "ItemType_SDP_GiveLeather"),
+    ("Telepathy",           "ItemType_SDP_Telepathy"),
+    ("Expose",              "ItemType_SDP_MutualVision"),
+    ("Blood Moon",          "ItemType_SDP_Hecatombe"),
+]
+_CARD_LABEL = {value: label for label, value in _DIRECTOR_CARDS}
+
+
+def _read_deck() -> list:
+    """Read the current 11-slot deck from noble-hopper state.json."""
+    try:
+        if os.path.exists(_STATE_JSON):
+            with open(_STATE_JSON, "r", encoding="utf-8") as f:
+                loaded = json.load(f).get("directorDeck", [])
+            return (loaded + ["ItemType_Null"] * 11)[:11]
+    except Exception:
+        pass
+    return ["ItemType_Null"] * 11
+
+
+def _write_deck(deck: list) -> None:
+    """Write deck to noble-hopper state.json, preserving all other proxy fields."""
+    state = {}
+    if os.path.exists(_STATE_JSON):
+        with open(_STATE_JSON, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    state["directorDeck"] = deck
+    state.pop("lastSyncedDeck", None)   # force proxy to re-sync on next game action
+    state["needsSync"] = True           # signal proxy to sync on next game API request
+    with open(_STATE_JSON, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
+def _try_force_sync() -> bool:
+    """POST to noble-hopper's force-sync endpoint. Returns True if the deck was applied live."""
+    try:
+        import urllib.request as _urlreq
+        req = _urlreq.Request(
+            "http://localhost:3000/api/force-sync-deck",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _urlreq.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read())
+            if not result.get("success"):
+                logger.warning("Force sync failed: %s", result.get("error", "unknown error"))
+            return result.get("success", False)
+    except Exception as e:
+        logger.warning("Force sync unavailable: %s", e)
+        return False
+
+
+# ------------------------------------------------------------------
+# Deck editor UI components
+# ------------------------------------------------------------------
+
+class _SlotSelect(discord.ui.Select):
+    def __init__(self, slot: int, current: str, row: int):
+        options = [
+            discord.SelectOption(label=label, value=value, default=(value == current))
+            for label, value in _DIRECTOR_CARDS
+        ]
+        super().__init__(placeholder=f"Slot {slot + 1}: {_CARD_LABEL.get(current, current)}", options=options, row=row)
+        self.slot = slot
+
+    async def callback(self, interaction: discord.Interaction):
+        view: DeckEditorView = self.view
+        view.deck[self.slot] = self.values[0]
+        for opt in self.options:
+            opt.default = (opt.value == self.values[0])
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class _NavButton(discord.ui.Button):
+    def __init__(self, label: str, direction: int):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=4)
+        self.direction = direction
+
+    async def callback(self, interaction: discord.Interaction):
+        view: DeckEditorView = self.view
+        view.page += self.direction
+        view._rebuild()
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class _SaveButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Save Deck", style=discord.ButtonStyle.success, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: DeckEditorView = self.view
+        try:
+            _write_deck(view.deck)
+        except Exception as ex:
+            await interaction.response.send_message(f"Save failed: {ex}", ephemeral=True)
+            return
+        view.stop()
+        lines = [f"`{i + 1:2}.` {_CARD_LABEL.get(c, c)}" for i, c in enumerate(view.deck)]
+        e = discord.Embed(title="Deck Saved", description="\n".join(lines), color=_COLOR_OK)
+        e.set_footer(text="Deck saved — will apply on next launch.")
+        await interaction.response.edit_message(embed=e, view=None)
+
+
+class DeckEditorView(discord.ui.View):
+    _SLOTS_PER_PAGE = 4
+
+    def __init__(self, deck: list):
+        super().__init__(timeout=120)
+        self.deck = list(deck)
+        self.page = 0
+        self._rebuild()
+
+    @property
+    def _total_pages(self) -> int:
+        return (11 + self._SLOTS_PER_PAGE - 1) // self._SLOTS_PER_PAGE  # ceil(11/4) = 3
+
+    def _rebuild(self):
+        self.clear_items()
+        start = self.page * self._SLOTS_PER_PAGE
+        end = min(start + self._SLOTS_PER_PAGE, 11)
+        for i in range(start, end):
+            self.add_item(_SlotSelect(i, self.deck[i], row=i - start))
+        if self.page > 0:
+            self.add_item(_NavButton("← Prev", -1))
+        self.add_item(_SaveButton())
+        if self.page < self._total_pages - 1:
+            self.add_item(_NavButton("Next →", +1))
+
+    def build_embed(self) -> discord.Embed:
+        lines = [f"`{i + 1:2}.` {_CARD_LABEL.get(c, c)}" for i, c in enumerate(self.deck)]
+        e = discord.Embed(title="Director Deck", description="\n".join(lines), color=_COLOR_OK)
+        e.set_footer(text=f"Page {self.page + 1}/{self._total_pages} · Edit slots below then Save")
+        return e
+
 logger = logging.getLogger(__name__)
 
 # Hard safety ceilings for each long-running operation.
 _LAUNCH_TIMEOUT = 420.0    # 7 min: game start + splash + menu detection (slow HDD installs)
 _CUSTOM_TIMEOUT = 180.0    # 3 min: menu navigation to lobby (lobby load can be slow)
-_MATCH_TIMEOUT  = 1200.0   # 20 min: full match safety net
+_MATCH_TIMEOUT  = 3600.0   # 60 min: safety net — real matches can exceed 20 min
 
 # Embed accent colors
 _COLOR_OK      = 0x2ECC71  # green   — success
@@ -23,6 +181,41 @@ _COLOR_FAIL    = 0xE74C3C  # red     — failure / error
 _COLOR_ACTIVE  = 0x3498DB  # blue    — launching / in-progress
 _COLOR_WARN    = 0xE67E22  # orange  — active match / warning
 _COLOR_NEUTRAL = 0x95A5A6  # gray    — idle / neutral
+
+
+class _EndConfirmView(discord.ui.View):
+    """Two-button Yes/No prompt for /quit."""
+
+    def __init__(self, cog: "DirectorCog"):
+        super().__init__(timeout=30)
+        self._cog = cog
+
+    async def _do_end(self, interaction: discord.Interaction):
+        self._cog._stop_event.set()
+        if self._cog._active_runner is not None:
+            self._cog._active_runner.stop()
+        from game.launcher import close_game
+        close_game()
+        self._cog.bot.session.reset()
+        self.stop()
+        embed = discord.Embed(title="Session Ended", description="Game closed. Bot reset to IDLE.", color=_COLOR_OK)
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="Yes, close game", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._do_end(interaction)
+
+    @discord.ui.button(label="No, keep running", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="Cancelled", description="Session continues.", color=_COLOR_NEUTRAL),
+            view=None,
+        )
+
+    async def on_timeout(self):
+        # View expires silently — no edit possible without storing the message reference
+        self.stop()
 
 
 class DarwinBot(commands.Bot):
@@ -35,12 +228,26 @@ class DarwinBot(commands.Bot):
     async def setup_hook(self):
         cog = DirectorCog(self)
         await self.add_cog(cog)
-        await self.tree.sync()
-        logger.info("Slash commands synced")
+        # discord_guild_ids accepts a list or a single id string/int.
+        # Falls back to the legacy discord_guild_id key for compatibility.
+        guild_ids = self.config.get("discord_guild_ids") or self.config.get("discord_guild_id")
+        if guild_ids:
+            if not isinstance(guild_ids, list):
+                guild_ids = [guild_ids]
+            for gid in guild_ids:
+                guild = discord.Object(id=int(gid))
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info("Slash commands synced to guild %s (instant)", gid)
+        else:
+            await self.tree.sync()
+            logger.info("Slash commands synced globally (may take up to 1 hour to propagate)")
         self.loop.create_task(cog._screen_watcher())
 
     async def on_ready(self):
         logger.info("Logged in as %s (id %d)", self.user, self.user.id)
+        from game import tts
+        tts.set_event_loop(asyncio.get_event_loop())
 
 
 class DirectorCog(commands.Cog):
@@ -55,6 +262,9 @@ class DirectorCog(commands.Cog):
         # Shared stop signal for _do_launch and _do_create_custom threads.
         # /end sets this; each thread checks it between steps to exit early.
         self._stop_event = threading.Event()
+        # Background task that fires the match runner when the lobby auto-start
+        # timer expires. Cancelled immediately if /start is used manually.
+        self._auto_start_task: Optional[asyncio.Task] = None
 
     # Screen name → (BotState, label) used by the background screen watcher
     _SCREEN_STATES = {
@@ -138,6 +348,17 @@ class DirectorCog(commands.Cog):
                         last_action=f"Auto-detected: {label}",
                         next_action="Awaiting command",
                     )
+
+                # Idle-close: if we've been in the main menu for > 10 minutes, close the game
+                _IDLE_CLOSE_SECONDS = 600
+                if (
+                    self.bot.session.state == BotState.IN_MENU
+                    and self.bot.session.state_duration_seconds() > _IDLE_CLOSE_SECONDS
+                ):
+                    logger.info("Screen watcher: IN_MENU idle > 10 min — closing game")
+                    from game.launcher import close_game
+                    await loop.run_in_executor(None, close_game)
+                    self.bot.session.reset()
             except Exception as e:
                 logger.debug("Screen watcher error: %s", e)
 
@@ -217,7 +438,7 @@ class DirectorCog(commands.Cog):
             )
             await interaction.followup.send(embed=self._ok(
                 "Game Ready",
-                "Menu screen detected.\nRun `/deck` to check your deck or `/custom` to create a match.",
+                "Menu screen detected. Run `/custom` to create a match.",
             ))
         else:
             self.bot.session.reset()
@@ -235,71 +456,151 @@ class DirectorCog(commands.Cog):
         exe = self.bot.config.get("game_executable_path", "")
         timeout = self.bot.config.get("launch_timeout_seconds", 60)
 
+        # Sync deck to the server BEFORE launching, using the previous session's token.
+        # If this succeeds, the game's startup profile load will already return the new deck
+        # so the correct cards appear without needing a second launch.
+        if _try_force_sync():
+            logger.info("Pre-launch deck sync succeeded — game will load correct deck at startup")
+        else:
+            logger.warning("Pre-launch deck sync failed (token expired?) — deck may require a second launch to reflect")
+
         if not launch_game(exe, timeout):
             return False
 
         if self._stop_event.is_set():
             return False
 
-        # Short timeout — splash appears within seconds of launch or not at all.
-        # Using full timeout here would block 3 minutes if the game is already at the menu.
-        logger.info("Waiting for Latest Updates splash screen...")
-        center = wait_for_template_center("templates/latest_updates_continue.png", timeout=20)
+        # Poll for splash or main menu — whichever appears first.
+        # Polling both avoids a hard timeout on the splash that either misses it
+        # (too short) or wastes time on machines that skip straight to the menu.
+        logger.info("Waiting for splash screen or main menu...")
+        import time as _time
+        from game.screen_detection import find_template, take_screenshot
+        splash_center = None
+        at_menu = False
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            if self._stop_event.is_set():
+                return False
+            ss = take_screenshot()
+            splash = find_template(ss, "templates/latest_updates_continue.png")
+            if splash:
+                splash_center = splash
+                break
+            if find_template(ss, "templates/play_button.png"):
+                at_menu = True
+                break
+            _time.sleep(1.0)
 
         if self._stop_event.is_set():
             return False
 
-        if center:
-            logger.info("Splash screen detected — focusing window then clicking Continue at %s", center)
+        if at_menu:
+            logger.info("Main menu detected directly — no splash to dismiss")
+        elif splash_center:
+            logger.info("Splash screen detected — clicking Continue at %s", splash_center)
             try:
-                import time
-                pyautogui.moveTo(*center)   # move first so the window activates
-                time.sleep(1.0)             # wait for focus to settle before clicking
-                pyautogui.click(*center)
-                time.sleep(0.5)
+                pyautogui.moveTo(*splash_center)
+                _time.sleep(1.0)
+                pyautogui.click()
+                _time.sleep(0.5)
             except Exception as e:
                 logger.error("Mouse action failed during launch: %s", e)
                 save_error_screenshot("click_failed_launch")
                 return False
         else:
-            logger.warning("Splash screen not detected — proceeding anyway")
+            logger.warning("Neither splash nor main menu detected within %ds", timeout)
+            return False
 
         if self._stop_event.is_set():
             return False
 
-        return wait_for_template("templates/play_button.png", timeout=timeout)
+        if not at_menu:
+            remaining = max(10, int(deadline - _time.monotonic()))
+            if not wait_for_template("templates/play_button.png", timeout=remaining):
+                logger.error("Main menu not detected after dismissing splash")
+                save_error_screenshot("menu_not_found_after_splash")
+                return False
+
+        if self._stop_event.is_set():
+            return False
+
+        return True
 
     # ------------------------------------------------------------------
     # /deck
     # ------------------------------------------------------------------
 
-    @app_commands.command(
-        name="deck",
-        description="Check the Director deck. Optionally provide card names to swap in.",
-    )
-    @app_commands.describe(cards="Comma-separated card names to swap into the deck (optional)")
-    async def deck(self, interaction: discord.Interaction, cards: Optional[str] = None):
+    @app_commands.command(name="deck", description="View and edit the Director deck")
+    async def deck(self, interaction: discord.Interaction):
         if not await self._role_check(interaction):
             return
-        if not await self._state_check(interaction, "deck"):
+
+        view = DeckEditorView(_read_deck())
+        await interaction.response.send_message(embed=view.build_embed(), view=view)
+
+    # ------------------------------------------------------------------
+    # /profile
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="profile", description="View or set the active Director match profile")
+    @app_commands.describe(name="Profile to activate (leave blank to view current)")
+    async def profile(self, interaction: discord.Interaction, name: Optional[str] = None):
+        if not await self._role_check(interaction):
             return
-        if not await self._lock_check(interaction):
+
+        from game.profiles import PROFILES, get_profile, profile_summary
+
+        if name is None:
+            active = self.bot.config.get("active_profile", "standard")
+            p = get_profile(active)
+            embed = self._ok(
+                f"Active Profile: {p['display_name']}",
+                profile_summary(p),
+            )
+            embed.add_field(name="Key", value=f"`{active}`", inline=True)
+            embed.add_field(name="Available", value="  ".join(f"`{k}`" for k in PROFILES), inline=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        await interaction.response.defer(thinking=True)
+        if name not in PROFILES:
+            keys = ", ".join(f"`{k}`" for k in PROFILES)
+            await interaction.response.send_message(
+                f"Unknown profile `{name}`. Available: {keys}", ephemeral=True
+            )
+            return
 
-        async with self._session_lock:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, self._do_deck_check, cards)
+        self.bot.config["active_profile"] = name
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            cfg_path = _Path("config.json")
+            with cfg_path.open(encoding="utf-8") as f:
+                on_disk = _json.load(f)
+            on_disk["active_profile"] = name
+            with cfg_path.open("w", encoding="utf-8") as f:
+                _json.dump(on_disk, f, indent=4)
+        except Exception as ex:
+            logger.warning("Could not persist active_profile to config.json: %s", ex)
 
-        await interaction.followup.send(embed=self._info("Director Deck", result))
+        p = PROFILES[name]
+        embed = self._ok(f"Profile Set: {p['display_name']}", profile_summary(p))
+        in_match = self.bot.session.state == BotState.MATCH_IN_PROGRESS
+        note = " · Takes effect on next /start" if in_match else ""
+        state_label = self.bot.session.state.name.replace("_", " ").title()
+        embed.set_footer(text=f"State: {state_label}{note}")
+        await interaction.response.send_message(embed=embed)
 
-    def _do_deck_check(self, cards: Optional[str]) -> str:
-        # TODO: click Director Deck tab, screenshot, compare against config card list
-        msg = "Deck check not yet implemented — UI navigation pending calibration."
-        if cards:
-            msg += f"\nRequested swap: `{cards}`"
-        return msg
+    @profile.autocomplete("name")
+    async def _profile_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        from game.profiles import PROFILES, profile_summary
+        return [
+            app_commands.Choice(name=f"{p['display_name']} — {profile_summary(p)}", value=key)
+            for key, p in PROFILES.items()
+            if current.lower() in key.lower() or current.lower() in p["display_name"].lower()
+        ]
 
     # ------------------------------------------------------------------
     # /custom
@@ -353,6 +654,12 @@ class DirectorCog(commands.Cog):
             embed.add_field(name="Region", value=region.name, inline=True)
             embed.add_field(name="Lobby Code", value=f"```{lobby_code}```", inline=False)
             await interaction.followup.send(embed=embed)
+
+            # Start a background watcher that fires the match runner if the lobby
+            # auto-starts before /start is called.
+            self._auto_start_task = asyncio.create_task(
+                self._watch_for_auto_start(interaction.channel)
+            )
         else:
             self.bot.session.reset()
             await interaction.followup.send(embed=self._fail(
@@ -556,6 +863,13 @@ class DirectorCog(commands.Cog):
                 return None
 
             logger.info("Custom: lobby code = %s", code)
+
+            # Close the password menu and dismiss the initial card tray
+            from game.card_actions import press_key
+            press_key("escape")
+            time.sleep(0.3)
+            press_key("shift")
+
             return code
 
         except Exception as e:
@@ -716,6 +1030,43 @@ class DirectorCog(commands.Cog):
             save_error_screenshot("go_to_menu_exception")
             return False
 
+    def _do_post_match_return(self) -> bool:
+        """Click MAIN MENU on the results screen and wait for the main menu to appear."""
+        import time
+        import pyautogui
+        from game.screen_detection import (
+            find_template, take_screenshot, wait_for_template_center, save_error_screenshot,
+        )
+        from game.card_actions import focus_darwin_window
+
+        try:
+            focus_darwin_window()
+            time.sleep(0.3)
+
+            screenshot = take_screenshot()
+            center = find_template(screenshot, "templates/placement_badge.png", threshold=0.88)
+            if not center:
+                logger.warning("Post-match: MAIN MENU button not found — skipping return to menu")
+                save_error_screenshot("post_match_main_menu_not_found")
+                return False
+
+            pyautogui.moveTo(*center)
+            time.sleep(0.2)
+            pyautogui.click()
+            logger.info("Post-match: clicked MAIN MENU at %s", center)
+
+            menu = wait_for_template_center("templates/play_button.png", timeout=20)
+            if menu:
+                logger.info("Post-match: main menu detected")
+                return True
+            logger.warning("Post-match: timed out waiting for main menu")
+            save_error_screenshot("post_match_menu_timeout")
+            return False
+
+        except Exception as e:
+            logger.error("_do_post_match_return failed: %s", e, exc_info=True)
+            return False
+
     # ------------------------------------------------------------------
     # /start
     # ------------------------------------------------------------------
@@ -734,10 +1085,34 @@ class DirectorCog(commands.Cog):
 
         await interaction.response.defer(thinking=True)
 
+        # Manual start — cancel any pending auto-start watcher
+        if self._auto_start_task and not self._auto_start_task.done():
+            self._auto_start_task.cancel()
+            self._auto_start_task = None
+
+        from game.profiles import get_profile, profile_summary
+        from game.deck_utils import deck_layout_from_state, validate_profile_deck
+        _profile = get_profile(self.bot.config.get("active_profile", "standard"))
+        _deck_layout = deck_layout_from_state()
+        if _deck_layout:
+            _warnings = validate_profile_deck(_profile, _deck_layout)
+            if _warnings:
+                warn_embed = self._embed(
+                    "Deck / Profile Mismatch",
+                    "Match starting, but some profile cards are missing from the deck:\n"
+                    + "\n".join(f"• {w}" for w in _warnings),
+                    color=_COLOR_WARN,
+                )
+                warn_embed.add_field(name="Profile", value=profile_summary(_profile), inline=False)
+                await interaction.followup.send(embed=warn_embed)
+
+        _first = min(_profile["card_plays"], key=lambda p: p["play_time_seconds"])
+        _m, _s = divmod(_first["play_time_seconds"], 60)
+        _first_label = f"{_first['card'].replace('_', ' ').title()} at {_m}:{_s:02d}"
         self.bot.session.transition(
             BotState.MATCH_IN_PROGRESS,
             last_action="Match started",
-            next_action="Electromania at 2:00",
+            next_action=_first_label,
         )
         self.bot.session.start_match_timer()
 
@@ -777,10 +1152,234 @@ class DirectorCog(commands.Cog):
         self.bot.session.transition(
             BotState.MATCH_ENDED,
             last_action="Match ended",
-            next_action="None",
+            next_action="Returning to menu",
         )
-        await interaction.followup.send(embed=self._info("Match Complete", results_text))
-        self.bot.session.reset()
+        # Use channel.send() — matches can exceed the 15-minute Discord interaction
+        # token lifetime, making interaction.followup.send() return 401 after that point.
+        channel = interaction.channel
+        if results_text.endswith(".png"):
+            await channel.send(
+                embed=self._info("Match Complete", "Results screenshot attached."),
+                file=discord.File(results_text),
+            )
+        else:
+            await channel.send(embed=self._info("Match Complete", results_text))
+
+        loop = asyncio.get_running_loop()
+        returned = await loop.run_in_executor(None, self._do_post_match_return)
+        if returned:
+            self.bot.session.transition(
+                BotState.IN_MENU,
+                last_action="Returned to main menu",
+                next_action="Await /custom",
+            )
+        else:
+            self.bot.session.reset()
+
+    # ------------------------------------------------------------------
+    # Auto-start watcher
+    # ------------------------------------------------------------------
+
+    async def _watch_for_auto_start(self, channel: discord.TextChannel):
+        """
+        Started after /custom creates a lobby. OCRs the on-screen countdown,
+        sleeps until it expires, then fires the match runner automatically
+        (skip_start=True — no B press needed since the game already started).
+        Cancelled immediately if /start is called manually first.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            from game.screen_detection import take_screenshot
+            from game.ocr import read_lobby_countdown
+
+            screenshot = await loop.run_in_executor(None, take_screenshot)
+            countdown = await loop.run_in_executor(
+                None, lambda: read_lobby_countdown(screenshot, debug=True)
+            )
+
+            if countdown is None:
+                logger.warning("Auto-start watcher: could not read lobby countdown — watcher inactive")
+                return
+
+            logger.info("Auto-start watcher: lobby expires in %ds", countdown)
+            await asyncio.sleep(max(0, countdown))
+
+            # Re-check — /start may have been called while we were sleeping
+            if self.bot.session.state != BotState.IN_CUSTOM:
+                logger.info("Auto-start watcher: state is %s — aborting", self.bot.session.state.name)
+                return
+            if self._session_lock.locked():
+                logger.info("Auto-start watcher: session lock held — aborting")
+                return
+
+            logger.info("Auto-start watcher: firing match runner")
+            await channel.send(embed=self._info(
+                "Match Auto-Started",
+                "Lobby timer expired — card timers are now running.",
+            ))
+
+            from game.profiles import get_profile
+            _profile = get_profile(self.bot.config.get("active_profile", "standard"))
+            _first = min(_profile["card_plays"], key=lambda p: p["play_time_seconds"])
+            _m, _s = divmod(_first["play_time_seconds"], 60)
+            _first_label = f"{_first['card'].replace('_', ' ').title()} at {_m}:{_s:02d}"
+
+            self.bot.session.transition(
+                BotState.MATCH_IN_PROGRESS,
+                last_action="Match auto-started (lobby timer)",
+                next_action=_first_label,
+            )
+            self.bot.session.start_match_timer()
+
+            def on_action_update(last: str, next_: str):
+                self.bot.session.transition(self.bot.session.state, last_action=last, next_action=next_)
+
+            runner = MatchRunner(
+                config=self.bot.config,
+                session=self.bot.session,
+                on_action_update=on_action_update,
+                skip_start=True,
+            )
+            self._active_runner = runner
+
+            async with self._session_lock:
+                loop = asyncio.get_running_loop()
+                try:
+                    results_text = await asyncio.wait_for(
+                        loop.run_in_executor(None, runner.run),
+                        timeout=_MATCH_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    if self._active_runner is not None:
+                        self._active_runner.stop()
+                    self._active_runner = None
+                    self.bot.session.reset()
+                    await channel.send(embed=self._fail(
+                        "Match Safety Timeout",
+                        f"Match exceeded the {int(_MATCH_TIMEOUT // 60)}-minute safety limit. "
+                        "Bot reset to IDLE.",
+                    ))
+                    return
+
+            self._active_runner = None
+            self.bot.session.transition(
+                BotState.MATCH_ENDED,
+                last_action="Match ended",
+                next_action="Returning to menu",
+            )
+            if results_text.endswith(".png"):
+                await channel.send(
+                    embed=self._info("Match Complete", "Results screenshot attached."),
+                    file=discord.File(results_text),
+                )
+            else:
+                await channel.send(embed=self._info("Match Complete", results_text))
+
+            loop = asyncio.get_running_loop()
+            returned = await loop.run_in_executor(None, self._do_post_match_return)
+            if returned:
+                self.bot.session.transition(
+                    BotState.IN_MENU,
+                    last_action="Returned to main menu",
+                    next_action="Await /custom",
+                )
+            else:
+                self.bot.session.reset()
+
+        except asyncio.CancelledError:
+            logger.info("Auto-start watcher cancelled (/start used manually)")
+
+    # ------------------------------------------------------------------
+    # /voice — Discord voice channel mirroring for remote TTS monitoring
+    # ------------------------------------------------------------------
+
+    voice = app_commands.Group(name="voice", description="Mirror TTS audio to a Discord voice channel")
+
+    @voice.command(name="join", description="Join your voice channel to hear TTS announcements")
+    async def voice_join(self, interaction: discord.Interaction):
+        if not await self._role_check(interaction):
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
+            await interaction.response.send_message(
+                embed=self._fail(
+                    "Not in Voice",
+                    "Join a Discord voice channel first, then run this command.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        channel = member.voice.channel
+
+        # Disconnect from any existing voice channel before joining the new one
+        existing = interaction.guild.voice_client
+        if existing:
+            from game import tts as _tts
+            _tts.set_voice_client(None)
+            await existing.disconnect(force=True)
+
+        vc = await channel.connect()
+
+        from game import tts
+        tts.set_voice_client(vc)
+
+        await interaction.response.send_message(
+            embed=self._ok(
+                "Voice Connected",
+                f"Joined **{channel.name}**. All TTS audio will now play here.",
+            ),
+            ephemeral=True,
+        )
+
+    @voice.command(name="leave", description="Leave the voice channel")
+    async def voice_leave(self, interaction: discord.Interaction):
+        if not await self._role_check(interaction):
+            return
+
+        vc = interaction.guild.voice_client
+        if not vc:
+            await interaction.response.send_message(
+                embed=self._fail("Not Connected", "Bot is not in a voice channel."),
+                ephemeral=True,
+            )
+            return
+
+        from game import tts
+        tts.set_voice_client(None)
+        await vc.disconnect(force=True)
+
+        await interaction.response.send_message(
+            embed=self._ok("Voice Disconnected", "Left the voice channel."),
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------
+    # /say
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="say", description="Speak a message through in-game voice chat via TTS")
+    @app_commands.describe(message="Text to speak aloud to players")
+    async def say(self, interaction: discord.Interaction, message: str):
+        if not await self._role_check(interaction):
+            return
+
+        from game import tts
+        if not tts.is_enabled():
+            await interaction.response.send_message(
+                embed=self._fail("TTS Disabled", "No TTS device configured. Add `tts_device` to config.json."),
+                ephemeral=True,
+            )
+            return
+
+        in_match = self.bot.session.state == BotState.MATCH_IN_PROGRESS
+        tts.speak(message, broadcast=in_match)
+        context_note = "via broadcast (G key)" if in_match else "via game voice chat"
+        embed = self._ok("Director Says", f"_{message}_")
+        embed.add_field(name="Sent by", value=interaction.user.display_name, inline=True)
+        embed.add_field(name="Method", value=context_note, inline=True)
+        await interaction.response.send_message(embed=embed)
 
     # ------------------------------------------------------------------
     # /status
@@ -806,45 +1405,33 @@ class DirectorCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ------------------------------------------------------------------
-    # /end
+    # /quit
     # ------------------------------------------------------------------
 
     @app_commands.command(
-        name="end",
-        description="Force close the game. Requires confirm=True if a match is in progress.",
+        name="quit",
+        description="Force close the game and reset the bot to IDLE.",
     )
-    @app_commands.describe(confirm="Pass True to confirm force-close during an active match")
-    async def end(self, interaction: discord.Interaction, confirm: bool = False):
+    async def quit(self, interaction: discord.Interaction):
         if not await self._role_check(interaction):
             return
 
-        state = self.bot.session.state
-
-        if state == BotState.IDLE:
+        if self.bot.session.state == BotState.IDLE:
             await interaction.response.send_message(embed=self._info(
                 "Nothing to End", "Bot is already IDLE."
-            ))
+            ), ephemeral=True)
             return
 
-        if state == BotState.MATCH_IN_PROGRESS and not confirm:
-            await interaction.response.send_message(
-                embed=self._embed(
-                    "Confirm Required",
-                    "A match is in progress. Run `/end confirm:True` to force-close.",
-                    color=_COLOR_WARN,
-                ),
-                ephemeral=True,
-            )
-            return
-
-        # Signal all running threads to stop.
-        self._stop_event.set()
-        if self._active_runner is not None:
-            self._active_runner.stop()
-
-        from game.launcher import close_game
-        close_game()
-        self.bot.session.reset()
-        await interaction.response.send_message(embed=self._ok(
-            "Session Ended", "Game closed. Bot reset to IDLE."
-        ))
+        in_match = self.bot.session.state == BotState.MATCH_IN_PROGRESS
+        description = (
+            "A match is currently in progress. Closing the game will forfeit the match.\n\n"
+            "Are you sure?"
+            if in_match else
+            "This will close the game and reset the bot to IDLE.\n\nAre you sure?"
+        )
+        embed = self._embed("End Session", description, color=_COLOR_WARN)
+        await interaction.response.send_message(
+            embed=embed,
+            view=_EndConfirmView(self),
+            ephemeral=True,
+        )

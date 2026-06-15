@@ -82,16 +82,22 @@ def wait_for_template_center(
 def poll_for_match_end(
     badge_template_path: str,
     poll_interval: float = 12.0,
-    threshold: float = 0.75,
+    threshold: float = 0.88,
 ) -> bool:
     """
-    Poll every poll_interval seconds for the placement badge (match end indicator).
-    Returns True when detected. Caller is responsible for stopping the loop externally.
+    Single-shot check for the placement badge (match end indicator).
+    Returns True when detected. Caller is responsible for the polling loop.
+    Saves a debug screenshot on detection so false positives can be diagnosed.
     """
     screenshot = take_screenshot()
     match = find_template(screenshot, badge_template_path, threshold)
     if match:
         logger.info("Match end detected via placement badge")
+        SCREENSHOT_ERROR_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        debug_path = SCREENSHOT_ERROR_DIR / f"{ts}_match_end_detected.png"
+        cv2.imwrite(str(debug_path), screenshot)
+        logger.info("Match-end debug screenshot saved: %s", debug_path)
         return True
     return False
 

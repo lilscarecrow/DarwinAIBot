@@ -12,11 +12,25 @@ env/
 # Logs
 logs/*.log
 
-# Screenshots (generated at runtime)
-screenshots/errors/*.png
+# Runtime screenshots (errors and results — generated automatically)
+screenshots/
 
-# OpenCV template images (large, binary)
+# Calibration output (machine-specific, generated at runtime)
+calibration_screenshots/
+calibration_log.json
+CALIBRATION_NOTES.md
+
+# Loose reference/calibration images at repo root
+*.png
+
+# OpenCV template images (binary, machine-specific captures)
 templates/
+
+# noble-hopper proxy component (separate project)
+noble-hopper/
+
+# Claude Code session data
+.claude/
 
 # OS
 .DS_Store

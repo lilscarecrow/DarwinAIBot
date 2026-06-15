@@ -78,7 +78,7 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 2. `_state_check` — ephemeral error if command invalid in current state
 3. `_lock_check` — ephemeral error if another long-running operation is active
 
-**The asyncio lock (`_session_lock`)** wraps all `run_in_executor` calls to prevent concurrent operations. `/end` bypasses this lock intentionally — it calls `_active_runner.stop()` then closes the game.
+**The asyncio lock (`_session_lock`)** wraps all `run_in_executor` calls to prevent concurrent operations. `/quit` bypasses this lock intentionally — it calls `_active_runner.stop()` then closes the game.
 
 **Long-running commands** (`/launch`, `/custom`, `/start`) use `run_in_executor` to run blocking game automation in a thread without blocking the Discord event loop.
 
@@ -86,12 +86,12 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 | Command | Valid States | Description |
 |---|---|---|
 | `/launch` | IDLE | Launch game, poll for menu screen |
-| `/deck [cards]` | IN_MENU | Check/swap Director deck |
+| `/deck` | Any | View and edit the Director deck (purely API-driven, no game UI needed) |
 | `/custom <region>` | IN_MENU | Set region (NA/EU), create private match, return lobby code |
 | `/start` | IN_CUSTOM | Start match, responds with results when done |
 | `/menu` | IN_CUSTOM | Navigate back to main menu from any screen in the custom flow |
 | `/status` | Any | Current state + last/next action |
-| `/end [confirm]` | Any | Force close game; requires `confirm:True` if match in progress |
+| `/quit` | Any | Force close game — shows ephemeral Yes/No confirmation prompt |
 
 All responses use `discord.Embed` with color-coded status (green=ok, red=fail, blue=active, orange=in-match, gray=neutral). State is shown in every embed footer.
 
@@ -99,16 +99,38 @@ All responses use `discord.Embed` with color-coded status (green=ok, red=fail, b
 
 `MatchRunner.run()` is the full match sequence, called via `run_in_executor` from `/start`:
 
-1. Pre-match deck check (stub — pending calibration)
-2. Press B to start match
-3. 5-second sync delay
-4. Main loop:
-   - Fire card events when elapsed time reaches trigger (Electromania @ 2:00, Beach Party @ 4:00)
+1. Press B to start match (via PostMessage to Darwin hwnd — focus-independent)
+2. 5-second sync delay
+3. Main loop:
+   - Sleep until the next card trigger time (capped at `screen_poll_interval_seconds`) — cards fire within ~0.1s of scheduled time
+   - Fire card events: check director points first, wait if insufficient, then shift-drag
    - Every 30s: sample zone pixels → `valid_closeable_zones()` → strategy selects zone → play close card
-   - Every `screen_poll_interval_seconds`: template-match placement badge for match end
-5. OCR results screen → format → return to Discord
+   - Every `screen_poll_interval_seconds`: double-confirm match end (two detections 2s apart, threshold 0.88)
+4. Take screenshot of results screen → send as Discord file attachment (saved to `screenshots/results/`)
+5. Click MAIN MENU button on results screen → wait for main menu → transition to `IN_MENU`
 
-`MatchRunner.stop()` sets a `threading.Event` that the loop checks between every action. Called by `/end`.
+`MatchRunner.stop()` sets a `threading.Event` that the loop checks between every action. Called by `/quit`.
+
+**Director points reading (`_read_points`):**
+- Primary: count filled pips by brightness (`max(B,G,R) > 130`) — immune to color/size changes
+- Always use `pip_count - 1` as conservative reading (guards against partially-filled pip)
+- If OCR count == pip_count (conservative + 1), the last pip is fully filled — trust OCR
+- Fallback to OCR alone if pip config missing; no-op if neither configured
+- Config: `director_points_pips: {"x_start": 862, "y": 1012, "spacing": 26, "count": 10}`
+- Config: `director_points_region: [782, 1002, 76, 24]` (for OCR fallback)
+
+**Card point costs** (all in `CARD_POINT_COSTS` in `game/deck_utils.py`):
+| Card | Cost | Card | Cost |
+|---|---|---|---|
+| zone_close | 3 | electromania | 3 |
+| beach_party | 5 | blood_moon | 5 |
+| open_zone | 5 | lava_zone | 5 |
+| nuclear_blast | 5 | anti_grav_storm | 5 |
+| man_hunt | 5 | spawn_electronic | 2 |
+| telepathy | 3 | expose | 3 |
+| warm_up | 1 | speed_boost | 1 |
+| give_wood | 1 | give_leather | 1 |
+| favorite_player | 0 | | |
 
 ### Zone Logic (`zones/`)
 
@@ -141,9 +163,80 @@ Zone strategy is pluggable via `config.json → zone_selection_strategy`. Adding
 | `play_screen` | `play_screen_region.png` | PLAY mode-selection screen with region button |
 | `main_menu` | `play_button.png` | Main menu with PLAY / CUSTOM / TRAINING |
 
+### Director Deck Sync (`noble-hopper/`)
+
+The Director deck is managed entirely via the game's API — no UI automation is needed. The noble-hopper process (mitmproxy + web server) handles sync.
+
+**Why response injection doesn't work for the deck:**
+The game treats `sDPowerArray` (in `othersOptions`) as local state — it pushes its local deck TO the server via `saveOthersOptionsCommand` at startup rather than reading it from the server. Injecting into the profile GET response is ignored. Skins and power unlocks work with response injection because the game reads those FROM the server with no local cache.
+
+**Three sync paths (in priority order):**
+
+1. **Startup proxy sync** (`proxy_addon.py` `request` hook) — On the first request to `darwinproject.ca` after game launch, if `directorDeckEnabled = True` in `state.json`, the proxy makes a blocking `saveOthersOptionsCommand` POST using the fresh auth headers from that intercepted request. This runs BEFORE the game's profile GET, so the server has the correct deck when the game initializes. This is the primary sync path. Syncs every launch unconditionally (the `needsSync` gate was removed — it was unreliable).
+
+2. **Pre-launch force sync** (`_do_launch()` in `discord_bot.py`) — Before launching the game, the bot calls `/api/force-sync-deck` on the noble-hopper server, which uses the auth token captured from the previous game session. This handles the case where `needsSync` was already True from a deck edit before this launch. May fail if the token has expired between sessions.
+
+3. **Piggybacked sync** (`proxy_addon.py` `request` hook) — Whenever the game sends any `saveOthersOptionsCommand` (e.g. when visiting the Director Deck screen in-game), the proxy intercepts and overrides `sDPowerArray` with the configured deck.
+
+**`needsSync` flag flow:**
+- Set to `True` by `_write_deck()` in `discord_bot.py` whenever the user saves a deck change via `/deck`
+- Cleared to `False` by the startup proxy sync on success
+- Cleared to `False` by `/api/force-sync-deck` on success
+- The 30-second rate limit on `_last_sync_attempt` in `SkinChangerAddon` prevents hammering the API if multiple game requests fire in quick succession at startup
+
+**`state.json` key fields:**
+- `directorDeck` — 11-slot array of `ItemType_*` strings (the desired deck)
+- `directorDeckEnabled` — bool, must be true for any sync to fire
+- `capturedApiUrl` — `https://pc-live.api.darwinproject.ca/profile/commands/<userId>` (captured from game traffic)
+- `capturedApiHeaders` — auth headers from the game's last API request (token refreshes each session)
+- `lastOthersOptions` — full `othersOptions` object template, needed to construct valid `saveOthersOptionsCommand` body
+- `lastSyncedDeck` — cleared by `_write_deck()` to mark a pending change
+- `needsSync` — True when a deck change is pending startup sync
+
+**Card display aliases** (`_DIRECTOR_CARDS` in `discord_bot.py`):
+The Discord UI shows friendly names that differ from the internal ItemType. The mapping is display-only — the ItemType values used in all API calls are unchanged:
+| Display name | ItemType |
+|---|---|
+| Beach Party | `ItemType_SDP_NakedAll` |
+| Blood Moon | `ItemType_SDP_Hecatombe` |
+| Expose | `ItemType_SDP_MutualVision` |
+| Spawn Electronic | `ItemType_SDP_ActivatePylon` |
+| Electromania | `ItemType_SDP_ActivateAllPylons` |
+
 ### Card Actions (`game/card_actions.py`)
 
 `play_card()` shift-drags from a slot coordinate to a target coordinate, then optionally verifies the card left its slot via template match. All actions respect `bypass_mode` — when enabled, logs the action and waits for Enter instead of sending input to the game.
+
+**`press_key()` — PostMessage routing for game input:**
+Darwin Project uses Raw Input. `pyautogui.press()` sends to whichever window is focused, which is often Discord. `press_key()` sidesteps this by sending `WM_KEYDOWN` / `WM_KEYUP` via `win32api.PostMessage()` directly to the Darwin hwnd — no focus change required. Keys in `_SCAN_CODES` (`b`, `escape`, `shift`, and others) use this path; anything not in that dict falls back to `pyautogui.press()` with `focus_darwin_window()` first.
+
+**`focus_darwin_window()` — AttachThreadInput trick:**
+Standard `SetForegroundWindow()` fails from background processes (Windows blocks cross-process focus stealing). The fix: call `AttachThreadInput(current_thread, darwin_thread, True)` to share input queues before calling `SetForegroundWindow()`. Always detach after. Only needed for the `pyautogui` fallback path — PostMessage-based keys don't require focus at all.
+
+**`shift_down()` / `shift_up()` — public shift hold:**
+Used internally by `play_card()`, `grab_card()`, and `complete_drag()`. The same two-part combo (pyautogui.keyDown + PostMessage WM_KEYDOWN) is required — both must fire or the tray won't open.
+
+**`grab_card(slot_coordinate)` / `release_card()` / `complete_drag(target_coordinate, card_name)`:**
+Split the card drag into three steps so zone state can be read from the map between grab and play:
+- `grab_card()` — shift+moveTo+mouseDown; the big zone map appears on mouseDown
+- `release_card()` — mouseUp+shift_up with no drag; cancels the play, card returns to slot
+- `complete_drag()` — moveTo+mouseUp+shift_up to finish a grab already in progress
+
+**Zone state detection — grab-based:**
+The big zone map only appears when a zone_close card is grabbed (shift+click+hold). Zone states cannot be read with a shift-only peek. The flow in `_attempt_zone_close()`:
+1. Wait for enough director points
+2. `grab_card()` → `time.sleep(0.35)` → screenshot
+3. `_update_zone_states_from_screenshot()` — votes across 4 `zone_map_sample_points` per tile; majority wins
+4. `valid_closeable_zones()` + strategy → pick zone
+5. `complete_drag()` to target zone, or `release_card()` if nothing closeable
+In bypass mode, uses cached `_zone_states` (all OPEN initially) and calls `play_card(bypass_mode=True)`.
+
+**Zone visual states on the big map (what to calibrate against):**
+- **OPEN**: plain medium blue/teal hex, no border glow
+- **CLOSING**: visibly darker (navy/dim) hex, no orange border — tile darkens as lava begins but orange outline has not appeared yet
+- **CLOSED**: dark red/maroon hex with a bright orange border glow at the edges
+
+Sample points are placed at ~110px from each tile center (near the hex edge, well outside the player icon area at center). At this distance, colors are: OPEN=blue, CLOSING=dark navy, CLOSED=dark red. The orange border glow is right at the very edge and would require sampling at ~120-125px to catch; the interior color differences are sufficient for three-way distinction. Calibrate `zone_color_thresholds` using `calibrate_zone_colors.py` while holding a zone_close card with known zone states visible.
 
 ## Custom Lobby Creation Flow (`_do_create_custom`)
 
@@ -191,6 +284,8 @@ Step 9 — Lobby
   sleep(10.0)                                    wait for game lag before clipboard
   click(center[0]+316, center[1]-9)             clipboard icon offset from label center
   pyperclip.paste()                             → lobby code
+  press_key("escape")                           close the lobby menu
+  press_key("shift")                            dismiss the initial tray display
 ```
 
 **Key offsets calibrated at 1920×1080:**
@@ -242,6 +337,23 @@ On each retry, moves mouse to `(960, 300)` first to force a fresh `MouseEnter` o
 - Cross-test against screens where the template should NOT match (score must be < 0.8)
 - Templates with animation/glow (e.g. "CHOOSE ROLE" title) score poorly — crop a static element instead
 - Avoid including ping/ms values in region templates (they change between sessions)
+- **"REWARD" text on the results screen does NOT render in pyautogui screenshots** (it lives on a separate GPU layer). Use the MAIN MENU button (`placement_badge.png`) for match-end detection instead.
+
+### Match end detection pitfalls
+
+`placement_badge.png` is the "MAIN MENU" button (white text on dark blue, 98×30px). It appears on the results screen and is also used by `_do_post_match_return()` to find and click MAIN MENU after the match.
+
+- Threshold is **0.88** — lower values cause false positives from HUD elements during the match
+- Double-confirm required: the template must match **twice, 2 seconds apart** before ending the match (`_match_has_ended()`)
+- `poll_for_match_end()` saves a debug screenshot to `screenshots/errors/` on every positive detection (useful for debugging false positives)
+
+### Match profiles (`game/profiles.py`)
+
+Profiles define the card play schedule. Active profile is set in `config.json → active_profile`.
+
+**Standard profile** (default): Electromania 2:30 · Beach Party 4:00 · Electromania 6:30 · Blood Moon 9:00
+
+Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The bot picks it up via `get_profile()` — no other changes needed.
 
 ## Config Reference (`config.json`)
 
@@ -269,18 +381,22 @@ On each retry, moves mouse to `(960, 300)` first to force a fresh `MouseEnter` o
         }
     },
     "zone_close_card_slot": null,        // [x, y] of the Close Zone card — calibrate
-    "zone_sample_coordinates": {         // [x, y] pixel to sample per zone — calibrate
-        "1": null, ..., "7": null
+    "zone_map_sample_points": {          // 3-5 [x,y] points per zone tile on the big map (appears when grabbing a zone_close card)
+        "1": null, "2": null, "3": null, "4": null, "5": null, "6": null, "7": null
     },
     "zone_drop_coordinates": {           // [x, y] drag target per zone — calibrate
         "1": null, ..., "7": null
     },
-    "zone_color_thresholds": {           // RGB tuples for open/closing/closed — calibrate
+    "zone_color_thresholds": {           // RGB tuples for open/closing/closed — calibrate against whichever source above is active
         "open": null,
         "closing": null,
         "closed": null
     },
-    "results_ocr_regions": null,         // Per-column (x,y,w,h) lists — calibrate
+    "results_ocr_regions": null,         // Per-column (x,y,w,h) lists — calibrate (optional; bot now sends screenshot)
+    "director_points_region": [782, 1002, 76, 24],   // OCR region for "03/10" points display
+    "director_points_pips": {            // Pixel sampling for filled pip count
+        "x_start": 862, "y": 1012, "spacing": 26, "count": 10
+    },
     "screen_poll_interval_seconds": 12,
     "launch_timeout_seconds": 60
 }
@@ -313,7 +429,7 @@ All templates captured at **1920×1080** via pyautogui. Centers listed are for t
 | `quit_to_main_menu.png` | Quit confirmation popup header | (960, 457) |
 | `yes_button.png` | YES button in quit confirmation | (821, 583) |
 | `latest_updates_continue.png` | CONTINUE on director splash screen | dynamic |
-| `placement_badge.png` | Match end detection — **not yet captured** | — |
+| `placement_badge.png` | Match end detection — **MAIN MENU button** (98×30px at x=1780, y=1028) | (1829, 1043) |
 
 ## Calibration Checklist
 
@@ -327,8 +443,9 @@ All templates captured at **1920×1080** via pyautogui. Centers listed are for t
 - [ ] `zone_sample_coordinates` (all 7 zones)
 - [ ] `zone_drop_coordinates` (all 7 zones)
 - [ ] `zone_color_thresholds` (open / closing / closed RGB values)
-- [ ] `results_ocr_regions` (x,y,w,h per column per row)
-- [ ] `templates/placement_badge.png` captured (requires a match to end)
+- [ ] `results_ocr_regions` (x,y,w,h per column per row) — not needed if sending screenshot to Discord
+- [x] `templates/placement_badge.png` captured (MAIN MENU button, 98×30px — self-match 1.0, in-game HUD 0.50)
+- [x] `director_points_region` and `director_points_pips` calibrated in config.json
 
 ## Testing Requirements
 
@@ -343,17 +460,13 @@ Custom matches in Darwin Project require **Director + minimum 2 players** to sta
 
 ## Pending Implementation (TODOs)
 
-- `game/match_runner.py` — `_pre_match_deck_check()`: navigate deck tab, screenshot, compare card list
 - `bot/discord_bot.py` — `_do_launch()`: replace template path placeholder with real captured template
-- `bot/discord_bot.py` — `_do_deck_check()`: UI navigation to deck tab, screenshot, parse current deck
 - In-game calibration: card slot coordinates, zone pixel coordinates, zone color thresholds, OCR regions (requires live Director match with 2+ players)
 
 ## Future Enhancements (from plan)
 
-- Director points bar monitoring before card plays
 - Variable zone closing timing
 - Lobby screenshot polling for automatic player count detection
 - Additional zone selection strategies
-- Card deck modification via `/deck` parameter
 - Zone coordinate calibration utility
 - Multi-resolution support

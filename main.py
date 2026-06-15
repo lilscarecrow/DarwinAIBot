@@ -1,7 +1,12 @@
+import atexit
 import json
 import logging
+import subprocess
 import sys
+import time
 from pathlib import Path
+
+import psutil
 
 from session.state import SessionState
 from zones.strategy_factory import valid_strategy_names
@@ -50,11 +55,20 @@ def validate_config(config: dict) -> list[str]:
             f"Valid options: {valid_strategy_names()}"
         )
 
-    card_slots = config.get("card_slots", {})
-    if len(card_slots) != 10:
-        errors.append(f"card_slots must have exactly 10 entries, found {len(card_slots)}")
-
     return errors
+
+
+def _kill_noble_hopper(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    logger.info("Shutting down noble-hopper proxy (pid %d)...", proc.pid)
+    try:
+        parent = psutil.Process(proc.pid)
+        for child in parent.children(recursive=True):
+            child.kill()
+        parent.kill()
+    except psutil.NoSuchProcess:
+        pass
 
 
 def main():
@@ -69,6 +83,26 @@ def main():
         sys.exit(1)
 
     logger.info("Config validated successfully")
+
+    from game import tts
+    tts.configure(
+        device_name=config.get("tts_device"),
+        voice=config.get("tts_voice", "en-US-ChristopherNeural"),
+        bypass=config.get("ahk_bypass_mode", False),
+    )
+
+    noble_hopper = Path("noble-hopper")
+    if noble_hopper.exists():
+        logger.info("Starting noble-hopper proxy...")
+        nh_proc = subprocess.Popen(
+            [sys.executable, "launcher.py"],
+            cwd=str(noble_hopper),
+        )
+        atexit.register(_kill_noble_hopper, nh_proc)
+        time.sleep(3)
+        logger.info("Noble-hopper launched (pid %d)", nh_proc.pid)
+    else:
+        logger.warning("noble-hopper directory not found — skipping proxy launch")
 
     session = SessionState()
 
