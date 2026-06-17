@@ -45,6 +45,9 @@ DarwinAIBot/
 │   ├── screen_detection.py     # OpenCV template matching, pixel sampling, screenshots
 │   ├── card_actions.py         # Shift-drag card plays, key presses, bypass mode
 │   ├── ocr.py                  # Tesseract results parsing, Discord formatter
+│   ├── tts.py                  # TTS worker queue, broadcast/cable modes, Discord voice
+│   ├── deck_utils.py           # Card point costs, deck layout from state.json
+│   ├── profiles.py             # Match card play schedules
 │   └── match_runner.py         # Full match loop (card timers, zone closes, end detection)
 ├── session/
 │   └── state.py                # BotState enum + SessionState machine
@@ -117,7 +120,7 @@ All responses use `discord.Embed` with color-coded status (green=ok, red=fail, b
 - If OCR count == pip_count (conservative + 1), the last pip is fully filled — trust OCR
 - Fallback to OCR alone if pip config missing; no-op if neither configured
 - Config: `director_points_pips: {"x_start": 862, "y": 1012, "spacing": 26, "count": 10}`
-- Config: `director_points_region: [782, 1002, 76, 24]` (for OCR fallback)
+- Config: `director_points_region: [808, 1002, 20, 24]` — calibrated to the 2-digit numerator only (not the `/10`); x=808 skips background/tree pixels on the left, w=20 excludes the slash and denominator. OCR uses 4× upscale + Otsu auto-threshold + PSM 8 (single word) for best accuracy.
 
 **Card point costs** (all in `CARD_POINT_COSTS` in `game/deck_utils.py`):
 | Card | Cost | Card | Cost |
@@ -164,6 +167,9 @@ Zone strategy is pluggable via `config.json → zone_selection_strategy`. Adding
 | `main_menu` | `play_button.png` | Main menu with PLAY / CUSTOM / TRAINING |
 
 ### Director Deck Sync (`noble-hopper/`)
+
+> **Note:** `noble-hopper/` is gitignored — it is not tracked in this repo. It runs as a separate local process launched by `main.py`. `noble-hopper/state.json` contains captured auth tokens and must never be committed.
+
 
 The Director deck is managed entirely via the game's API — no UI automation is needed. The noble-hopper process (mitmproxy + web server) handles sync.
 
@@ -216,19 +222,19 @@ Standard `SetForegroundWindow()` fails from background processes (Windows blocks
 **`shift_down()` / `shift_up()` — public shift hold:**
 Used internally by `play_card()`, `grab_card()`, and `complete_drag()`. The same two-part combo (pyautogui.keyDown + PostMessage WM_KEYDOWN) is required — both must fire or the tray won't open.
 
-**`grab_card(slot_coordinate)` / `release_card()` / `complete_drag(target_coordinate, card_name)`:**
+**`grab_card(slot_coordinate, shift_already_held=False)` / `release_card()` / `complete_drag(target_coordinate, card_name)`:**
 Split the card drag into three steps so zone state can be read from the map between grab and play:
-- `grab_card()` — shift+moveTo+mouseDown; the big zone map appears on mouseDown
+- `grab_card()` — shift+moveTo+mouseDown; the big zone map appears on mouseDown. Pass `shift_already_held=True` if the caller already called `shift_down()` (e.g. to hold shift for a before-screenshot) — avoids a redundant second `shift_down`.
 - `release_card()` — mouseUp+shift_up with no drag; cancels the play, card returns to slot
 - `complete_drag()` — moveTo+mouseUp+shift_up to finish a grab already in progress
 
 **Zone state detection — grab-based:**
 The big zone map only appears when a zone_close card is grabbed (shift+click+hold). Zone states cannot be read with a shift-only peek. The flow in `_attempt_zone_close()`:
 1. Wait for enough director points
-2. `grab_card()` → `time.sleep(0.35)` → screenshot
+2. `shift_down()` → before-screenshot (tray visible) → `grab_card(shift_already_held=True)` → `time.sleep(0.35)` → screenshot
 3. `_update_zone_states_from_screenshot()` — votes across 4 `zone_map_sample_points` per tile; majority wins
-4. `valid_closeable_zones()` + strategy → pick zone
-5. `complete_drag()` to target zone, or `release_card()` if nothing closeable
+4. `valid_closeable_zones()` → pick zone (live path uses random shuffle across valid zones, not the configured strategy — intentional for now)
+5. `complete_drag(keep_shift=True)` to target zone → after-screenshot → verify slot pixel changed → `shift_up()`, or `mouseUp()+shift_up()` if nothing closeable
 In bypass mode, uses cached `_zone_states` (all OPEN initially) and calls `play_card(bypass_mode=True)`.
 
 **Zone visual states on the big map (what to calibrate against):**
@@ -237,6 +243,30 @@ In bypass mode, uses cached `_zone_states` (all OPEN initially) and calls `play_
 - **CLOSED**: dark red/maroon hex with a bright orange border glow at the edges
 
 Sample points are placed at ~110px from each tile center (near the hex edge, well outside the player icon area at center). At this distance, colors are: OPEN=blue, CLOSING=dark navy, CLOSED=dark red. The orange border glow is right at the very edge and would require sampling at ~120-125px to catch; the interior color differences are sufficient for three-way distinction. Calibrate `zone_color_thresholds` using `calibrate_zone_colors.py` while holding a zone_close card with known zone states visible.
+
+### TTS (`game/tts.py`)
+
+All TTS is **fire-and-forget** — no call blocks the match loop. A single `_worker_thread` processes `(text, mode)` tuples from `_queue` in order.
+
+**Config required:** `tts_device` must be set in `config.json` (e.g. `"CABLE Input"`). If absent, TTS is silently disabled (`tts.is_enabled()` returns False). Use `tts.is_enabled()` to check — do not access `_device_name` directly.
+
+**Broadcast lifecycle (in-game voice chat via G key):**
+- G opens a 15s window, then 90s cooldown (`_BROADCAST_CYCLE = 105s`)
+- `try_open_broadcast()` — checks cooldown, presses G if available, returns True/False
+- `queue_close_broadcast()` — queues a sentinel that presses G to close the window **after all preceding audio in the queue finishes**. This is the correct way to close broadcast — never call `close_broadcast()` directly mid-sequence.
+- `close_broadcast()` — presses G immediately and resets cooldown to 90s from now. Only call directly when no audio is queued.
+
+**TTS functions:**
+- `speak_cable(text)` — queues audio to CABLE Input, no G press. Use for all in-broadcast announcements (broadcast window already open).
+- `speak(text, broadcast=True)` — queues audio; if `broadcast=True`, the worker checks cooldown, presses G, plays audio (standalone use — not used in the match loop).
+- `try_open_broadcast()` + `speak_cable(...)` + `queue_close_broadcast()` — the correct pattern for in-match card announcements.
+
+**Waiting-on-points broadcast close:**
+If `_wait_for_points()` needs to wait and the broadcast window is open, it queues `speak_cable("Waiting on points for X")` then `queue_close_broadcast()` immediately — the 90s cooldown starts ticking while waiting for points. When points arrive, `_fire_card_event` tries `try_open_broadcast()` again (may fail if cooldown hasn't expired).
+
+**Pre-caching:** `precache_async(phrases)` fires a background thread that generates and caches all TTS audio via edge-tts before cards fire, so every queued phrase hits the cache instead of making a live network request.
+
+**Discord voice mirroring:** `/voice join` connects the bot to the user's voice channel — all TTS audio then plays concurrently to both CABLE Input and the Discord channel. Set/cleared via `tts.set_voice_client(vc)`.
 
 ## Custom Lobby Creation Flow (`_do_create_custom`)
 
@@ -362,25 +392,30 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "game_executable_path": "",          // Full path to DarwinProject.exe
     "discord_bot_token": "",             // Discord bot token (keep secret)
     "discord_required_role": "DarwinBotAdmin",
+    "discord_guild_ids": ["..."],        // Guild IDs for instant slash command sync
     "zone_selection_strategy": "weighted_outer",
+    "active_profile": "standard",        // Match card play profile (see game/profiles.py)
     "ahk_bypass_mode": false,            // true = log actions instead of executing
+    "tts_device": "CABLE Input",         // Sounddevice output name for TTS; omit to disable TTS
+    "tts_voice": "en-US-ChristopherNeural",  // edge-tts voice name
+    "card_play_lead_time_seconds": 2,    // Fire card events this many seconds early to account for drag time
 
-    "card_slots": {                      // Screen coordinates for each card slot (0-9)
-        "1": null, "2": null, ...        // e.g. [960, 850] — calibrate in-game
-    },
+    // Card tray layout (calibrate with shift held in-game)
+    "card_tray_center_x": 966,           // X center of the tray when all cards visible
+    "card_tray_card_y": 943,             // Y coordinate of card center row
+    "card_tray_card_width": 76,          // Pixel spacing between card centers
+
     "cards": {
         "electromania": {
-            "slot": null,                // Which card_slot key this card is in
-            "play_time_seconds": 120,    // 2:00
             "drop_target": null          // [x, y] to drag to — calibrate in-game
         },
         "beach_party": {
-            "slot": null,
-            "play_time_seconds": 240,    // 4:00
+            "drop_target": null
+        },
+        "blood_moon": {
             "drop_target": null
         }
     },
-    "zone_close_card_slot": null,        // [x, y] of the Close Zone card — calibrate
     "zone_map_sample_points": {          // 3-5 [x,y] points per zone tile on the big map (appears when grabbing a zone_close card)
         "1": null, "2": null, "3": null, "4": null, "5": null, "6": null, "7": null
     },
@@ -393,12 +428,12 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
         "closed": null
     },
     "results_ocr_regions": null,         // Per-column (x,y,w,h) lists — calibrate (optional; bot now sends screenshot)
-    "director_points_region": [782, 1002, 76, 24],   // OCR region for "03/10" points display
+    "director_points_region": [808, 1002, 20, 24],  // OCR crop: 2-digit numerator only (not "/10"). Calibrated at 1920×1080.
     "director_points_pips": {            // Pixel sampling for filled pip count
         "x_start": 862, "y": 1012, "spacing": 26, "count": 10
     },
     "screen_poll_interval_seconds": 12,
-    "launch_timeout_seconds": 60
+    "launch_timeout_seconds": 180
 }
 ```
 
@@ -445,7 +480,9 @@ All templates captured at **1920×1080** via pyautogui. Centers listed are for t
 - [ ] `zone_color_thresholds` (open / closing / closed RGB values)
 - [ ] `results_ocr_regions` (x,y,w,h per column per row) — not needed if sending screenshot to Discord
 - [x] `templates/placement_badge.png` captured (MAIN MENU button, 98×30px — self-match 1.0, in-game HUD 0.50)
-- [x] `director_points_region` and `director_points_pips` calibrated in config.json
+- [x] `director_points_region` calibrated to `[808, 1002, 20, 24]` (2-digit numerator only)
+- [x] `director_points_pips` calibrated in config.json
+- [x] `tts_device` set to `"CABLE Input"` in config.json
 
 ## Testing Requirements
 
