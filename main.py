@@ -87,7 +87,7 @@ def main():
     from game import tts
     tts.configure(
         device_name=config.get("tts_device"),
-        voice=config.get("tts_voice", "en-US-ChristopherNeural"),
+        voice=config.get("tts_voice", "en-US-AriaNeural"),
         bypass=config.get("ahk_bypass_mode", False),
     )
 

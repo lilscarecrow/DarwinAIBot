@@ -397,7 +397,7 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "active_profile": "standard",        // Match card play profile (see game/profiles.py)
     "ahk_bypass_mode": false,            // true = log actions instead of executing
     "tts_device": "CABLE Input",         // Sounddevice output name for TTS; omit to disable TTS
-    "tts_voice": "en-US-ChristopherNeural",  // edge-tts voice name
+    "tts_voice": "en-US-AriaNeural",  // edge-tts voice name
     "card_play_lead_time_seconds": 2,    // Fire card events this many seconds early to account for drag time
 
     // Card tray layout (calibrate with shift held in-game)
@@ -500,6 +500,25 @@ Custom matches in Darwin Project require **Director + minimum 2 players** to sta
 - `bot/discord_bot.py` — `_do_launch()`: replace template path placeholder with real captured template
 - In-game calibration: card slot coordinates, zone pixel coordinates, zone color thresholds, OCR regions (requires live Director match with 2+ players)
 
+## Player-Targeted Cards
+
+Cards that target a specific player (`expose`, `favorite_player`, `give_leather`, `give_wood`, `man_hunt`, `speed_boost`, `warm_up`) drag to a player card slot at the top of the screen. These are grouped as `_PLAYER_TARGETED_CARDS` in `match_runner.py` and pick from `player_target_coordinates` in config at runtime (same pattern as zone-targeted cards).
+
+**Player bar layout:**
+- Up to 9 numbered player cards (slots 1–9) run across the top of the HUD
+- A 10th card sometimes appears at the far left — this is a known client glitch (spinning loading icon, no name, no health bar). It is not a real player and must be excluded from targeting.
+- Dead/eliminated players show: greyed-out name, "ELIMINATED" text, X overlaid on portrait, and no health bar.
+
+**Do not use OCR for player targeting.** Names are small, variable color, and the glitch card has no name. The reliable signal is the **health bar**:
+- Alive player → colored health bar pixel at the bottom of the card
+- Dead / glitch card → dark/empty pixel at that position
+
+**Planned implementation (not yet built):**
+- Config: `player_card_slots` — list of `[x, y]` center coordinates for each of the 9 fixed slot positions (calibrate once; positions don't change between matches even if players do)
+- Config: `player_health_bar_y_offset` — pixel offset below card center where the health bar sits
+- At play time: sample the health bar pixel for each slot; collect slots where pixel is colored (alive); pick one at random and drag there
+- The glitch slot is excluded by only calibrating slots 1–9 in `player_card_slots`
+
 ## Future Enhancements (from plan)
 
 - Variable zone closing timing
@@ -507,3 +526,4 @@ Custom matches in Darwin Project require **Director + minimum 2 players** to sta
 - Additional zone selection strategies
 - Zone coordinate calibration utility
 - Multi-resolution support
+- Player-targeted card implementation (health bar sampling to find alive players — see Player-Targeted Cards section above)

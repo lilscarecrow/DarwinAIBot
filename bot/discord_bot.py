@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Optional
 
 import discord
@@ -196,7 +197,7 @@ class _EndConfirmView(discord.ui.View):
             self._cog._active_runner.stop()
         from game.launcher import close_game
         close_game()
-        self._cog.bot.session.reset()
+        self._cog._reset_session()
         self.stop()
         embed = discord.Embed(title="Session Ended", description="Game closed. Bot reset to IDLE.", color=_COLOR_OK)
         await interaction.response.edit_message(embed=embed, view=None)
@@ -216,6 +217,64 @@ class _EndConfirmView(discord.ui.View):
     async def on_timeout(self):
         # View expires silently — no edit possible without storing the message reference
         self.stop()
+
+
+class _ProfileButton(discord.ui.Button):
+    def __init__(self, key: str, display_name: str, is_active: bool):
+        super().__init__(
+            label=display_name,
+            style=discord.ButtonStyle.success if is_active else discord.ButtonStyle.secondary,
+        )
+        self.key = key
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "_ProfileSelectView" = self.view
+        await view.select_profile(interaction, self.key)
+
+
+class _ProfileSelectView(discord.ui.View):
+    def __init__(self, cog: "DirectorCog", active_key: str):
+        super().__init__(timeout=60)
+        self._cog = cog
+        self._active = active_key
+        self._rebuild()
+
+    def _rebuild(self):
+        self.clear_items()
+        from game.profiles import PROFILES
+        for key, p in PROFILES.items():
+            self.add_item(_ProfileButton(key, p["display_name"], key == self._active))
+
+    async def select_profile(self, interaction: discord.Interaction, key: str):
+        self._active = key
+        self._cog.bot.config["active_profile"] = key
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            cfg_path = _Path("config.json")
+            with cfg_path.open(encoding="utf-8") as f:
+                on_disk = _json.load(f)
+            on_disk["active_profile"] = key
+            with cfg_path.open("w", encoding="utf-8") as f:
+                _json.dump(on_disk, f, indent=4)
+        except Exception as ex:
+            logger.warning("Could not persist active_profile to config.json: %s", ex)
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    def build_embed(self) -> discord.Embed:
+        from game.profiles import PROFILES, get_profile, profile_summary
+        p = get_profile(self._active)
+        embed = discord.Embed(
+            title="Match Profile",
+            description=f"Active: **{p['display_name']}**",
+            color=_COLOR_OK,
+        )
+        for prof in PROFILES.values():
+            embed.add_field(name=prof["display_name"], value=profile_summary(prof), inline=False)
+        if self._cog.bot.session.state == BotState.MATCH_IN_PROGRESS:
+            embed.set_footer(text="Takes effect on next /start")
+        return embed
 
 
 class DarwinBot(commands.Bot):
@@ -265,6 +324,10 @@ class DirectorCog(commands.Cog):
         # Background task that fires the match runner when the lobby auto-start
         # timer expires. Cancelled immediately if /start is used manually.
         self._auto_start_task: Optional[asyncio.Task] = None
+        # Absolute monotonic time when the lobby expires (set by auto-start watcher).
+        self._lobby_expiry: Optional[float] = None
+        # Profile resolved at /custom time so the same pick is used at /start.
+        self._resolved_profile: Optional[dict] = None
 
     # Screen name → (BotState, label) used by the background screen watcher
     _SCREEN_STATES = {
@@ -272,6 +335,7 @@ class DirectorCog(commands.Cog):
         "custom_browser":  (BotState.IN_MENU,   "Custom match browser"),
         "create_match":    (BotState.IN_MENU,   "Create Match screen"),
         "director_lobby":  (BotState.IN_CUSTOM, "Director lobby"),
+        "lobby_open":      (BotState.IN_CUSTOM, "Director lobby (open)"),
         "director_splash": (BotState.LAUNCHING, "Latest Updates splash"),
     }
 
@@ -358,7 +422,7 @@ class DirectorCog(commands.Cog):
                     logger.info("Screen watcher: IN_MENU idle > 10 min — closing game")
                     from game.launcher import close_game
                     await loop.run_in_executor(None, close_game)
-                    self.bot.session.reset()
+                    self._reset_session()
             except Exception as e:
                 logger.debug("Screen watcher error: %s", e)
 
@@ -369,6 +433,18 @@ class DirectorCog(commands.Cog):
     def _has_role(self, interaction: discord.Interaction) -> bool:
         required = self.bot.config.get("discord_required_role", "")
         return any(r.name == required for r in interaction.user.roles)
+
+    def _reset_session(self):
+        """Reset session state and clear any lobby-scoped cached values."""
+        if self._auto_start_task and not self._auto_start_task.done():
+            self._auto_start_task.cancel()
+            logger.info("Auto-start watcher cancelled by session reset")
+        self._auto_start_task = None
+        self._resolved_profile = None
+        self._lobby_expiry = None
+        from game import tts
+        tts.stop()
+        self.bot.session.reset()
 
     async def _role_check(self, interaction: discord.Interaction) -> bool:
         """Silent ignore if user lacks the required role (per spec)."""
@@ -422,7 +498,7 @@ class DirectorCog(commands.Cog):
                 )
             except asyncio.TimeoutError:
                 self._stop_event.set()
-                self.bot.session.reset()
+                self._reset_session()
                 await interaction.followup.send(embed=self._fail(
                     "Launch Timed Out",
                     f"No menu screen detected after {int(_LAUNCH_TIMEOUT // 60)} minutes.\n"
@@ -441,7 +517,7 @@ class DirectorCog(commands.Cog):
                 "Menu screen detected. Run `/custom` to create a match.",
             ))
         else:
-            self.bot.session.reset()
+            self._reset_session()
             await interaction.followup.send(embed=self._fail(
                 "Launch Failed",
                 "Failed to launch or detect the menu screen. Bot reset to IDLE.\n"
@@ -543,64 +619,13 @@ class DirectorCog(commands.Cog):
     # /profile
     # ------------------------------------------------------------------
 
-    @app_commands.command(name="profile", description="View or set the active Director match profile")
-    @app_commands.describe(name="Profile to activate (leave blank to view current)")
-    async def profile(self, interaction: discord.Interaction, name: Optional[str] = None):
+    @app_commands.command(name="profile", description="View and set the active Director match profile")
+    async def profile(self, interaction: discord.Interaction):
         if not await self._role_check(interaction):
             return
-
-        from game.profiles import PROFILES, get_profile, profile_summary
-
-        if name is None:
-            active = self.bot.config.get("active_profile", "standard")
-            p = get_profile(active)
-            embed = self._ok(
-                f"Active Profile: {p['display_name']}",
-                profile_summary(p),
-            )
-            embed.add_field(name="Key", value=f"`{active}`", inline=True)
-            embed.add_field(name="Available", value="  ".join(f"`{k}`" for k in PROFILES), inline=True)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        if name not in PROFILES:
-            keys = ", ".join(f"`{k}`" for k in PROFILES)
-            await interaction.response.send_message(
-                f"Unknown profile `{name}`. Available: {keys}", ephemeral=True
-            )
-            return
-
-        self.bot.config["active_profile"] = name
-        try:
-            import json as _json
-            from pathlib import Path as _Path
-            cfg_path = _Path("config.json")
-            with cfg_path.open(encoding="utf-8") as f:
-                on_disk = _json.load(f)
-            on_disk["active_profile"] = name
-            with cfg_path.open("w", encoding="utf-8") as f:
-                _json.dump(on_disk, f, indent=4)
-        except Exception as ex:
-            logger.warning("Could not persist active_profile to config.json: %s", ex)
-
-        p = PROFILES[name]
-        embed = self._ok(f"Profile Set: {p['display_name']}", profile_summary(p))
-        in_match = self.bot.session.state == BotState.MATCH_IN_PROGRESS
-        note = " · Takes effect on next /start" if in_match else ""
-        state_label = self.bot.session.state.name.replace("_", " ").title()
-        embed.set_footer(text=f"State: {state_label}{note}")
-        await interaction.response.send_message(embed=embed)
-
-    @profile.autocomplete("name")
-    async def _profile_autocomplete(
-        self, interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        from game.profiles import PROFILES, profile_summary
-        return [
-            app_commands.Choice(name=f"{p['display_name']} — {profile_summary(p)}", value=key)
-            for key, p in PROFILES.items()
-            if current.lower() in key.lower() or current.lower() in p["display_name"].lower()
-        ]
+        active = self.bot.config.get("active_profile", "standard")
+        view = _ProfileSelectView(self, active)
+        await interaction.response.send_message(embed=view.build_embed(), view=view)
 
     # ------------------------------------------------------------------
     # /custom
@@ -623,6 +648,28 @@ class DirectorCog(commands.Cog):
         if not await self._lock_check(interaction):
             return
 
+        from game.profiles import resolve_profile
+        from game.deck_utils import deck_layout_from_state, validate_profile_deck
+        _active_key = self.bot.config.get("active_profile", "standard")
+        self._resolved_profile = resolve_profile(_active_key)
+        if _active_key == "randomizer":
+            logger.info("Profile selected by randomizer: %s", self._resolved_profile["display_name"])
+        else:
+            logger.info("Profile: %s", self._resolved_profile["display_name"])
+
+        _deck_layout = deck_layout_from_state()
+        if _deck_layout:
+            _warnings = validate_profile_deck(self._resolved_profile, _deck_layout)
+            if _warnings:
+                _name = self._resolved_profile["display_name"]
+                self._resolved_profile = None
+                await interaction.response.send_message(embed=self._fail(
+                    "Deck / Profile Mismatch",
+                    f"The **{_name}** profile requires cards not in the deck:\n"
+                    + "\n".join(f"• {w}" for w in _warnings),
+                ))
+                return
+
         await interaction.response.defer(thinking=True)
 
         async with self._session_lock:
@@ -636,7 +683,7 @@ class DirectorCog(commands.Cog):
                 )
             except asyncio.TimeoutError:
                 self._stop_event.set()
-                self.bot.session.reset()
+                self._reset_session()
                 await interaction.followup.send(embed=self._fail(
                     "Custom Match Timed Out",
                     f"Match creation did not complete within {int(_CUSTOM_TIMEOUT)}s. Bot reset to IDLE.\n"
@@ -650,8 +697,10 @@ class DirectorCog(commands.Cog):
                 last_action="Custom match created",
                 next_action="Await /start",
             )
+            _profile_label = "Randomizer" if _active_key == "randomizer" else self._resolved_profile["display_name"]
             embed = self._ok("Custom Match Ready", "Private lobby created. Share the code with your players.")
             embed.add_field(name="Region", value=region.name, inline=True)
+            embed.add_field(name="Profile", value=_profile_label, inline=True)
             embed.add_field(name="Lobby Code", value=f"```{lobby_code}```", inline=False)
             await interaction.followup.send(embed=embed)
 
@@ -661,7 +710,7 @@ class DirectorCog(commands.Cog):
                 self._watch_for_auto_start(interaction.channel)
             )
         else:
-            self.bot.session.reset()
+            self._reset_session()
             await interaction.followup.send(embed=self._fail(
                 "Custom Match Failed",
                 "Could not complete match setup. Bot reset to IDLE.\n"
@@ -905,7 +954,7 @@ class DirectorCog(commands.Cog):
                 )
             except asyncio.TimeoutError:
                 self._stop_event.set()
-                self.bot.session.reset()
+                self._reset_session()
                 await interaction.followup.send(embed=self._fail(
                     "Menu Navigation Timed Out",
                     "Did not reach the main menu within 60s. Bot reset to IDLE.\n"
@@ -924,7 +973,7 @@ class DirectorCog(commands.Cog):
                 "Lobby closed. Run `/custom` to create a new match.",
             ))
         else:
-            self.bot.session.reset()
+            self._reset_session()
             await interaction.followup.send(embed=self._fail(
                 "Menu Navigation Failed",
                 "Could not return to the main menu. Bot reset to IDLE.\n"
@@ -938,6 +987,7 @@ class DirectorCog(commands.Cog):
             detect_current_screen, wait_for_template_center,
             find_template, take_screenshot, save_error_screenshot,
         )
+        from game.card_actions import press_key
 
         def stopped() -> bool:
             return self._stop_event.is_set()
@@ -961,6 +1011,13 @@ class DirectorCog(commands.Cog):
 
                 if screen == "main_menu":
                     return True
+
+                if screen == "lobby_open":
+                    # Lobby with password overlay dismissed — press ESC to reopen it,
+                    # then the next loop iteration handles it as director_lobby.
+                    press_key("escape")
+                    time.sleep(1.5)
+                    continue
 
                 if screen == "director_lobby":
                     # Lobby has a dedicated MAIN MENU button instead of BACK
@@ -1083,28 +1140,13 @@ class DirectorCog(commands.Cog):
         if not await self._lock_check(interaction):
             return
 
-        await interaction.response.defer(thinking=True)
-
         # Manual start — cancel any pending auto-start watcher
         if self._auto_start_task and not self._auto_start_task.done():
             self._auto_start_task.cancel()
             self._auto_start_task = None
 
-        from game.profiles import get_profile, profile_summary
-        from game.deck_utils import deck_layout_from_state, validate_profile_deck
-        _profile = get_profile(self.bot.config.get("active_profile", "standard"))
-        _deck_layout = deck_layout_from_state()
-        if _deck_layout:
-            _warnings = validate_profile_deck(_profile, _deck_layout)
-            if _warnings:
-                warn_embed = self._embed(
-                    "Deck / Profile Mismatch",
-                    "Match starting, but some profile cards are missing from the deck:\n"
-                    + "\n".join(f"• {w}" for w in _warnings),
-                    color=_COLOR_WARN,
-                )
-                warn_embed.add_field(name="Profile", value=profile_summary(_profile), inline=False)
-                await interaction.followup.send(embed=warn_embed)
+        from game.profiles import resolve_profile, profile_summary
+        _profile = self._resolved_profile or resolve_profile(self.bot.config.get("active_profile", "standard"))
 
         _first = min(_profile["card_plays"], key=lambda p: p["play_time_seconds"])
         _m, _s = divmod(_first["play_time_seconds"], 60)
@@ -1123,58 +1165,68 @@ class DirectorCog(commands.Cog):
             config=self.bot.config,
             session=self.bot.session,
             on_action_update=on_action_update,
+            profile=self._resolved_profile,
         )
+        self._resolved_profile = None
         self._active_runner = runner
 
-        # Match can run up to ~15 min. Discord followup tokens last exactly 15 min,
-        # so this is tight. If matches regularly exceed that, switch to sending a
-        # new channel message via interaction.channel.send() instead of followup.
-        async with self._session_lock:
-            loop = asyncio.get_running_loop()
-            try:
-                results_text = await asyncio.wait_for(
-                    loop.run_in_executor(None, runner.run),
-                    timeout=_MATCH_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                if self._active_runner is not None:
-                    self._active_runner.stop()
-                self._active_runner = None
-                self.bot.session.reset()
-                await interaction.followup.send(embed=self._fail(
-                    "Match Safety Timeout",
-                    f"Match exceeded the {int(_MATCH_TIMEOUT // 60)}-minute safety limit. "
-                    "Bot reset to IDLE.\nCheck `darwin_bot.log` for details.",
-                ))
-                return
-
-        self._active_runner = None
-        self.bot.session.transition(
-            BotState.MATCH_ENDED,
-            last_action="Match ended",
-            next_action="Returning to menu",
+        # Respond immediately — match runs in the background so the interaction
+        # token never expires waiting for results.
+        start_embed = self._info(
+            "Match In Progress",
+            f"Match started. First card: **{_first_label}**\n"
+            "Results will be posted here when the match ends.",
         )
-        # Use channel.send() — matches can exceed the 15-minute Discord interaction
-        # token lifetime, making interaction.followup.send() return 401 after that point.
-        channel = interaction.channel
-        if results_text.endswith(".png"):
-            await channel.send(
-                embed=self._info("Match Complete", "Results screenshot attached."),
-                file=discord.File(results_text),
-            )
-        else:
-            await channel.send(embed=self._info("Match Complete", results_text))
+        await interaction.response.send_message(embed=start_embed)
 
-        loop = asyncio.get_running_loop()
-        returned = await loop.run_in_executor(None, self._do_post_match_return)
-        if returned:
+        channel = interaction.channel
+
+        async def _run_match():
+            async with self._session_lock:
+                loop = asyncio.get_running_loop()
+                try:
+                    results_text = await asyncio.wait_for(
+                        loop.run_in_executor(None, runner.run),
+                        timeout=_MATCH_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    if self._active_runner is not None:
+                        self._active_runner.stop()
+                    self._active_runner = None
+                    self._reset_session()
+                    await channel.send(embed=self._fail(
+                        "Match Safety Timeout",
+                        f"Match exceeded the {int(_MATCH_TIMEOUT // 60)}-minute safety limit. "
+                        "Bot reset to IDLE.\nCheck `darwin_bot.log` for details.",
+                    ))
+                    return
+
+            self._active_runner = None
             self.bot.session.transition(
-                BotState.IN_MENU,
-                last_action="Returned to main menu",
-                next_action="Await /custom",
+                BotState.MATCH_ENDED,
+                last_action="Match ended",
+                next_action="Returning to menu",
             )
-        else:
-            self.bot.session.reset()
+            if results_text.endswith(".png"):
+                await channel.send(
+                    embed=self._info("Match Complete", "Results screenshot attached."),
+                    file=discord.File(results_text),
+                )
+            else:
+                await channel.send(embed=self._info("Match Complete", results_text))
+
+            loop = asyncio.get_running_loop()
+            returned = await loop.run_in_executor(None, self._do_post_match_return)
+            if returned:
+                self.bot.session.transition(
+                    BotState.IN_MENU,
+                    last_action="Returned to main menu",
+                    next_action="Await /custom",
+                )
+            else:
+                self._reset_session()
+
+        asyncio.ensure_future(_run_match())
 
     # ------------------------------------------------------------------
     # Auto-start watcher
@@ -1202,7 +1254,9 @@ class DirectorCog(commands.Cog):
                 return
 
             logger.info("Auto-start watcher: lobby expires in %ds", countdown)
+            self._lobby_expiry = time.monotonic() + countdown
             await asyncio.sleep(max(0, countdown))
+            self._lobby_expiry = None
 
             # Re-check — /start may have been called while we were sleeping
             if self.bot.session.state != BotState.IN_CUSTOM:
@@ -1218,8 +1272,8 @@ class DirectorCog(commands.Cog):
                 "Lobby timer expired — card timers are now running.",
             ))
 
-            from game.profiles import get_profile
-            _profile = get_profile(self.bot.config.get("active_profile", "standard"))
+            from game.profiles import resolve_profile
+            _profile = resolve_profile(self.bot.config.get("active_profile", "standard"))
             _first = min(_profile["card_plays"], key=lambda p: p["play_time_seconds"])
             _m, _s = divmod(_first["play_time_seconds"], 60)
             _first_label = f"{_first['card'].replace('_', ' ').title()} at {_m}:{_s:02d}"
@@ -1239,7 +1293,9 @@ class DirectorCog(commands.Cog):
                 session=self.bot.session,
                 on_action_update=on_action_update,
                 skip_start=True,
+                profile=self._resolved_profile,
             )
+            self._resolved_profile = None
             self._active_runner = runner
 
             async with self._session_lock:
@@ -1253,7 +1309,7 @@ class DirectorCog(commands.Cog):
                     if self._active_runner is not None:
                         self._active_runner.stop()
                     self._active_runner = None
-                    self.bot.session.reset()
+                    self._reset_session()
                     await channel.send(embed=self._fail(
                         "Match Safety Timeout",
                         f"Match exceeded the {int(_MATCH_TIMEOUT // 60)}-minute safety limit. "
@@ -1284,9 +1340,10 @@ class DirectorCog(commands.Cog):
                     next_action="Await /custom",
                 )
             else:
-                self.bot.session.reset()
+                self._reset_session()
 
         except asyncio.CancelledError:
+            self._lobby_expiry = None
             logger.info("Auto-start watcher cancelled (/start used manually)")
 
     # ------------------------------------------------------------------
@@ -1399,6 +1456,10 @@ class DirectorCog(commands.Cog):
         embed.add_field(name="State", value=state_label, inline=True)
         if state == BotState.MATCH_IN_PROGRESS:
             embed.add_field(name="Match Timer", value=session.match_elapsed_display(), inline=True)
+        if state == BotState.IN_CUSTOM and self._lobby_expiry is not None:
+            remaining = max(0, self._lobby_expiry - time.monotonic())
+            rm, rs = divmod(int(remaining), 60)
+            embed.add_field(name="Lobby Expires", value=f"{rm}:{rs:02d}", inline=True)
         embed.add_field(name="Last Action", value=session.last_action, inline=False)
         embed.add_field(name="Next Action", value=session.next_action, inline=False)
 
@@ -1419,7 +1480,7 @@ class DirectorCog(commands.Cog):
         if self.bot.session.state == BotState.IDLE:
             await interaction.response.send_message(embed=self._info(
                 "Nothing to End", "Bot is already IDLE."
-            ), ephemeral=True)
+            ))
             return
 
         in_match = self.bot.session.state == BotState.MATCH_IN_PROGRESS
@@ -1433,5 +1494,4 @@ class DirectorCog(commands.Cog):
         await interaction.response.send_message(
             embed=embed,
             view=_EndConfirmView(self),
-            ephemeral=True,
         )

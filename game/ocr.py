@@ -145,6 +145,58 @@ def _ocr_region_img(image: np.ndarray, config: str = "") -> str:
         return ""
 
 
+def ocr_player_names(screenshot: np.ndarray, slot_xs: list[int], config: dict) -> list[str]:
+    """
+    OCR the name text of each player slot.
+    Returns a list of strings in the same order as slot_xs; empty string if unreadable.
+    """
+    bar = config.get("player_bar_region")
+    if not bar or not slot_xs:
+        return []
+    x0_bar, y0_bar, x1_bar, _y1_bar = int(bar[0]), int(bar[1]), int(bar[2]), int(bar[3])
+
+    n_total = len(slot_xs) + 1  # +1 for glitch slot
+    card_w = max(1, (x1_bar - x0_bar) // n_total)
+    name_y_off = int(config.get("player_name_y_in_bar", 62))
+    name_h = int(config.get("player_name_h", 14))
+    name_w = max(20, card_w - 8)
+    name_y = y0_bar + name_y_off
+
+    names = []
+    for sx in slot_xs:
+        nx = sx - name_w // 2
+        nx = max(0, min(nx, screenshot.shape[1] - name_w))
+        if name_y + name_h > screenshot.shape[0] or name_y < 0:
+            names.append("")
+            continue
+        crop = _crop(screenshot, nx, name_y, name_w, name_h)
+        scaled = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        name = _ocr_region_img(thresh, config="--psm 7")
+        names.append(name.strip())
+    return names
+
+
+def ocr_kill_notification(screenshot: np.ndarray, config: dict) -> str:
+    """
+    OCR the kill/event notification text that appears just below the player bar.
+    Player names are colored; action words are white — both are brighter than the background.
+    Returns raw OCR text, or empty string if kill_notification_region is not configured.
+    """
+    region = config.get("kill_notification_region")
+    if not region:
+        return ""
+    x, y, w, h = int(region[0]), int(region[1]), int(region[2]), int(region[3])
+    if y + h > screenshot.shape[0] or x + w > screenshot.shape[1]:
+        return ""
+    crop = _crop(screenshot, x, y, w, h)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    scaled = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    _, thresh = cv2.threshold(scaled, 160, 255, cv2.THRESH_BINARY)
+    return _ocr_region_img(thresh, config="--psm 7").strip()
+
+
 def read_lobby_countdown(screenshot: np.ndarray, debug: bool = False) -> int | None:
     """
     OCR the 'CUSTOM MATCH EXPIRES IN MM:SS' orange banner in the Director lobby.

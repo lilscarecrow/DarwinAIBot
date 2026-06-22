@@ -10,6 +10,13 @@ from session.state import SessionState
 
 logger = logging.getLogger(__name__)
 
+# Cards that target a zone coordinate at runtime rather than a fixed drop_target
+_ZONE_TARGETED_CARDS = frozenset({"lava_zone", "nuclear_blast", "open_zone", "spawn_electronic"})
+
+# Cards that target a player card slot at the top of the screen
+_PLAYER_TARGETED_CARDS = frozenset({"expose", "favorite_player", "give_leather", "give_wood",
+                                     "man_hunt", "speed_boost", "warm_up"})
+
 
 @dataclass
 class CardEvent:
@@ -38,16 +45,22 @@ class MatchRunner:
         session: SessionState,
         on_action_update: Callable[[str, str], None],
         skip_start: bool = False,
+        profile: Optional[dict] = None,
     ):
         self._config = config
         self._session = session
         self._on_action_update = on_action_update
         self._stop = threading.Event()
         self._skip_start = skip_start
+        self._profile = profile
         self._bypass = config.get("ahk_bypass_mode", False)
         self._strategy = get_strategy(config.get("zone_selection_strategy", "weighted_outer"))
         self._zone_states: dict[int, str] = {i: ZoneState.OPEN for i in range(1, 8)}
         self._deck_played: set[int] = set()
+        self._player_slot_xs: list[int] = []
+        self._player_names: list[str] = []
+        self._player_alive: list[bool] = []
+        self._first_blood_logged: bool = False
         from game.deck_utils import deck_layout_from_state
         live_layout = deck_layout_from_state()
         self._deck_layout: list[str] = live_layout if live_layout else config.get("deck_layout", [])
@@ -73,6 +86,11 @@ class MatchRunner:
         if self._stop.is_set():
             return "Match aborted before start."
 
+        # Capture player roster from lobby nameplates before the match countdown begins.
+        # The bar layout is identical in the lobby and in-match; this is the most stable
+        # moment to read names and establish slot order.
+        self._init_player_bar()
+
         from game import tts
 
         if self._skip_start:
@@ -92,16 +110,31 @@ class MatchRunner:
             if self._stop.wait(5):
                 return "Match aborted during countdown."
 
-        from game.profiles import get_profile
-        _profile = get_profile(self._config.get("active_profile", "standard"))
+        if self._profile is not None:
+            _profile = self._profile
+            logger.info("Profile: %s (pre-resolved at lobby creation)", _profile["display_name"])
+        else:
+            from game.profiles import resolve_profile
+            _active_key = self._config.get("active_profile", "standard")
+            _profile = resolve_profile(_active_key)
+            if _active_key == "randomizer":
+                logger.info("Profile selected by randomizer: %s", _profile["display_name"])
+            else:
+                logger.info("Profile: %s", _profile["display_name"])
         _first = min(_profile["card_plays"], key=lambda p: p["play_time_seconds"])
         _m, _s = divmod(_first["play_time_seconds"], 60)
         _first_label = f"{_first['card'].replace('_', ' ').title()} at {_m}:{_s:02d}"
         self._update("Match in progress", _first_label)
         start_time = time.monotonic()
 
-        card_schedule = self._build_card_schedule()
-        tts.precache_async(self._build_tts_phrases(card_schedule))
+        card_schedule = self._build_card_schedule(_profile)
+        phrases = self._build_tts_phrases(card_schedule)
+        lineup_text = self._build_lineup_text(card_schedule)
+        if lineup_text:
+            phrases.append(lineup_text)
+        tts.precache_async(phrases)
+        if not self._stop.wait(5):
+            self._announce_card_lineup(lineup_text)
         poll_interval = self._config.get("screen_poll_interval_seconds", 12)
 
         # ------------------------------------------------------------------
@@ -119,6 +152,11 @@ class MatchRunner:
             if self._match_has_ended():
                 logger.info("Match end detected at %.1fs elapsed", elapsed)
                 break
+
+            # Poll player bar for first blood
+            if not self._first_blood_logged and self._player_slot_xs:
+                from game.screen_detection import take_screenshot as _take_ss
+                self._poll_player_bar(_take_ss())
 
             # Sleep until the next card trigger, but no longer than poll_interval
             now = time.monotonic()
@@ -142,12 +180,79 @@ class MatchRunner:
         return self._capture_results()
 
     # ------------------------------------------------------------------
+    # Player bar
+    # ------------------------------------------------------------------
+
+    def _init_player_bar(self):
+        """
+        Snapshot the player bar from the lobby screen before the match starts.
+        Detects slot count, x-positions, and OCRs player names in slot order.
+        Called once; results are reused for first-blood tracking during the match.
+        """
+        from game.screen_detection import take_screenshot, detect_player_slot_xs
+        from game.ocr import ocr_player_names
+
+        screenshot = take_screenshot()
+        self._player_slot_xs = detect_player_slot_xs(screenshot, self._config)
+        if not self._player_slot_xs:
+            logger.warning(
+                "Player bar snapshot: no slots detected — player tracking disabled. "
+                "Set player_count in config if auto-detect fails."
+            )
+            return
+
+        self._player_names = ocr_player_names(screenshot, self._player_slot_xs, self._config)
+        self._player_alive = [True] * len(self._player_slot_xs)
+
+        logger.info("Player bar snapshot — %d players:", len(self._player_slot_xs))
+        for i, (name, x) in enumerate(zip(self._player_names, self._player_slot_xs)):
+            logger.info("  slot %d  x=%-4d  %s", i + 1, x, name or "(unread)")
+
+    def _poll_player_bar(self, screenshot):
+        """
+        Check alive/eliminated status for each player slot.
+        On the first death (first blood), logs the victim and attempts to OCR
+        the kill notification text to identify the killer.
+        """
+        if not self._player_slot_xs or self._first_blood_logged:
+            return
+
+        from game.screen_detection import sample_player_alive
+
+        new_alive = [
+            sample_player_alive(screenshot, x, self._config)
+            for x in self._player_slot_xs
+        ]
+
+        prev_dead = sum(1 for a in self._player_alive if not a)
+        curr_dead = sum(1 for a in new_alive if not a)
+
+        if prev_dead == 0 and curr_dead >= 1:
+            newly_dead = [
+                i for i, (was, now) in enumerate(zip(self._player_alive, new_alive))
+                if was and not now
+            ]
+            victim_name = (
+                self._player_names[newly_dead[0]]
+                if self._player_names and newly_dead
+                else f"slot {newly_dead[0] if newly_dead else '?'}"
+            )
+            from game.screen_detection import take_screenshot as _take_ss
+            from game.ocr import ocr_kill_notification
+            notif = ocr_kill_notification(_take_ss(), self._config)
+            logger.info(
+                "FIRST BLOOD — victim: %s | kill notification: %r",
+                victim_name, notif,
+            )
+            self._first_blood_logged = True
+
+        self._player_alive = new_alive
+
+    # ------------------------------------------------------------------
     # Card schedule
     # ------------------------------------------------------------------
 
-    def _build_card_schedule(self) -> list[CardEvent]:
-        from game.profiles import get_profile
-        profile = get_profile(self._config.get("active_profile", "standard"))
+    def _build_card_schedule(self, profile: dict) -> list[CardEvent]:
         card_plays = sorted(profile.get("card_plays", []), key=lambda p: p["play_time_seconds"])
 
         lead = self._config.get("card_play_lead_time_seconds", 0)
@@ -240,10 +345,11 @@ class MatchRunner:
                 logger.info("Points ready for '%s': %d/%d", card_name, current, needed)
                 return closed_broadcast
             logger.info("Waiting for points: have %d, need %d for '%s'", current, needed, card_name)
-            if not closed_broadcast and broadcast_open and card_label:
+            if not closed_broadcast and card_label:
                 from game import tts as _tts
                 _tts.speak_cable(f"Waiting on points for {card_label}")
-                _tts.queue_close_broadcast()
+                if broadcast_open:
+                    _tts.queue_close_broadcast()
                 closed_broadcast = True
             self._stop.wait(2.0)
         return closed_broadcast
@@ -266,15 +372,152 @@ class MatchRunner:
                     broadcast_open = tts.try_open_broadcast()
             if self._stop.is_set():
                 return
-            zone_success = self._attempt_zone_close(broadcast_open=broadcast_open)
-            if broadcast_open and not self._stop.is_set():
+            zone_success = self._attempt_zone_close()
+            if not self._stop.is_set():
                 if zone_success:
                     ann = self._next_card_announce(next_event)
                     if ann:
                         tts.speak_cable(ann)
-                tts.queue_close_broadcast()
+                if broadcast_open:
+                    tts.queue_close_broadcast()
         elif event.deck_position is None:
             logger.warning("Card event '%s' has no deck position assigned — skipping", event.name)
+        elif event.card_type in _ZONE_TARGETED_CARDS:
+            import random
+            zone_drop_coords = self._config.get("zone_drop_coordinates", {})
+            available = {k: v for k, v in zone_drop_coords.items() if v}
+            if not available:
+                logger.warning("Card event '%s': no zone_drop_coordinates calibrated — skipping", event.name)
+            else:
+                zone_id = random.choice(list(available.keys()))
+                target = tuple(available[zone_id])
+                logger.info("Zone-targeted card '%s' → zone %s at %s", event.name, zone_id, target)
+                broadcast_open = tts.try_open_broadcast()
+                if event.points_cost is not None:
+                    if self._wait_for_points(event.points_cost, event.name,
+                                             broadcast_open=broadcast_open, card_label=card_label):
+                        broadcast_open = tts.try_open_broadcast()
+                if not self._stop.is_set():
+                    tts.speak_cable(f"Deploying {card_label}")
+                    slot_coord = self._deck_pos_to_screen(event.deck_position)
+                    from game.card_actions import play_card
+                    played = False
+                    if self._bypass:
+                        play_card(slot_coordinate=slot_coord, target_coordinate=target,
+                                  card_name=event.name, bypass_mode=True)
+                        self._deck_played.add(event.deck_position)
+                        played = True
+                    else:
+                        from game.card_actions import shift_down, shift_up
+                        from game.screen_detection import take_screenshot, save_error_screenshot
+                        tray_configured = all([
+                            self._config.get("card_tray_center_x"),
+                            self._config.get("card_tray_card_width"),
+                            self._config.get("card_tray_card_y"),
+                        ])
+                        if tray_configured:
+                            shift_down()
+                            time.sleep(0.25)
+                            before = take_screenshot()
+                            for attempt in range(1, 3):
+                                if attempt > 1:
+                                    tts.speak_cable("Retrying")
+                                play_card(slot_coordinate=slot_coord, target_coordinate=target,
+                                          card_name=event.name, keep_shift=True)
+                                time.sleep(0.4)
+                                after = take_screenshot()
+                                if self._verify_card_removed(slot_coord, before, after):
+                                    self._deck_played.add(event.deck_position)
+                                    played = True
+                                    break
+                                logger.warning("Card '%s' not verified in tray (attempt %d/2)", event.name, attempt)
+                                if self._stop.is_set():
+                                    break
+                            if not played and not self._stop.is_set():
+                                logger.error("Card '%s' failed to play after 2 attempts", event.name)
+                                save_error_screenshot(f"card_play_failed_{event.name.replace(' ', '_').replace(':', '_')}")
+                            shift_up()
+                        else:
+                            if play_card(slot_coordinate=slot_coord, target_coordinate=target,
+                                         card_name=event.name):
+                                self._deck_played.add(event.deck_position)
+                                played = True
+                    if not self._stop.is_set():
+                        if played:
+                            ann = self._next_card_announce(next_event)
+                            if ann:
+                                tts.speak_cable(ann)
+                        else:
+                            tts.speak_cable(f"Sorry, failed to deploy {card_label}")
+                        if broadcast_open:
+                            tts.queue_close_broadcast()
+        elif event.card_type in _PLAYER_TARGETED_CARDS:
+            player_coords = self._config.get("player_target_coordinates") or []
+            if not player_coords:
+                logger.warning("Card event '%s': player_target_coordinates not calibrated — skipping", event.name)
+            else:
+                import random
+                target = tuple(random.choice(player_coords))
+                logger.info("Player-targeted card '%s' → player slot at %s", event.name, target)
+                broadcast_open = tts.try_open_broadcast()
+                if event.points_cost is not None:
+                    if self._wait_for_points(event.points_cost, event.name,
+                                             broadcast_open=broadcast_open, card_label=card_label):
+                        broadcast_open = tts.try_open_broadcast()
+                if not self._stop.is_set():
+                    tts.speak_cable(f"Deploying {card_label}")
+                    slot_coord = self._deck_pos_to_screen(event.deck_position)
+                    from game.card_actions import play_card
+                    played = False
+                    if self._bypass:
+                        play_card(slot_coordinate=slot_coord, target_coordinate=target,
+                                  card_name=event.name, bypass_mode=True)
+                        self._deck_played.add(event.deck_position)
+                        played = True
+                    else:
+                        from game.card_actions import shift_down, shift_up
+                        from game.screen_detection import take_screenshot, save_error_screenshot
+                        tray_configured = all([
+                            self._config.get("card_tray_center_x"),
+                            self._config.get("card_tray_card_width"),
+                            self._config.get("card_tray_card_y"),
+                        ])
+                        if tray_configured:
+                            shift_down()
+                            time.sleep(0.25)
+                            before = take_screenshot()
+                            for attempt in range(1, 3):
+                                if attempt > 1:
+                                    tts.speak_cable("Retrying")
+                                play_card(slot_coordinate=slot_coord, target_coordinate=target,
+                                          card_name=event.name, keep_shift=True)
+                                time.sleep(0.4)
+                                after = take_screenshot()
+                                if self._verify_card_removed(slot_coord, before, after):
+                                    self._deck_played.add(event.deck_position)
+                                    played = True
+                                    break
+                                logger.warning("Card '%s' not verified in tray (attempt %d/2)", event.name, attempt)
+                                if self._stop.is_set():
+                                    break
+                            if not played and not self._stop.is_set():
+                                logger.error("Card '%s' failed to play after 2 attempts", event.name)
+                                save_error_screenshot(f"card_play_failed_{event.name.replace(' ', '_').replace(':', '_')}")
+                            shift_up()
+                        else:
+                            if play_card(slot_coordinate=slot_coord, target_coordinate=target,
+                                         card_name=event.name):
+                                self._deck_played.add(event.deck_position)
+                                played = True
+                    if not self._stop.is_set():
+                        if played:
+                            ann = self._next_card_announce(next_event)
+                            if ann:
+                                tts.speak_cable(ann)
+                        else:
+                            tts.speak_cable(f"Sorry, failed to deploy {card_label}")
+                        if broadcast_open:
+                            tts.queue_close_broadcast()
         elif not event.drop_target:
             logger.warning("Card event '%s' has no drop_target configured — skipping", event.name)
         else:
@@ -284,8 +527,7 @@ class MatchRunner:
                                          broadcast_open=broadcast_open, card_label=card_label):
                     broadcast_open = tts.try_open_broadcast()
             if not self._stop.is_set():
-                if broadcast_open:
-                    tts.speak_cable(f"Deploying {card_label}")
+                tts.speak_cable(f"Deploying {card_label}")
                 slot_coord = self._deck_pos_to_screen(event.deck_position)
                 from game.card_actions import play_card
                 played = False
@@ -309,7 +551,7 @@ class MatchRunner:
                         time.sleep(0.25)
                         before = take_screenshot()
                         for attempt in range(1, 3):
-                            if attempt > 1 and broadcast_open:
+                            if attempt > 1:
                                 tts.speak_cable("Retrying")
                             play_card(slot_coordinate=slot_coord, target_coordinate=event.drop_target,
                                       card_name=event.name, keep_shift=True)
@@ -332,14 +574,15 @@ class MatchRunner:
                             self._deck_played.add(event.deck_position)
                             played = True
 
-                if broadcast_open and not self._stop.is_set():
+                if not self._stop.is_set():
                     if played:
                         ann = self._next_card_announce(next_event)
                         if ann:
                             tts.speak_cable(ann)
                     else:
                         tts.speak_cable(f"Sorry, failed to deploy {card_label}")
-                    tts.queue_close_broadcast()
+                    if broadcast_open:
+                        tts.queue_close_broadcast()
 
         next_label = next_event.name if next_event else "Match end polling"
         self._update(f"Played {event.name}", next_label)
@@ -369,10 +612,32 @@ class MatchRunner:
             if next_ev:
                 next_label = _tts.card_announce(next_ev.card_type)
                 m, s = divmod(next_ev.play_time_seconds, 60)
-                time_str = f"{m} minutes" if s == 0 else f"{m} minutes {s} seconds"
+                time_str = str(m) if s == 0 else f"{m} {s}"
                 phrases.append(f"Next card is {next_label} at {time_str}")
 
         return phrases
+
+    def _build_lineup_text(self, card_schedule: list[CardEvent]) -> str:
+        """Build the full card lineup as a single TTS-friendly string."""
+        from game import tts as _tts
+        parts = []
+        for event in sorted(card_schedule, key=lambda e: e.play_time_seconds):
+            label = _tts.card_announce(event.card_type)
+            m, s = divmod(event.play_time_seconds, 60)
+            time_str = str(m) if s == 0 else f"{m} {s}"
+            parts.append(f"{label} at {time_str}")
+        return ", ".join(parts)
+
+    def _announce_card_lineup(self, text: str):
+        """Announce the card lineup at match start. Plays over proximity audio regardless;
+        also broadcasts globally if the cooldown allows."""
+        from game import tts
+        if not text or not tts.is_enabled():
+            return
+        broadcast_open = tts.try_open_broadcast()
+        tts.speak_cable(text)
+        if broadcast_open:
+            tts.queue_close_broadcast()
 
     def _next_card_announce(self, next_event: Optional[CardEvent]) -> Optional[str]:
         """Format a 'Next card is X at Y' announcement for TTS."""
@@ -381,14 +646,14 @@ class MatchRunner:
         from game import tts
         m, s = divmod(next_event.play_time_seconds, 60)
         name = tts.card_announce(next_event.card_type)
-        time_str = f"{m} minutes" if s == 0 else f"{m} minutes {s} seconds"
+        time_str = str(m) if s == 0 else f"{m} {s}"
         return f"Next card is {name} at {time_str}"
 
     # ------------------------------------------------------------------
     # Zone closes
     # ------------------------------------------------------------------
 
-    def _attempt_zone_close(self, broadcast_open: bool = False) -> bool:
+    def _attempt_zone_close(self) -> bool:
         """
         Every 30s: grab the zone_close card to reveal the big zone map, read zone states
         from multiple sample points per tile, pick the best zone, then play or cancel.
@@ -402,13 +667,12 @@ class MatchRunner:
             logger.info("Zone close: no ZoneClose cards remaining")
             return False
 
-        if broadcast_open:
-            tts.speak_cable("Deploying Zone Close")
+        tts.speak_cable("Deploying Zone Close")
 
         slot_coord = self._deck_pos_to_screen(deck_pos)
 
         if self._bypass:
-            return self._attempt_zone_close_bypass(slot_coord, deck_pos, broadcast_open=broadcast_open)
+            return self._attempt_zone_close_bypass(slot_coord, deck_pos)
 
         import random
         import pyautogui as _pag
@@ -430,8 +694,7 @@ class MatchRunner:
             logger.info("Zone close: no valid zones — releasing card")
             _pag.mouseUp()
             shift_up()
-            if broadcast_open:
-                tts.speak_cable("Sorry, no zones available to close")
+            tts.speak_cable("Sorry, no zones available to close")
             return False
 
         zones_to_try = list(valid_closeable_zones(self._zone_states))
@@ -478,8 +741,7 @@ class MatchRunner:
             if verified:
                 self._zone_states[zone_id] = ZoneState.CLOSING
                 self._deck_played.add(deck_pos)
-                if broadcast_open:
-                    tts.speak_cable(f"Closing zone {zone_id}")
+                tts.speak_cable(f"Closing zone {zone_id}")
                 self._update(f"Closed zone {zone_id}", "Continue match")
                 shift_up()
                 return True
@@ -498,11 +760,10 @@ class MatchRunner:
         _pag.mouseUp()  # ensure card is released if loop exited via skip/stop
         save_error_screenshot("zone_close_failed")  # shift still held = tray visible
         shift_up()
-        if broadcast_open:
-            tts.speak_cable("Sorry, failed to close a zone")
+        tts.speak_cable("Sorry, failed to close a zone")
         return False
 
-    def _attempt_zone_close_bypass(self, slot_coord: tuple, deck_pos: int, broadcast_open: bool = False) -> bool:
+    def _attempt_zone_close_bypass(self, slot_coord: tuple, deck_pos: int) -> bool:
         """Bypass-mode zone close: use cached zone states, log the action, pause."""
         from game.card_actions import play_card
         from game import tts
@@ -530,8 +791,7 @@ class MatchRunner:
         )
         self._zone_states[zone_id] = ZoneState.CLOSING
         self._deck_played.add(deck_pos)
-        if broadcast_open:
-            tts.speak_cable(f"Closing zone {zone_id}")
+        tts.speak_cable(f"Closing zone {zone_id}")
         self._update(f"Closed zone {zone_id}", "Continue match")
         return True
 

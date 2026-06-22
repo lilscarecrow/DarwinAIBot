@@ -208,11 +208,16 @@ def click(x: int, y: int, bypass_mode: bool = False):
     pyautogui.click(x, y)
 
 
-def press_key(key: str, bypass_mode: bool = False):
+def press_key(key: str, bypass_mode: bool = False, no_focus_fallback: bool = False) -> bool:
+    """Send a key to the Darwin game window. Returns True if sent, False if skipped.
+
+    no_focus_fallback=True: skip entirely (don't fall through to pyautogui) if the
+    Darwin window can't be found. Use this for keys that must never go to Discord.
+    """
     if bypass_mode:
         logger.info("[BYPASS] Would press key '%s'", key)
         input("Press Enter to continue (bypass mode)...")
-        return
+        return True
 
     hwnd = _get_darwin_hwnd()
     key_lower = key.lower()
@@ -226,11 +231,16 @@ def press_key(key: str, bypass_mode: bool = False):
         time.sleep(0.05)
         win32api.PostMessage(hwnd, win32con.WM_KEYUP, vk, lparam_up)
         logger.info("Key '%s' sent via PostMessage to Darwin hwnd", key)
+        return True
+    elif no_focus_fallback:
+        logger.warning("Key '%s' skipped — Darwin window not found (would go to focused window)", key)
+        return False
     else:
         # Fallback: focus window first, then send via pyautogui
         focus_darwin_window()
         pyautogui.press(key)
         logger.info("Key '%s' sent via pyautogui (focus fallback)", key)
+        return True
 
 
 def copy_clipboard() -> str:

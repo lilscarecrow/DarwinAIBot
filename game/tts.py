@@ -102,13 +102,17 @@ def try_open_broadcast() -> bool:
     if now < _broadcast_available_at:
         logger.info("TTS: broadcast on cooldown (%.0fs remaining)", _broadcast_available_at - now)
         return False
-    _broadcast_available_at = now + _BROADCAST_CYCLE
     if not _bypass:
         from game.card_actions import press_key
-        press_key("g")
+        sent = press_key("g", no_focus_fallback=True)
+        if not sent:
+            # Darwin window not found — don't consume the cooldown so the next
+            # attempt can retry rather than waiting a full 105-second cycle.
+            return False
         logger.info("TTS: broadcast window opened (G pressed)")
     else:
         logger.info("[BYPASS] TTS: would press G to open broadcast window")
+    _broadcast_available_at = now + _BROADCAST_CYCLE
     return True
 
 
@@ -119,8 +123,10 @@ def close_broadcast() -> None:
         return
     if not _bypass:
         from game.card_actions import press_key
-        press_key("g")
-        logger.info("TTS: broadcast window closed (G pressed)")
+        if press_key("g", no_focus_fallback=True):
+            logger.info("TTS: broadcast window closed (G pressed)")
+        else:
+            logger.warning("TTS: close_broadcast G press skipped — Darwin window not found")
     else:
         logger.info("[BYPASS] TTS: would press G to close broadcast window")
     _broadcast_available_at = time.monotonic() + _BROADCAST_COOLDOWN
@@ -154,6 +160,25 @@ def speak_cable(text: str) -> None:
         return
     _ensure_worker()
     _queue.put((text, "cable"))
+
+
+def stop() -> None:
+    """Drain any queued TTS items and reset broadcast state.
+
+    Call on match end or /quit so stale audio and cooldown state don't bleed
+    into the next session.
+    """
+    global _broadcast_available_at
+    drained = 0
+    while True:
+        try:
+            _queue.get_nowait()
+            drained += 1
+        except queue.Empty:
+            break
+    _broadcast_available_at = 0.0
+    if drained:
+        logger.info("TTS: flushed %d queued item(s) on stop", drained)
 
 
 def queue_close_broadcast() -> None:
@@ -216,7 +241,7 @@ async def _speak_broadcast(text: str) -> None:
         return
     if not _bypass:
         from game.card_actions import press_key
-        press_key("g")
+        press_key("g", no_focus_fallback=True)
     else:
         logger.info("[BYPASS] Would press G to open broadcast")
     await _play(data, samplerate, device_idx=device_idx)
