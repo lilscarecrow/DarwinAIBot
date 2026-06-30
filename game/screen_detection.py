@@ -93,11 +93,6 @@ def poll_for_match_end(
     match = find_template(screenshot, badge_template_path, threshold)
     if match:
         logger.info("Match end detected via placement badge")
-        SCREENSHOT_ERROR_DIR.mkdir(parents=True, exist_ok=True)
-        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        debug_path = SCREENSHOT_ERROR_DIR / f"{ts}_match_end_detected.png"
-        cv2.imwrite(str(debug_path), screenshot)
-        logger.info("Match-end debug screenshot saved: %s", debug_path)
         return True
     return False
 

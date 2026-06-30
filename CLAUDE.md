@@ -39,7 +39,7 @@ DarwinAIBot/
 ├── requirements.txt
 ├── CLAUDE.md
 ├── bot/
-│   └── discord_bot.py          # DarwinBot + DirectorCog (all slash commands)
+│   └── discord_bot.py          # DarwinBot + DirectorCog + ScrimCog (all slash commands)
 ├── game/
 │   ├── launcher.py             # Launch game process, monitor for crashes
 │   ├── screen_detection.py     # OpenCV template matching, pixel sampling, screenshots
@@ -48,11 +48,12 @@ DarwinAIBot/
 │   ├── tts.py                  # TTS worker queue, broadcast/cable modes, Discord voice
 │   ├── deck_utils.py           # Card point costs, deck layout from state.json
 │   ├── profiles.py             # Match card play schedules
-│   └── match_runner.py         # Full match loop (card timers, zone closes, end detection)
+│   ├── match_runner.py         # Full match loop (card timers, zone closes, end detection)
+│   └── video_recorder.py       # Background match recording (H.264 MP4, cropped, 0.5fps)
 ├── session/
 │   └── state.py                # BotState enum + SessionState machine
 ├── zones/
-│   ├── zone_logic.py           # Adjacency map, BFS connectivity, can_close_zone()
+│   ├── zone_logic.py           # Adjacency map, valid_closeable_zones() (returns all OPEN zones)
 │   ├── base_strategy.py        # Abstract base class for zone strategies
 │   ├── strategy_factory.py     # Factory + strategy registry
 │   └── strategies/
@@ -61,6 +62,7 @@ DarwinAIBot/
 │       └── weighted_outer.py   # Prefer outer zones, occasional variation (default)
 ├── logs/                       # Runtime log (darwin_bot.log, appended across sessions)
 ├── screenshots/errors/         # Auto-saved on any automation failure
+├── screenshots/recordings/     # Match recordings (H.264 MP4, 0.5fps, cropped)
 └── templates/                  # OpenCV template images (captured from game, not in repo)
 ```
 
@@ -74,7 +76,7 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 
 ### Discord Bot (`bot/discord_bot.py`)
 
-`DarwinBot(commands.Bot)` holds config and session. All commands live in `DirectorCog(commands.Cog)`.
+`DarwinBot(commands.Bot)` holds config and session. Commands live in `DirectorCog(commands.Cog)` and `ScrimCog(commands.Cog)`. `intents.members = True` is required (must also be enabled in the Discord Developer Portal under Privileged Gateway Intents).
 
 **Guards on every command:**
 1. `_role_check` — silent ignore if user lacks `discord_required_role` (per spec)
@@ -98,21 +100,54 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 
 All responses use `discord.Embed` with color-coded status (green=ok, red=fail, blue=active, orange=in-match, gray=neutral). State is shown in every embed footer.
 
+**Results mirroring:** end-of-match screenshots are also posted to channel ID `1520509048540238015` (new guild) via `_mirror_results()`. The local screenshot file is deleted after both sends complete.
+
+### Scrim Signup System (`ScrimCog`)
+
+Manages a static signup message in the configured channel. On every `on_ready`, the bot checks whether the tracked message still exists — if deleted or first run, it posts a new embed and saves the message ID to `config.json`.
+
+**Reaction flow:**
+- Players react with ✅ to sign up
+- When reaction count reaches `scrim_min_players` (default 8), the `scrim_admin_role` is pinged in the signup channel
+- Every hour at the top of the hour, all reactions are cleared and a message pings removed players in channel ID `1520509256678506737` to re-sign up
+
+**Commands (scrim admin role required):**
+| Command | Description |
+|---|---|
+| `/role add` | Gives `scrim_player_role` to the first 10 reactors (Discord reaction order) |
+| `/role remove` | Removes `scrim_player_role` from all who have it, clears all reactions on signup message |
+
+**Config keys:**
+| Key | Value |
+|---|---|
+| `scrim_signup_channel_id` | `1520517054988419123` |
+| `scrim_signup_message_id` | Auto-persisted — do not edit manually |
+| `scrim_player_role` | `Scrim Player` |
+| `scrim_admin_role` | `Scrim Admin` |
+| `scrim_min_players` | `8` |
+| `scrim_reaction_emoji` | `✅` |
+
 ### Match Runner (`game/match_runner.py`)
 
 `MatchRunner.run()` is the full match sequence, called via `run_in_executor` from `/start`:
 
 1. Press B to start match (via PostMessage to Darwin hwnd — focus-independent)
 2. 5-second sync delay
-3. Main loop:
+3. Announce active profile name via TTS: *"Using profile: [name]"*
+4. Start `VideoRecorder` in background thread
+5. Main loop (wrapped in `try/finally` to guarantee recorder finalization):
    - Sleep until the next card trigger time (capped at `screen_poll_interval_seconds`) — cards fire within ~0.1s of scheduled time
    - Fire card events: check director points first, wait if insufficient, then shift-drag
-   - Every 30s: sample zone pixels → `valid_closeable_zones()` → strategy selects zone → play close card
+   - Every 30s: sample zone pixels → `valid_closeable_zones()` → shuffle all OPEN zones → try each until one verifies
    - Every `screen_poll_interval_seconds`: double-confirm match end (two detections 2s apart, threshold 0.88)
-4. Take screenshot of results screen → send as Discord file attachment (saved to `screenshots/results/`)
-5. Click MAIN MENU button on results screen → wait for main menu → transition to `IN_MENU`
+6. Stop recorder (`finally` block — runs on normal end, force-stop, and exceptions)
+7. Take screenshot of results screen → send as Discord file attachment → delete local file
+8. Fire background upload of recording via `_upload_recording()`
+9. Click MAIN MENU button on results screen → wait for main menu → transition to `IN_MENU`
 
 `MatchRunner.stop()` sets a `threading.Event` that the loop checks between every action. Called by `/quit`.
+
+`run()` returns a tuple `(results_text, recording_path)`. The discord bot unpacks this; plain string returns (e.g. force-stop) are handled via `isinstance(result, tuple)` guard.
 
 **Director points reading (`_read_points`):**
 - Primary: count filled pips by brightness (`max(B,G,R) > 130`) — immune to color/size changes
@@ -137,12 +172,15 @@ All responses use `discord.Embed` with color-coded status (green=ok, red=fail, b
 
 ### Zone Logic (`zones/`)
 
-7-zone hex grid with fixed adjacency. `can_close_zone()` enforces three rules:
-- Zone must be OPEN
-- Cannot close the last open zone
-- Remaining open zones must stay connected (BFS validation)
+7-zone hex grid with fixed adjacency. `valid_closeable_zones()` returns all zones currently in `OPEN` state — no connectivity filtering. The bot shuffles the list and tries each zone in order, relying on the verification step (slot pixel delta check) to detect game rejections rather than pre-filtering.
 
-Zone strategy is pluggable via `config.json → zone_selection_strategy`. Adding a new strategy: create a file in `zones/strategies/`, subclass `BaseZoneStrategy`, add to `STRATEGIES` dict in `strategy_factory.py`.
+The connectivity logic (`can_close_zone`, `open_zones_stay_connected`, BFS) has been removed. `neighbor_count()` is kept for the strategy classes which use it for weighting.
+
+**Zone close flow in `_attempt_zone_close()`:**
+- Grab zone_close card → read zone states from screenshot → `valid_closeable_zones()` → `random.shuffle()` → try each until slot pixel verifies or list exhausted
+- The game itself enforces any rules about which zones can actually be closed
+
+Zone strategy is pluggable via `config.json → zone_selection_strategy` but the live path currently ignores the strategy and uses random shuffle directly. Adding a new strategy: create a file in `zones/strategies/`, subclass `BaseZoneStrategy`, add to `STRATEGIES` dict in `strategy_factory.py`.
 
 ### Screen Detection (`game/screen_detection.py`)
 
@@ -243,6 +281,18 @@ In bypass mode, uses cached `_zone_states` (all OPEN initially) and calls `play_
 - **CLOSED**: dark red/maroon hex with a bright orange border glow at the edges
 
 Sample points are placed at ~110px from each tile center (near the hex edge, well outside the player icon area at center). At this distance, colors are: OPEN=blue, CLOSING=dark navy, CLOSED=dark red. The orange border glow is right at the very edge and would require sampling at ~120-125px to catch; the interior color differences are sufficient for three-way distinction. Calibrate `zone_color_thresholds` using `calibrate_zone_colors.py` while holding a zone_close card with known zone states visible.
+
+### Video Recorder (`game/video_recorder.py`)
+
+Records match footage in a background thread. Started after the match countdown, stopped in a `try/finally` so the file is always finalized regardless of how the match ends.
+
+- **Format:** H.264 MP4 (`avc1`) — all three FOURCC options tested True on this machine
+- **FPS:** 0.5 (1 frame every 2 seconds)
+- **Crop:** configured via `recording_crop_region: [x, y, w, h]` — currently `[755, 175, 410, 200]` (tight center band focused on the kill feed area)
+- **Output:** `screenshots/recordings/match_{timestamp}.mp4` — ~8 MB for a 20-min match at these settings
+- **Upload:** `_upload_recording(path)` fires as a detached async task after the match. Currently a stub — wire up when `recording_api_endpoint` is set in config
+
+**Safety:** process crash will leave the file corrupt (VideoWriter MOOV atom not flushed). All other exit paths (normal end, `/quit`, exceptions, asyncio timeout) are covered by the `try/finally`.
 
 ### TTS (`game/tts.py`)
 
@@ -433,7 +483,19 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
         "x_start": 862, "y": 1012, "spacing": 26, "count": 10
     },
     "screen_poll_interval_seconds": 12,
-    "launch_timeout_seconds": 180
+    "launch_timeout_seconds": 180,
+
+    // Video recording
+    "recording_api_endpoint": "",        // POST endpoint for upload — leave empty to skip upload
+    "recording_crop_region": [755, 175, 410, 200],   // [x, y, w, h] crop at 1920×1080 — tight center band on kill feed
+
+    // Scrim signup system
+    "scrim_signup_channel_id": "1520517054988419123",
+    "scrim_signup_message_id": null,     // Auto-persisted by bot on startup — do not edit manually
+    "scrim_player_role": "Scrim Player",
+    "scrim_admin_role": "Scrim Admin",
+    "scrim_min_players": 8,
+    "scrim_reaction_emoji": "✅"
 }
 ```
 

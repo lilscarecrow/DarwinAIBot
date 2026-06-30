@@ -129,44 +129,51 @@ class MatchRunner:
 
         card_schedule = self._build_card_schedule(_profile)
         phrases = self._build_tts_phrases(card_schedule)
-        lineup_text = self._build_lineup_text(card_schedule)
-        if lineup_text:
-            phrases.append(lineup_text)
+        profile_announce = f"Using profile: {_profile['display_name']}"
+        phrases.append(profile_announce)
         tts.precache_async(phrases)
         if not self._stop.wait(5):
-            self._announce_card_lineup(lineup_text)
+            self._announce_card_lineup(profile_announce)
         poll_interval = self._config.get("screen_poll_interval_seconds", 12)
 
-        # ------------------------------------------------------------------
-        # Main match loop
-        # ------------------------------------------------------------------
-        while not self._stop.is_set():
-            elapsed = time.monotonic() - start_time
+        from game.video_recorder import VideoRecorder
+        recorder = VideoRecorder(self._config)
+        recorder.start()
+        recording_path = None
 
-            # Fire any card events whose time has arrived
-            for event in card_schedule:
-                if not event.done and elapsed >= event.trigger_seconds:
-                    self._fire_card_event(event, card_schedule)
+        try:
+            # ------------------------------------------------------------------
+            # Main match loop
+            # ------------------------------------------------------------------
+            while not self._stop.is_set():
+                elapsed = time.monotonic() - start_time
 
-            # Poll for match end (placement badge on screen)
-            if self._match_has_ended():
-                logger.info("Match end detected at %.1fs elapsed", elapsed)
-                break
+                # Fire any card events whose time has arrived
+                for event in card_schedule:
+                    if not event.done and elapsed >= event.trigger_seconds:
+                        self._fire_card_event(event, card_schedule)
 
-            # Poll player bar for first blood
-            if not self._first_blood_logged and self._player_slot_xs:
-                from game.screen_detection import take_screenshot as _take_ss
-                self._poll_player_bar(_take_ss())
+                # Poll for match end (placement badge on screen)
+                if self._match_has_ended():
+                    logger.info("Match end detected at %.1fs elapsed", elapsed)
+                    break
 
-            # Sleep until the next card trigger, but no longer than poll_interval
-            now = time.monotonic()
-            now_elapsed = now - start_time
-            pending_times = [
-                e.trigger_seconds - now_elapsed
-                for e in card_schedule if not e.done
-            ]
-            sleep_time = min(poll_interval, min(pending_times)) if pending_times else poll_interval
-            self._stop.wait(max(0.1, sleep_time))
+                # Poll player bar for first blood
+                if not self._first_blood_logged and self._player_slot_xs:
+                    from game.screen_detection import take_screenshot as _take_ss
+                    self._poll_player_bar(_take_ss())
+
+                # Sleep until the next card trigger, but no longer than poll_interval
+                now = time.monotonic()
+                now_elapsed = now - start_time
+                pending_times = [
+                    e.trigger_seconds - now_elapsed
+                    for e in card_schedule if not e.done
+                ]
+                sleep_time = min(poll_interval, min(pending_times)) if pending_times else poll_interval
+                self._stop.wait(max(0.1, sleep_time))
+        finally:
+            recording_path = recorder.stop()
 
         if self._stop.is_set():
             return "Match ended early (force stopped)."
@@ -177,7 +184,7 @@ class MatchRunner:
         from game import tts
         tts.speak("Match over.", broadcast=False)
         self._update("Reading results screen", "Post to Discord")
-        return self._capture_results()
+        return self._capture_results(), recording_path
 
     # ------------------------------------------------------------------
     # Player bar

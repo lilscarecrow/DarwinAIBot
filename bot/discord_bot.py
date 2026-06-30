@@ -280,6 +280,7 @@ class _ProfileSelectView(discord.ui.View):
 class DarwinBot(commands.Bot):
     def __init__(self, config: dict, session: SessionState):
         intents = discord.Intents.default()
+        intents.members = True
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
         self.session = session
@@ -287,6 +288,8 @@ class DarwinBot(commands.Bot):
     async def setup_hook(self):
         cog = DirectorCog(self)
         await self.add_cog(cog)
+        scrim_cog = ScrimCog(self)
+        await self.add_cog(scrim_cog)
         # discord_guild_ids accepts a list or a single id string/int.
         # Falls back to the legacy discord_guild_id key for compatibility.
         guild_ids = self.config.get("discord_guild_ids") or self.config.get("discord_guild_id")
@@ -358,6 +361,41 @@ class DirectorCog(commands.Cog):
         state_label = self.bot.session.state.name.replace("_", " ").title()
         e.set_footer(text=f"State: {state_label}")
         return e
+
+    async def _upload_recording(self, path: str):
+        """Upload the match recording to the API endpoint in the background."""
+        endpoint = self.bot.config.get("recording_api_endpoint", "")
+        if not endpoint:
+            logger.info("Recording ready at %s — no recording_api_endpoint configured, skipping upload", path)
+            return
+        logger.info("Uploading recording %s to %s", path, endpoint)
+        # TODO: implement upload when API is finalized
+        # Example with aiohttp:
+        # import aiohttp
+        # async with aiohttp.ClientSession() as session:
+        #     with open(path, "rb") as f:
+        #         await session.post(endpoint, data={"file": f})
+
+    async def _mirror_results(self, results_text: str):
+        """Post match results to the secondary guild channel."""
+        _MIRROR_CHANNEL_ID = 1520509048540238015
+        ch = self.bot.get_channel(_MIRROR_CHANNEL_ID)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(_MIRROR_CHANNEL_ID)
+            except Exception as e:
+                logger.warning("Could not reach mirror channel %d: %s", _MIRROR_CHANNEL_ID, e)
+                return
+        try:
+            if results_text.endswith(".png"):
+                await ch.send(
+                    embed=self._info("Match Complete", "Results screenshot attached."),
+                    file=discord.File(results_text),
+                )
+            else:
+                await ch.send(embed=self._info("Match Complete", results_text))
+        except Exception as e:
+            logger.warning("Failed to post to mirror channel: %s", e)
 
     def _ok(self, title: str, description: str = "") -> discord.Embed:
         return self._embed(title, description, color=_COLOR_OK)
@@ -1185,7 +1223,7 @@ class DirectorCog(commands.Cog):
             async with self._session_lock:
                 loop = asyncio.get_running_loop()
                 try:
-                    results_text = await asyncio.wait_for(
+                    result = await asyncio.wait_for(
                         loop.run_in_executor(None, runner.run),
                         timeout=_MATCH_TIMEOUT,
                     )
@@ -1201,6 +1239,8 @@ class DirectorCog(commands.Cog):
                     ))
                     return
 
+            results_text, recording_path = result if isinstance(result, tuple) else (result, None)
+
             self._active_runner = None
             self.bot.session.transition(
                 BotState.MATCH_ENDED,
@@ -1214,6 +1254,14 @@ class DirectorCog(commands.Cog):
                 )
             else:
                 await channel.send(embed=self._info("Match Complete", results_text))
+            await self._mirror_results(results_text)
+            if results_text.endswith(".png"):
+                try:
+                    os.remove(results_text)
+                except Exception as e:
+                    logger.warning("Could not delete results screenshot: %s", e)
+            if recording_path:
+                asyncio.ensure_future(self._upload_recording(recording_path))
 
             loop = asyncio.get_running_loop()
             returned = await loop.run_in_executor(None, self._do_post_match_return)
@@ -1301,7 +1349,7 @@ class DirectorCog(commands.Cog):
             async with self._session_lock:
                 loop = asyncio.get_running_loop()
                 try:
-                    results_text = await asyncio.wait_for(
+                    result = await asyncio.wait_for(
                         loop.run_in_executor(None, runner.run),
                         timeout=_MATCH_TIMEOUT,
                     )
@@ -1317,6 +1365,8 @@ class DirectorCog(commands.Cog):
                     ))
                     return
 
+            results_text, recording_path = result if isinstance(result, tuple) else (result, None)
+
             self._active_runner = None
             self.bot.session.transition(
                 BotState.MATCH_ENDED,
@@ -1330,6 +1380,14 @@ class DirectorCog(commands.Cog):
                 )
             else:
                 await channel.send(embed=self._info("Match Complete", results_text))
+            await self._mirror_results(results_text)
+            if results_text.endswith(".png"):
+                try:
+                    os.remove(results_text)
+                except Exception as e:
+                    logger.warning("Could not delete results screenshot: %s", e)
+            if recording_path:
+                asyncio.ensure_future(self._upload_recording(recording_path))
 
             loop = asyncio.get_running_loop()
             returned = await loop.run_in_executor(None, self._do_post_match_return)
@@ -1495,3 +1553,341 @@ class DirectorCog(commands.Cog):
             embed=embed,
             view=_EndConfirmView(self),
         )
+
+
+# ==============================================================================
+# Scrim signup system
+# ==============================================================================
+
+class ScrimCog(commands.Cog):
+    """
+    Manages the scrim signup queue via reactions on a static message.
+
+    On startup the bot checks whether the configured signup message still exists.
+    If it does, it tracks it. If not (first run or message was deleted), it posts
+    a new one and saves the ID to config.json so it survives restarts.
+
+    Config keys:
+      scrim_signup_channel_id  — channel where the signup message lives
+      scrim_signup_message_id  — persisted ID of the tracked message
+      scrim_player_role        — role name given to signed-up players
+      scrim_admin_role         — role name pinged when the queue is full
+      scrim_min_players        — number of reactions that triggers the ping (default 8)
+      scrim_reaction_emoji     — emoji to count (default ✅)
+    """
+
+    def __init__(self, bot: "DarwinBot"):
+        self.bot = bot
+
+    # ------------------------------------------------------------------
+    # Startup — ensure a static signup message exists
+    # ------------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        await self._ensure_signup_message()
+        self.bot.loop.create_task(self._hourly_reaction_reset())
+
+    async def _ensure_signup_message(self):
+        ch_id = self._cfg("scrim_signup_channel_id")
+        if not ch_id:
+            return  # scrim feature not configured
+
+        ch = self.bot.get_channel(int(ch_id))
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(int(ch_id))
+            except Exception as e:
+                logger.warning("ScrimCog: could not fetch signup channel %s: %s", ch_id, e)
+                return
+
+        # Try to fetch the previously tracked message
+        existing_id = self._signup_message_id()
+        if existing_id:
+            try:
+                await ch.fetch_message(existing_id)
+                logger.info("ScrimCog: signup message %d still exists — tracking it", existing_id)
+                return
+            except discord.NotFound:
+                logger.warning("ScrimCog: signup message %d was deleted — posting a new one", existing_id)
+            except Exception as e:
+                logger.warning("ScrimCog: could not verify signup message: %s", e)
+                return
+
+        # Post a new static signup message
+        emoji = self._emoji()
+        min_p = self._min_players()
+        embed = discord.Embed(
+            title="Scrim Signup",
+            description=(
+                f"React with {emoji} to join the scrim queue.\n"
+                f"A match will be organized once **{min_p} players** have signed up."
+            ),
+            color=_COLOR_OK,
+        )
+        msg = await ch.send(embed=embed)
+        await msg.add_reaction(emoji)
+        logger.info("ScrimCog: posted new signup message %d in channel %s", msg.id, ch_id)
+
+        self._save_message_id(msg.id)
+
+    async def _hourly_reaction_reset(self):
+        """Background task: at the top of every hour, clear all signup reactions and DM removed players."""
+        import datetime
+        while True:
+            now = datetime.datetime.now()
+            # Sleep until the next top-of-hour
+            seconds_until_next_hour = (60 - now.minute) * 60 - now.second
+            await asyncio.sleep(seconds_until_next_hour)
+
+            message = await self._get_signup_message()
+            if message is None:
+                continue
+
+            reactors = await self._reactors(message)
+            if not reactors:
+                continue
+
+            try:
+                await message.clear_reactions()
+                await message.add_reaction(self._emoji())
+            except Exception as e:
+                logger.warning("ScrimCog hourly reset: could not clear reactions: %s", e)
+                continue
+
+            logger.info("ScrimCog hourly reset: cleared %d reactions", len(reactors))
+
+            notify_channel_id = 1520509256678506737
+            notify_ch = self.bot.get_channel(notify_channel_id)
+            if notify_ch is None:
+                try:
+                    notify_ch = await self.bot.fetch_channel(notify_channel_id)
+                except Exception as e:
+                    logger.warning("ScrimCog hourly reset: could not fetch notify channel: %s", e)
+                    continue
+
+            mentions = " ".join(u.mention for u in reactors)
+            signup_channel_id = self._cfg("scrim_signup_channel_id")
+            try:
+                await notify_ch.send(
+                    f"{mentions}\nThe scrim signup queue was reset. "
+                    f"Head to <#{signup_channel_id}> and react again to rejoin!"
+                )
+            except Exception as e:
+                logger.warning("ScrimCog hourly reset: could not post notify message: %s", e)
+
+    def _save_message_id(self, message_id: int):
+        self.bot.config["scrim_signup_message_id"] = message_id
+        import json as _json
+        try:
+            from pathlib import Path as _Path
+            cfg_path = _Path("config.json")
+            with cfg_path.open("r", encoding="utf-8") as f:
+                raw = _json.load(f)
+            raw["scrim_signup_message_id"] = message_id
+            with cfg_path.open("w", encoding="utf-8") as f:
+                _json.dump(raw, f, indent=4)
+        except Exception as e:
+            logger.warning("ScrimCog: could not persist scrim_signup_message_id: %s", e)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _cfg(self, key, default=None):
+        return self.bot.config.get(key, default)
+
+    def _signup_message_id(self) -> int | None:
+        v = self._cfg("scrim_signup_message_id")
+        return int(v) if v else None
+
+    def _emoji(self) -> str:
+        return self._cfg("scrim_reaction_emoji", "✅")
+
+    def _min_players(self) -> int:
+        return int(self._cfg("scrim_min_players", 8))
+
+    def _has_scrim_admin(self, interaction: discord.Interaction) -> bool:
+        role_name = self._cfg("scrim_admin_role", "")
+        return any(r.name == role_name for r in interaction.user.roles)
+
+    async def _get_signup_message(self) -> discord.Message | None:
+        msg_id = self._signup_message_id()
+        ch_id = self._cfg("scrim_signup_channel_id")
+        if not msg_id or not ch_id:
+            return None
+        ch = self.bot.get_channel(int(ch_id))
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(int(ch_id))
+            except Exception:
+                return None
+        try:
+            return await ch.fetch_message(msg_id)
+        except Exception:
+            return None
+
+    async def _reactors(self, message: discord.Message) -> list[discord.Member]:
+        """Return all non-bot members who reacted with the signup emoji."""
+        emoji = self._emoji()
+        for reaction in message.reactions:
+            if str(reaction.emoji) == emoji:
+                users = [u async for u in reaction.users() if not u.bot]
+                return users
+        return []
+
+    # ------------------------------------------------------------------
+    # Reaction events
+    # ------------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if str(payload.emoji) != self._emoji():
+            return
+        if payload.message_id != self._signup_message_id():
+            return
+        if payload.user_id == self.bot.user.id:
+            return
+
+        message = await self._get_signup_message()
+        if message is None:
+            return
+        reactors = await self._reactors(message)
+        count = len(reactors)
+        logger.info(
+            "Scrim signup: %s (id=%d) reacted — queue now %d/%d",
+            payload.member.display_name if payload.member else payload.user_id,
+            payload.user_id,
+            count,
+            self._min_players(),
+        )
+
+        if count == self._min_players():
+            guild = self.bot.get_guild(payload.guild_id)
+            if guild is None:
+                return
+            admin_role = discord.utils.get(guild.roles, name=self._cfg("scrim_admin_role", ""))
+            mention = admin_role.mention if admin_role else f"@{self._cfg('scrim_admin_role')}"
+            await message.channel.send(
+                f"{mention} Queue is full — **{count} players** signed up! "
+                f"Use `/role add` to assign the scrim player role and get the match going."
+            )
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        if str(payload.emoji) != self._emoji():
+            return
+        if payload.message_id != self._signup_message_id():
+            return
+
+    # ------------------------------------------------------------------
+    # /role
+    # ------------------------------------------------------------------
+
+    role_group = app_commands.Group(name="role", description="Manage scrim player roles")
+
+    @role_group.command(name="add", description="Give the scrim player role to all signed-up players")
+    async def role_add(self, interaction: discord.Interaction):
+        if not self._has_scrim_admin(interaction):
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        player_role_name = self._cfg("scrim_player_role", "")
+        if not player_role_name:
+            await interaction.followup.send("No `scrim_player_role` set in config.json.")
+            return
+
+        guild = interaction.guild
+        player_role = discord.utils.get(guild.roles, name=player_role_name)
+        if player_role is None:
+            await interaction.followup.send(f"Role **{player_role_name}** not found in this server.")
+            return
+
+        message = await self._get_signup_message()
+        if message is None:
+            await interaction.followup.send("Signup message not found. Check `scrim_signup_channel_id` in config.json.")
+            return
+
+        reactors = await self._reactors(message)
+        if not reactors:
+            await interaction.followup.send("Nobody has signed up yet.")
+            return
+
+        reactors = reactors[:10]
+        assigned, skipped = [], []
+        for user in reactors:
+            member = guild.get_member(user.id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(user.id)
+                except Exception:
+                    skipped.append(str(user))
+                    continue
+            if player_role not in member.roles:
+                try:
+                    await member.add_roles(player_role, reason="Scrim signup")
+                    assigned.append(member.display_name)
+                except Exception as e:
+                    logger.warning("Could not assign scrim role to %s: %s", member, e)
+                    skipped.append(member.display_name)
+            else:
+                assigned.append(member.display_name)  # already has it, count as success
+
+        lines = [f"Assigned **{player_role_name}** to {len(assigned)} player(s)."]
+        if assigned:
+            lines.append(", ".join(assigned))
+        if skipped:
+            lines.append(f"Could not assign to: {', '.join(skipped)}")
+        await interaction.followup.send("\n".join(lines))
+
+    @role_group.command(name="remove", description="Remove the scrim player role from everyone who has it")
+    async def role_remove(self, interaction: discord.Interaction):
+        if not self._has_scrim_admin(interaction):
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        player_role_name = self._cfg("scrim_player_role", "")
+        if not player_role_name:
+            await interaction.followup.send("No `scrim_player_role` set in config.json.")
+            return
+
+        guild = interaction.guild
+        player_role = discord.utils.get(guild.roles, name=player_role_name)
+        if player_role is None:
+            await interaction.followup.send(f"Role **{player_role_name}** not found in this server.")
+            return
+
+        removed, failed = [], []
+        for member in player_role.members:
+            try:
+                await member.remove_roles(player_role, reason="Scrim cleanup")
+                removed.append(member.display_name)
+            except Exception as e:
+                logger.warning("Could not remove scrim role from %s: %s", member, e)
+                failed.append(member.display_name)
+
+        if not removed and not failed:
+            await interaction.followup.send(f"Nobody currently has the **{player_role_name}** role.")
+            return
+
+        # Clear all reactions from the signup message so the queue resets
+        message = await self._get_signup_message()
+        if message is not None:
+            try:
+                await message.clear_reactions()
+                await message.add_reaction(self._emoji())
+            except Exception as e:
+                logger.warning("Could not reset signup message reactions: %s", e)
+
+        lines = [f"Removed **{player_role_name}** from {len(removed)} member(s)."]
+        if failed:
+            lines.append(f"Could not remove from: {', '.join(failed)}")
+        await interaction.followup.send("\n".join(lines))
