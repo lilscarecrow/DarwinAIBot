@@ -12,3 +12,5 @@ sounddevice>=0.4.6
 soundfile>=0.12.1
 PyNaCl>=1.4.0
 davey>=0.1.5
+requests>=2.31.0
+pip-system-certs>=4.0

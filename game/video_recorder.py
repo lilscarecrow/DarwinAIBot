@@ -8,9 +8,9 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
-_FPS = 0.5
+_FPS = 4
 _FOURCC = cv2.VideoWriter_fourcc(*"avc1")
-_FRAME_INTERVAL = 2.0
+_FRAME_INTERVAL = 1.0 / _FPS
 _OUTPUT_DIR = Path("screenshots/recordings")
 
 

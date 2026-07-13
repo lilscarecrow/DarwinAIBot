@@ -363,18 +363,42 @@ class DirectorCog(commands.Cog):
         return e
 
     async def _upload_recording(self, path: str):
-        """Upload the match recording to the API endpoint in the background."""
+        """Upload the match recording to the API endpoint in the background, then delete the local file."""
         endpoint = self.bot.config.get("recording_api_endpoint", "")
         if not endpoint:
             logger.info("Recording ready at %s — no recording_api_endpoint configured, skipping upload", path)
+        else:
+            logger.info("Uploading recording %s to %s", path, endpoint)
+            # TODO: implement upload when API is finalized
+            # Example with aiohttp:
+            # import aiohttp
+            # async with aiohttp.ClientSession() as session:
+            #     with open(path, "rb") as f:
+            #         await session.post(endpoint, data={"file": f})
+
+        try:
+            os.remove(path)
+            logger.info("Deleted local recording %s", path)
+        except Exception as e:
+            logger.warning("Could not delete recording %s: %s", path, e)
+
+    async def _post_results_to_ingest(self, results_text: str):
+        """Best-effort push of the raw results screenshot to the ds.xdos.ai scrim ladder."""
+        if not results_text.endswith(".png"):
             return
-        logger.info("Uploading recording %s to %s", path, endpoint)
-        # TODO: implement upload when API is finalized
-        # Example with aiohttp:
-        # import aiohttp
-        # async with aiohttp.ClientSession() as session:
-        #     with open(path, "rb") as f:
-        #         await session.post(endpoint, data={"file": f})
+        token = self.bot.config.get("ds_ingest_token")
+        if not token:
+            return
+        base_url = self.bot.config.get("ds_ingest_base_url", "https://ds.xdos.ai")
+        platform = self.bot.config.get("ds_ingest_platform", "pc")
+        from game.ingest import post_results_screenshot
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None, post_results_screenshot, results_text, base_url, token, platform,
+            )
+        except Exception as e:
+            logger.warning("ds.xdos.ai ingest failed: %s", e)
 
     async def _mirror_results(self, results_text: str):
         """Post match results to the secondary guild channel."""
@@ -1247,14 +1271,10 @@ class DirectorCog(commands.Cog):
                 last_action="Match ended",
                 next_action="Returning to menu",
             )
-            if results_text.endswith(".png"):
-                await channel.send(
-                    embed=self._info("Match Complete", "Results screenshot attached."),
-                    file=discord.File(results_text),
-                )
-            else:
+            if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
+            await self._post_results_to_ingest(results_text)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
@@ -1373,14 +1393,10 @@ class DirectorCog(commands.Cog):
                 last_action="Match ended",
                 next_action="Returning to menu",
             )
-            if results_text.endswith(".png"):
-                await channel.send(
-                    embed=self._info("Match Complete", "Results screenshot attached."),
-                    file=discord.File(results_text),
-                )
-            else:
+            if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
+            await self._post_results_to_ingest(results_text)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
@@ -1559,6 +1575,9 @@ class DirectorCog(commands.Cog):
 # Scrim signup system
 # ==============================================================================
 
+_AI_DIRECTOR_CHANNEL_ID = 1520518111089000548
+
+
 class ScrimCog(commands.Cog):
     """
     Manages the scrim signup queue via reactions on a static message.
@@ -1578,6 +1597,9 @@ class ScrimCog(commands.Cog):
 
     def __init__(self, bot: "DarwinBot"):
         self.bot = bot
+        # Countdown to the next reaction cleanup — (re)started when the first real
+        # reactor joins an empty queue, rather than pinned to the top of the hour.
+        self._reset_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Startup — ensure a static signup message exists
@@ -1586,7 +1608,21 @@ class ScrimCog(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         await self._ensure_signup_message()
-        self.bot.loop.create_task(self._hourly_reaction_reset())
+        await self._resume_reset_timer_if_needed()
+
+    async def _resume_reset_timer_if_needed(self):
+        """If the bot restarted mid-queue, restart the 1-hour countdown from now.
+
+        The original first-reaction time doesn't survive a restart, so this is a
+        best-effort fallback — a queue that was, say, 50 minutes in when the bot
+        restarted gets a fresh hour rather than resetting 10 minutes later.
+        """
+        message = await self._get_signup_message()
+        if message is None:
+            return
+        reactors = await self._reactors(message)
+        if reactors:
+            self._start_reset_timer()
 
     async def _ensure_signup_message(self):
         ch_id = self._cfg("scrim_signup_channel_id")
@@ -1631,50 +1667,66 @@ class ScrimCog(commands.Cog):
 
         self._save_message_id(msg.id)
 
-    async def _hourly_reaction_reset(self):
-        """Background task: at the top of every hour, clear all signup reactions and DM removed players."""
-        import datetime
-        while True:
-            now = datetime.datetime.now()
-            # Sleep until the next top-of-hour
-            seconds_until_next_hour = (60 - now.minute) * 60 - now.second
-            await asyncio.sleep(seconds_until_next_hour)
+    def _start_reset_timer(self):
+        """(Re)start the 1-hour countdown to the next reaction cleanup, if one isn't already running."""
+        if self._reset_task is not None and not self._reset_task.done():
+            return
+        self._reset_task = self.bot.loop.create_task(self._delayed_reset())
 
-            message = await self._get_signup_message()
-            if message is None:
-                continue
+    def _cancel_reset_timer(self):
+        if self._reset_task is not None and not self._reset_task.done():
+            self._reset_task.cancel()
+        self._reset_task = None
 
-            reactors = await self._reactors(message)
-            if not reactors:
-                continue
+    async def _delayed_reset(self):
+        try:
+            await asyncio.sleep(3600)
+            await self._do_reaction_reset()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("ScrimCog: reaction reset timer failed")
 
+    async def _do_reaction_reset(self):
+        """Clear signup reactions and notify removed players.
+
+        Skipped entirely if anyone currently holds scrim_player_role — that means a scrim is
+        underway and players shouldn't get pinged/reset out of the queue mid-match.
+        """
+        message = await self._get_signup_message()
+        if message is None:
+            return
+
+        if self._match_in_progress(message.guild):
+            logger.info("ScrimCog reaction reset: skipped — scrim_player_role is currently assigned")
+            return
+
+        reactors = await self._reactors(message)
+        if not reactors:
+            return
+
+        await self._clear_real_reactions(message, reactors)
+
+        logger.info("ScrimCog reaction reset: cleared %d reactions", len(reactors))
+
+        notify_channel_id = 1520509256678506737
+        notify_ch = self.bot.get_channel(notify_channel_id)
+        if notify_ch is None:
             try:
-                await message.clear_reactions()
-                await message.add_reaction(self._emoji())
+                notify_ch = await self.bot.fetch_channel(notify_channel_id)
             except Exception as e:
-                logger.warning("ScrimCog hourly reset: could not clear reactions: %s", e)
-                continue
+                logger.warning("ScrimCog reaction reset: could not fetch notify channel: %s", e)
+                return
 
-            logger.info("ScrimCog hourly reset: cleared %d reactions", len(reactors))
-
-            notify_channel_id = 1520509256678506737
-            notify_ch = self.bot.get_channel(notify_channel_id)
-            if notify_ch is None:
-                try:
-                    notify_ch = await self.bot.fetch_channel(notify_channel_id)
-                except Exception as e:
-                    logger.warning("ScrimCog hourly reset: could not fetch notify channel: %s", e)
-                    continue
-
-            mentions = " ".join(u.mention for u in reactors)
-            signup_channel_id = self._cfg("scrim_signup_channel_id")
-            try:
-                await notify_ch.send(
-                    f"{mentions}\nThe scrim signup queue was reset. "
-                    f"Head to <#{signup_channel_id}> and react again to rejoin!"
-                )
-            except Exception as e:
-                logger.warning("ScrimCog hourly reset: could not post notify message: %s", e)
+        mentions = " ".join(u.mention for u in reactors)
+        signup_channel_id = self._cfg("scrim_signup_channel_id")
+        try:
+            await notify_ch.send(
+                f"{mentions}\nThe scrim signup queue was reset. "
+                f"Head to <#{signup_channel_id}> and react again to rejoin!"
+            )
+        except Exception as e:
+            logger.warning("ScrimCog reaction reset: could not post notify message: %s", e)
 
     def _save_message_id(self, message_id: int):
         self.bot.config["scrim_signup_message_id"] = message_id
@@ -1711,6 +1763,13 @@ class ScrimCog(commands.Cog):
         role_name = self._cfg("scrim_admin_role", "")
         return any(r.name == role_name for r in interaction.user.roles)
 
+    def _match_in_progress(self, guild: discord.Guild | None) -> bool:
+        """True if anyone currently holds scrim_player_role (i.e. a scrim is underway)."""
+        if guild is None:
+            return False
+        role = discord.utils.get(guild.roles, name=self._cfg("scrim_player_role", ""))
+        return bool(role and role.members)
+
     async def _get_signup_message(self) -> discord.Message | None:
         msg_id = self._signup_message_id()
         ch_id = self._cfg("scrim_signup_channel_id")
@@ -1727,12 +1786,27 @@ class ScrimCog(commands.Cog):
         except Exception:
             return None
 
-    async def _reactors(self, message: discord.Message) -> list[discord.Member]:
-        """Return all non-bot members who reacted with the signup emoji."""
+    async def _clear_real_reactions(self, message: discord.Message, reactors: list) -> None:
+        """Remove each real reactor's reaction individually, leaving the bot's own seed reaction in place.
+
+        Fires a normal MESSAGE_REACTION_REMOVE event per user (the same path Discord clients use for
+        every manual un-react) instead of a bulk clear_reactions() call, which appeared to leave stale
+        names in the client's "who reacted" hover list.
+        """
         emoji = self._emoji()
+        for user in reactors:
+            try:
+                await message.remove_reaction(emoji, user)
+            except Exception as e:
+                logger.warning("Could not remove reaction for %s: %s", user, e)
+
+    async def _reactors(self, message: discord.Message) -> list[discord.Member]:
+        """Return all non-bot members who reacted with the signup emoji (excludes this bot's own seed reaction)."""
+        emoji = self._emoji()
+        bot_id = self.bot.user.id if self.bot.user else None
         for reaction in message.reactions:
             if str(reaction.emoji) == emoji:
-                users = [u async for u in reaction.users() if not u.bot]
+                users = [u async for u in reaction.users() if not u.bot and u.id != bot_id]
                 return users
         return []
 
@@ -1762,13 +1836,27 @@ class ScrimCog(commands.Cog):
             self._min_players(),
         )
 
+        if count == 1:
+            # First real reactor on an empty queue — start the 1-hour reset countdown from now
+            # instead of waiting for the next wall-clock hour.
+            self._start_reset_timer()
+
         if count == self._min_players():
             guild = self.bot.get_guild(payload.guild_id)
             if guild is None:
                 return
             admin_role = discord.utils.get(guild.roles, name=self._cfg("scrim_admin_role", ""))
             mention = admin_role.mention if admin_role else f"@{self._cfg('scrim_admin_role')}"
-            await message.channel.send(
+
+            notify_ch = self.bot.get_channel(_AI_DIRECTOR_CHANNEL_ID)
+            if notify_ch is None:
+                try:
+                    notify_ch = await self.bot.fetch_channel(_AI_DIRECTOR_CHANNEL_ID)
+                except Exception as e:
+                    logger.warning("ScrimCog: could not fetch ai-director channel: %s", e)
+                    notify_ch = message.channel
+
+            await notify_ch.send(
                 f"{mention} Queue is full — **{count} players** signed up! "
                 f"Use `/role add` to assign the scrim player role and get the match going."
             )
@@ -1779,6 +1867,15 @@ class ScrimCog(commands.Cog):
             return
         if payload.message_id != self._signup_message_id():
             return
+
+        # If the last real reactor just left, there's nothing left to reset — cancel the
+        # countdown so it doesn't fire against a queue that refills later from scratch.
+        message = await self._get_signup_message()
+        if message is None:
+            return
+        reactors = await self._reactors(message)
+        if not reactors:
+            self._cancel_reset_timer()
 
     # ------------------------------------------------------------------
     # /role
@@ -1794,7 +1891,7 @@ class ScrimCog(commands.Cog):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
 
         player_role_name = self._cfg("scrim_player_role", "")
         if not player_role_name:
@@ -1852,7 +1949,7 @@ class ScrimCog(commands.Cog):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
 
         player_role_name = self._cfg("scrim_player_role", "")
         if not player_role_name:
@@ -1881,11 +1978,10 @@ class ScrimCog(commands.Cog):
         # Clear all reactions from the signup message so the queue resets
         message = await self._get_signup_message()
         if message is not None:
-            try:
-                await message.clear_reactions()
-                await message.add_reaction(self._emoji())
-            except Exception as e:
-                logger.warning("Could not reset signup message reactions: %s", e)
+            reactors = await self._reactors(message)
+            if reactors:
+                await self._clear_real_reactions(message, reactors)
+        self._cancel_reset_timer()
 
         lines = [f"Removed **{player_role_name}** from {len(removed)} member(s)."]
         if failed:

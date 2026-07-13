@@ -741,9 +741,9 @@ class MatchRunner:
                     tuple(int(v) for v in bgr_before),
                     tuple(int(v) for v in bgr_after),
                     delta,
-                    "verified" if delta > 40 else "unchanged",
+                    "verified" if delta > 80 else "unchanged",
                 )
-                verified = delta > 40
+                verified = delta > 80
 
             if verified:
                 self._zone_states[zone_id] = ZoneState.CLOSING

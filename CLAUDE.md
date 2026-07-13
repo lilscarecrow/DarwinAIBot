@@ -49,7 +49,8 @@ DarwinAIBot/
 │   ├── deck_utils.py           # Card point costs, deck layout from state.json
 │   ├── profiles.py             # Match card play schedules
 │   ├── match_runner.py         # Full match loop (card timers, zone closes, end detection)
-│   └── video_recorder.py       # Background match recording (H.264 MP4, cropped, 0.5fps)
+│   ├── video_recorder.py       # Background match recording (H.264 MP4, cropped, 4fps)
+│   └── ingest.py               # Push results screenshot to darwinstalker.com scrim ladder
 ├── session/
 │   └── state.py                # BotState enum + SessionState machine
 ├── zones/
@@ -62,7 +63,7 @@ DarwinAIBot/
 │       └── weighted_outer.py   # Prefer outer zones, occasional variation (default)
 ├── logs/                       # Runtime log (darwin_bot.log, appended across sessions)
 ├── screenshots/errors/         # Auto-saved on any automation failure
-├── screenshots/recordings/     # Match recordings (H.264 MP4, 0.5fps, cropped)
+├── screenshots/recordings/     # Match recordings (H.264 MP4, 4fps, cropped) — deleted after each match, see Video Recorder section
 └── templates/                  # OpenCV template images (captured from game, not in repo)
 ```
 
@@ -83,6 +84,10 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 2. `_state_check` — ephemeral error if command invalid in current state
 3. `_lock_check` — ephemeral error if another long-running operation is active
 
+**`discord_required_role` is intentionally the same value as `scrim_admin_role`** (currently `"PC Scrim Admin"`) — merged so the same role gates both Director automation (`/launch`, `/custom`, `/start`, `/quit`, `/deck`) and scrim admin actions (`/role add`, `/role remove`). This means anyone with `PC Scrim Admin` can force-close the game or edit the live card deck, not just manage scrim signups — that's a deliberate scope decision, not an oversight, but worth remembering if the role is ever handed out more broadly.
+
+**Guild command sync doesn't self-clean.** `discord_guild_ids` controls which guilds get `tree.sync()`'d on startup, but removing a guild from that list does **not** un-register the commands Discord already has stored for it — they stay registered (and visible/callable) in that guild indefinitely. If a guild is dropped from config (e.g. after a server migration), its stale command list will drift from the code over time. Not dangerous as long as nobody in that guild holds `discord_required_role`, but worth an occasional check via `GET /applications/{app_id}/guilds/{guild_id}/commands` if a guild is meant to be fully decommissioned.
+
 **The asyncio lock (`_session_lock`)** wraps all `run_in_executor` calls to prevent concurrent operations. `/quit` bypasses this lock intentionally — it calls `_active_runner.stop()` then closes the game.
 
 **Long-running commands** (`/launch`, `/custom`, `/start`) use `run_in_executor` to run blocking game automation in a thread without blocking the Discord event loop.
@@ -100,7 +105,7 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 
 All responses use `discord.Embed` with color-coded status (green=ok, red=fail, blue=active, orange=in-match, gray=neutral). State is shown in every embed footer.
 
-**Results mirroring:** end-of-match screenshots are also posted to channel ID `1520509048540238015` (new guild) via `_mirror_results()`. The local screenshot file is deleted after both sends complete.
+**Results mirroring:** end-of-match screenshots are posted **only** to the `results` channel (ID `1520509048540238015`) via `_mirror_results()` — they are no longer sent as a file attachment in whatever channel `/start` was run from (that channel gets nothing further after the initial "Match In Progress" message, except for non-screenshot abort/force-stop text results, which still post there). The local screenshot file is deleted after the mirror send and the ladder ingest upload both complete.
 
 ### Scrim Signup System (`ScrimCog`)
 
@@ -108,24 +113,32 @@ Manages a static signup message in the configured channel. On every `on_ready`, 
 
 **Reaction flow:**
 - Players react with ✅ to sign up
-- When reaction count reaches `scrim_min_players` (default 8), the `scrim_admin_role` is pinged in the signup channel
-- Every hour at the top of the hour, all reactions are cleared and a message pings removed players in channel ID `1520509256678506737` to re-sign up
+- `_reactors()` excludes the bot's own seed reaction (both by `.bot` flag and explicit ID match — belt and suspenders) so the queue count reflects real players only
+- When the real reactor count reaches `scrim_min_players` (default 8), `scrim_admin_role` is pinged in the **`ai-director`** channel (ID `1520518111089000548`) — not the signup channel itself
+- A 1-hour reset countdown starts the moment the **first** real reactor joins an empty queue (`_start_reset_timer()`, triggered from `on_raw_reaction_add` when count hits 1) — this replaced the old "clear at the top of every wall-clock hour" behavior, so someone reacting at :59 doesn't get cut off a minute later. The timer is cancelled if the queue empties out before it fires (`on_raw_reaction_remove`) or is manually reset via `/role remove`, so a stale countdown from an old batch of reactors can never fire against a fresh one.
+- When the countdown fires (`_do_reaction_reset()`), it's skipped entirely if anyone currently holds `scrim_player_role` — a scrim is underway and players shouldn't get reset/pinged mid-match. Otherwise it clears reactions and pings removed players in channel ID `1520509256678506737` to re-sign up.
+- Reaction clearing (both the timer and `/role remove`) removes each real reactor's reaction **individually** (`message.remove_reaction`) rather than via a bulk `clear_reactions()` + re-add. Bulk clears appeared to leave stale names in some Discord clients' "who reacted" hover list; individual removals go through the same `MESSAGE_REACTION_REMOVE` event path used for a normal manual un-react. The bot's own seed reaction is never touched, so it doesn't need to be re-added.
+- **Bot restart caveat:** the reset countdown lives in memory only. If the bot restarts while a queue already has reactors, `_resume_reset_timer_if_needed()` starts a fresh full hour from restart time rather than knowing how long the queue had already been open — a queue that was 55 minutes old right before a restart effectively gets renewed.
 
-**Commands (scrim admin role required):**
+**Commands (scrim admin role required, i.e. `discord_required_role` — see merge note above):**
 | Command | Description |
 |---|---|
-| `/role add` | Gives `scrim_player_role` to the first 10 reactors (Discord reaction order) |
-| `/role remove` | Removes `scrim_player_role` from all who have it, clears all reactions on signup message |
+| `/role add` | Gives `scrim_player_role` to the first 10 reactors (Discord reaction order). Response is public (not ephemeral). |
+| `/role remove` | Removes `scrim_player_role` from all who have it, clears all reactions on signup message, cancels any pending reset timer. Response is public (not ephemeral). |
+
+Both commands' permission-denial message ("You don't have permission...") remains ephemeral — only the successful-result messages were made public.
 
 **Config keys:**
 | Key | Value |
 |---|---|
 | `scrim_signup_channel_id` | `1520517054988419123` |
 | `scrim_signup_message_id` | Auto-persisted — do not edit manually |
-| `scrim_player_role` | `Scrim Player` |
-| `scrim_admin_role` | `Scrim Admin` |
+| `scrim_player_role` | `PC Scrim Player` |
+| `scrim_admin_role` | `PC Scrim Admin` (same value as `discord_required_role`) |
 | `scrim_min_players` | `8` |
 | `scrim_reaction_emoji` | `✅` |
+
+Two channel IDs are hardcoded constants in `discord_bot.py` rather than config keys: `_AI_DIRECTOR_CHANNEL_ID` (queue-full ping) and the notify channel used in `_do_reaction_reset` (`1520509256678506737`, removed-players re-signup ping). Both were confirmed to belong to the current guild (`480566249609232389`) after the server migration — if the guild ever changes again, these need updating in code, not config.
 
 ### Match Runner (`game/match_runner.py`)
 
@@ -141,8 +154,8 @@ Manages a static signup message in the configured channel. On every `on_ready`, 
    - Every 30s: sample zone pixels → `valid_closeable_zones()` → shuffle all OPEN zones → try each until one verifies
    - Every `screen_poll_interval_seconds`: double-confirm match end (two detections 2s apart, threshold 0.88)
 6. Stop recorder (`finally` block — runs on normal end, force-stop, and exceptions)
-7. Take screenshot of results screen → send as Discord file attachment → delete local file
-8. Fire background upload of recording via `_upload_recording()`
+7. Take screenshot of results screen → mirror to the `results` channel via `_mirror_results()` (not posted in the invoking channel) → push to ladder ingest → delete local screenshot file
+8. Fire background upload of recording via `_upload_recording()` — see Video Recorder section for what this actually does today
 9. Click MAIN MENU button on results screen → wait for main menu → transition to `IN_MENU`
 
 `MatchRunner.stop()` sets a `threading.Event` that the loop checks between every action. Called by `/quit`.
@@ -275,6 +288,13 @@ The big zone map only appears when a zone_close card is grabbed (shift+click+hol
 5. `complete_drag(keep_shift=True)` to target zone → after-screenshot → verify slot pixel changed → `shift_up()`, or `mouseUp()+shift_up()` if nothing closeable
 In bypass mode, uses cached `_zone_states` (all OPEN initially) and calls `play_card(bypass_mode=True)`.
 
+**Zone_close slot verification threshold — 80, not 40:**
+The inline pixel delta check in `_attempt_zone_close` uses `delta > 80` (not the global 40 used by `_verify_card_removed`). This is intentional.
+
+The zone_close card's tray position varies by profile. In the Blood profile (custom_a), beach_party is never played, so the tray always has one extra card. This pushes zone_close from x=814 (Standard/Everything) to x=852. The game world background bleeds slightly through the card art at x=852, causing a consistent small delta of ~56-58 even when the card returns to its slot after a rejection. This is not a timing issue — it is a specific background bleed at that screen coordinate. Real plays produce delta of 240+; the false-positive bleed produces delta 56-58. Threshold 80 sits safely between them.
+
+`_verify_card_removed` (used by all non-zone_close cards) remains at delta > 40 — those cards are never affected by this background bleed.
+
 **Zone visual states on the big map (what to calibrate against):**
 - **OPEN**: plain medium blue/teal hex, no border glow
 - **CLOSING**: visibly darker (navy/dim) hex, no orange border — tile darkens as lava begins but orange outline has not appeared yet
@@ -287,12 +307,25 @@ Sample points are placed at ~110px from each tile center (near the hex edge, wel
 Records match footage in a background thread. Started after the match countdown, stopped in a `try/finally` so the file is always finalized regardless of how the match ends.
 
 - **Format:** H.264 MP4 (`avc1`) — all three FOURCC options tested True on this machine
-- **FPS:** 0.5 (1 frame every 2 seconds)
+- **FPS:** 4 (1 frame every 0.25 seconds)
 - **Crop:** configured via `recording_crop_region: [x, y, w, h]` — currently `[755, 175, 410, 200]` (tight center band focused on the kill feed area)
-- **Output:** `screenshots/recordings/match_{timestamp}.mp4` — ~8 MB for a 20-min match at these settings
-- **Upload:** `_upload_recording(path)` fires as a detached async task after the match. Currently a stub — wire up when `recording_api_endpoint` is set in config
+- **Output:** `screenshots/recordings/match_{timestamp}.mp4` — ~60-65 MB for a 20-min match at these settings (roughly 8x the file size of the old 0.5fps setting)
+- **Upload:** `_upload_recording(path)` fires as a detached async task after the match. The actual upload is still a stub (TODO — wire up when `recording_api_endpoint` is set in config). **The local recording file is deleted unconditionally at the end of `_upload_recording()` regardless of whether an upload happened** — this was an explicit choice to reclaim disk space now, accepting that until the upload is actually implemented, recordings aren't preserved anywhere once deleted.
 
 **Safety:** process crash will leave the file corrupt (VideoWriter MOOV atom not flushed). All other exit paths (normal end, `/quit`, exceptions, asyncio timeout) are covered by the `try/finally`.
+
+### Ladder Ingestion (`game/ingest.py`)
+
+Pushes the raw end-of-match results screenshot to the **`darwinstalker.com`** scrim ladder ingestion API (spec: `SHOW_DIRECTOR_HANDOFF.md`, gitignored — not tracked in this repo, and still documents the old `ds.xdos.ai` base URL — see domain migration note below). Everything sent lands in an **unpublished draft** grouped by (platform, day UTC); a human moderator reviews and publishes later, so this is genuinely fire-and-forget — failures are logged and swallowed, never retried.
+
+- `post_results_screenshot(screenshot_path, base_url, token, platform)` — `POST /api/ingest/screenshot`, multipart form with the PNG + `platform`. Called from `discord_bot.py`'s `_post_results_to_ingest()` via `run_in_executor` (blocking `requests` call off the event loop).
+- Wired into both match-end paths (`/start` and the auto-start watcher) in `discord_bot.py`, right after `_mirror_results()` and before the local screenshot file is deleted — the file must still exist on disk when this fires.
+- No-ops silently if `ds_ingest_token` is unset in config.
+- Success response: `{"draft_id": ..., "game_index": ..., "ocr_error": ...}` — logged at INFO. `ocr_error: null` means the server's OCR read the scorecard cleanly.
+
+**Domain migration — `ds.xdos.ai` → `darwinstalker.com`:** the ladder site moved domains; `ds.xdos.ai` now 301-redirects to `darwinstalker.com`. `config.json → ds_ingest_base_url` was updated to `https://darwinstalker.com` directly. This mattered because a 301 redirect downgrades a `POST` to a `GET` when followed (standard client behavior, not a bug) — hitting the old `ds.xdos.ai` URL produced `405 Method Not Allowed` with an empty body, since the redirect target's route only accepts `POST`. If ingest ever starts failing with `HTTP 405` again, check for another redirect first (`requests.post(..., allow_redirects=True)` then inspect `resp.history` for a 301/302) before assuming the API contract changed.
+
+**SSL cert gotcha (Windows):** `requests`/`certifi` ships its own fixed CA bundle instead of using the Windows trust store. On this machine, something doing TLS interception (AV/corporate proxy) re-signs HTTPS traffic with a root CA that Windows trusts but `certifi` doesn't — every `requests` call to the ingest API failed with `SSLCertVerificationError: unable to get local issuer certificate` until `pip-system-certs` was installed (patches Python to use the OS trust store at interpreter startup, no code changes needed). It's in `requirements.txt` — if a fresh machine hits the same SSL error, this is the fix.
 
 ### TTS (`game/tts.py`)
 
@@ -441,8 +474,8 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
 {
     "game_executable_path": "",          // Full path to DarwinProject.exe
     "discord_bot_token": "",             // Discord bot token (keep secret)
-    "discord_required_role": "DarwinBotAdmin",
-    "discord_guild_ids": ["..."],        // Guild IDs for instant slash command sync
+    "discord_required_role": "PC Scrim Admin",   // Intentionally the same value as scrim_admin_role — see merge note in Discord Bot section
+    "discord_guild_ids": ["..."],        // Guild IDs for instant slash command sync — removing an ID here does NOT un-register commands already synced to that guild, see note above
     "zone_selection_strategy": "weighted_outer",
     "active_profile": "standard",        // Match card play profile (see game/profiles.py)
     "ahk_bypass_mode": false,            // true = log actions instead of executing
@@ -486,14 +519,19 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "launch_timeout_seconds": 180,
 
     // Video recording
-    "recording_api_endpoint": "",        // POST endpoint for upload — leave empty to skip upload
+    "recording_api_endpoint": "",        // POST endpoint for upload — upload is still a TODO stub; local file is deleted after each match regardless (see Video Recorder section)
     "recording_crop_region": [755, 175, 410, 200],   // [x, y, w, h] crop at 1920×1080 — tight center band on kill feed
+
+    // Ladder ingestion (darwinstalker.com, formerly ds.xdos.ai) — see game/ingest.py
+    "ds_ingest_base_url": "https://darwinstalker.com",
+    "ds_ingest_token": "",                // Bearer token, issued out of band — leave empty to skip ingest
+    "ds_ingest_platform": "pc",           // "pc" | "xbox"
 
     // Scrim signup system
     "scrim_signup_channel_id": "1520517054988419123",
     "scrim_signup_message_id": null,     // Auto-persisted by bot on startup — do not edit manually
-    "scrim_player_role": "Scrim Player",
-    "scrim_admin_role": "Scrim Admin",
+    "scrim_player_role": "PC Scrim Player",
+    "scrim_admin_role": "PC Scrim Admin", // same value as discord_required_role — see merge note above
     "scrim_min_players": 8,
     "scrim_reaction_emoji": "✅"
 }
