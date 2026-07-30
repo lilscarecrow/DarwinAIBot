@@ -176,6 +176,11 @@ _LAUNCH_TIMEOUT = 420.0    # 7 min: game start + splash + menu detection (slow H
 _CUSTOM_TIMEOUT = 180.0    # 3 min: menu navigation to lobby (lobby load can be slow)
 _MATCH_TIMEOUT  = 3600.0   # 60 min: safety net — real matches can exceed 20 min
 
+# Lobby-ready ping: posted to this channel, pinging this role, when /custom captures a lobby code.
+# Hardcoded like _AI_DIRECTOR_CHANNEL_ID below — update in code, not config, if the guild changes.
+_LOBBY_PING_CHANNEL_ID = 1520520910006779915
+_LOBBY_PING_ROLE_ID = 1520526014600577134
+
 # Embed accent colors
 _COLOR_OK      = 0x2ECC71  # green   — success
 _COLOR_FAIL    = 0xE74C3C  # red     — failure / error
@@ -765,6 +770,16 @@ class DirectorCog(commands.Cog):
             embed.add_field(name="Profile", value=_profile_label, inline=True)
             embed.add_field(name="Lobby Code", value=f"```{lobby_code}```", inline=False)
             await interaction.followup.send(embed=embed)
+
+            ping_ch = self.bot.get_channel(_LOBBY_PING_CHANNEL_ID)
+            if ping_ch is None:
+                try:
+                    ping_ch = await self.bot.fetch_channel(_LOBBY_PING_CHANNEL_ID)
+                except Exception as e:
+                    logger.warning("Could not reach lobby ping channel %d: %s", _LOBBY_PING_CHANNEL_ID, e)
+                    ping_ch = None
+            if ping_ch is not None:
+                await ping_ch.send(f"<@&{_LOBBY_PING_ROLE_ID}> {lobby_code}")
 
             # Start a background watcher that fires the match runner if the lobby
             # auto-starts before /start is called.
@@ -1836,9 +1851,12 @@ class ScrimCog(commands.Cog):
             self._min_players(),
         )
 
-        if count == 1:
-            # First real reactor on an empty queue — start the 1-hour reset countdown from now
-            # instead of waiting for the next wall-clock hour.
+        if count > 0:
+            # Ensure a countdown is running whenever the queue is non-empty. _start_reset_timer()
+            # is a no-op if one is already active, so this is safe to call on every reaction.
+            # Gating on count == 1 exactly used to miss this: a rate-limited _reactors() fetch can
+            # resolve late and report 2+ for what was actually the first reactor of a fresh queue,
+            # permanently leaving the timer unarmed since the count never returns to exactly 1 again.
             self._start_reset_timer()
 
         if count == self._min_players():
