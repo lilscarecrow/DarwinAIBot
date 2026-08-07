@@ -1,5 +1,5 @@
 import logging
-import subprocess
+import os
 import time
 import psutil
 
@@ -7,24 +7,35 @@ logger = logging.getLogger(__name__)
 
 GAME_PROCESS_NAME = "Darwin-Win64-Shipping.exe"
 
+# Darwin Project's Steam App ID (fixed — not machine-specific, see appmanifest_544920.acf).
+STEAM_APP_ID = "544920"
+
 
 def launch_game(exe_path: str, timeout: int = 60) -> bool:
     """
-    Start the game process and wait for it to appear.
+    Start the game via the Steam client and wait for the process to appear.
     Returns True if the process appeared within timeout.
+
+    exe_path is only used as a sanity check that the game is installed where
+    config expects (see main.py startup validation) — the actual launch goes
+    through steam://rungameid so the Steamworks/EAC bootstrap in Darwin.exe
+    initializes the same way it does for a launch from the Steam client.
+    Launching Darwin.exe directly via subprocess used to work, but as of the
+    UE5 update it now exits immediately when not spawned by Steam.
     """
     if is_game_running():
         logger.info("Game already running — skipping launch")
         return True
 
-    logger.info("Launching game: %s", exe_path)
-    try:
-        subprocess.Popen([exe_path])
-    except FileNotFoundError:
+    if not os.path.exists(exe_path):
         logger.error("Executable not found: %s", exe_path)
         return False
+
+    logger.info("Launching game via Steam (appid %s)", STEAM_APP_ID)
+    try:
+        os.startfile(f"steam://rungameid/{STEAM_APP_ID}")
     except OSError as e:
-        logger.error("Failed to launch game: %s", e)
+        logger.error("Failed to launch game via Steam: %s", e)
         return False
 
     deadline = time.monotonic() + timeout

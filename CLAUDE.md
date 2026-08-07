@@ -41,7 +41,7 @@ DarwinAIBot/
 ├── bot/
 │   └── discord_bot.py          # DarwinBot + DirectorCog + ScrimCog (all slash commands)
 ├── game/
-│   ├── launcher.py             # Launch game process, monitor for crashes
+│   ├── launcher.py             # Launch game via Steam protocol, monitor for crashes
 │   ├── screen_detection.py     # OpenCV template matching, pixel sampling, screenshots
 │   ├── card_actions.py         # Shift-drag card plays, key presses, bypass mode
 │   ├── ocr.py                  # Tesseract results parsing, Discord formatter
@@ -68,6 +68,14 @@ DarwinAIBot/
 ```
 
 ## Code Architecture
+
+### Game Launcher (`game/launcher.py`)
+
+`launch_game()` launches the game via `os.startfile("steam://rungameid/544920")`, **not** by running `Darwin.exe` directly. `game_executable_path` in config is still validated (must exist on disk) as a sanity check that the game is installed where expected, but the path itself is no longer executed.
+
+**Why:** prior to the game's UE5 update, `subprocess.Popen([exe_path])` on `Darwin.exe` worked fine. After the update, direct-launching `Darwin.exe` causes it to exit immediately without ever spawning `Darwin-Win64-Shipping.exe` — no crash dump, no Windows Application Error event, and the Shipping exe's own debug.log never gets touched. `Darwin.exe` is a thin Steamworks/EasyAntiCheat bootstrap stub (this title uses EAC — see `installscript_544921.vdf` in the Steam install dir), and it appears to now validate that it was launched through Steam's own process context before proceeding — something the UE5 rebuild seems to have tightened. Launching via the `steam://rungameid/` protocol instead routes through the same path a manual Steam launch uses, sidestepping the check entirely. Steam App ID `544920` is fixed for this title (confirmed via `appmanifest_544920.acf`) and is hardcoded as `STEAM_APP_ID` in `launcher.py` — it is not machine-specific like the exe path.
+
+**Caveat:** the Steam client must be running (and logged in) for `steam://` launches to work. If Steam isn't already open, the protocol handler will start it first, which may add extra time before `Darwin-Win64-Shipping.exe` appears — worth keeping in mind if `launch_timeout_seconds` (180s default) ever needs bumping.
 
 ### Session State Machine (`session/state.py`)
 
@@ -97,7 +105,7 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 |---|---|---|
 | `/launch` | IDLE | Launch game, poll for menu screen |
 | `/deck` | Any | View and edit the Director deck (purely API-driven, no game UI needed) |
-| `/custom <region>` | IN_MENU | Set region (NA/EU), create private match, return lobby code |
+| `/custom <region>` | IN_MENU | Set region (NA/EU/APAC), create private match, return lobby code |
 | `/start` | IN_CUSTOM | Start match, responds with results when done |
 | `/menu` | IN_CUSTOM | Navigate back to main menu from any screen in the custom flow |
 | `/status` | Any | Current state + last/next action |
@@ -406,6 +414,16 @@ Step 9 — Lobby
 - DIRECTOR card click: `choose_role_screen` template center − 175px vertically
 - Region popup rows: NA=(740, 468), EU=(720, 511) — hardcoded, not template-matched (game highlights active row white which breaks matching)
 
+### UE5 update UI redesign (2026-08-07)
+
+The game's UE5 update reworked several screens in this flow. Templates were recaptured and verified (self-match ≥0.95, cross-screen <0.8) against the live game; **`_do_create_custom`'s code was not modified** — only template images changed, and only where the old one actually stopped matching (see per-template list below). Screens not listed here (`choose_role_screen`, the Director lobby / `lobby_password_label`, `create_custom_match`, `privacy_private`, `start_button`, `region_popup_header`) were re-verified and still match fine — no changes.
+
+- **PLAY screen (region setup)** — same "CHANGE REGION" concept, but now a single pill button reading e.g. `US EAST (N. VIRGINIA)` instead of separate flag-style indicators. Recaptured: `play_screen_region.png` (now just the "CHANGE REGION" label, static), `region_na.png` / `region_eu.png` (now the button's text portion, cropped to exclude the live ping value per the existing "no ping in region templates" rule), `play_screen_back.png` (BACK button moved/restyled — still doubles as the region-popup BACK button, score 0.99, same dual-purpose behavior as before).
+- **Region popup** — redesigned with a 3rd option, **Asia Pacific (Singapore)**, alongside US East and EU. `region_popup_header.png` ("CHOOSE YOUR REGION" banner) is unchanged and still matches (0.93). New row templates captured for documentation/reference (not used for matching, same as before): `region_row_na.png`, `region_row_eu.png`, `region_row_apac.png`. New button-text template `region_apac.png` also captured (`ASIA PACIFIC (SINGAPORE)`, same crop box as NA/EU).
+  - **`/custom` now has an APAC choice** (`app_commands.Choice(name="APAC — Singapore", value="APAC")`) and `_do_create_custom` detects/selects it via `region_apac.png` and `_REGION_ROW["APAC"]`. While touching `_REGION_ROW`, all three entries were moved off the old off-center hardcoded coordinates to center-x 960 (which sits inside every row regardless of region): NA=(960, 480), EU=(960, 525), APAC=(960, 568) — the old NA/EU values (740,468)/(720,511) happened to still land inside their rows post-redesign, but 960 is more robust long-term.
+- **CREATE MATCH screen** — this is the screen that changed the most. Mode cards (DUEL / SOLO CLASSIC / DUO CLASSIC / DUO / SOLO) are now much larger and repositioned; SOLO CLASSIC moved from wherever it was in the old layout to a top-row card centered at screen center. Recaptured: `solo_classic_label.png` (now the label strip at the bottom of the SOLO CLASSIC card, centered ~(960, 440), 435×42px — much bigger than the old crop). `privacy_private.png` and `start_button.png` on this screen were unaffected and still match.
+- **Not independently verified:** `lobby_countdown_label.png` (the "lobby_open" screen signature) — this needs the lobby to actually open with a countdown active to test, which wasn't exercised during this pass. If screen detection seems to misfire around lobby-open state, check this template first.
+
 ## `/menu` Navigation Flow (`_do_go_to_menu`)
 
 Loop up to 8 steps, 60s timeout. Each iteration calls `detect_current_screen()` then acts:
@@ -546,13 +564,15 @@ All templates captured at **1920×1080** via pyautogui. Centers listed are for t
 | Template | Purpose | Center (approx) |
 |---|---|---|
 | `play_button.png` | Main menu detection + PLAY button click | (355, 258) |
-| `play_screen_region.png` | PLAY mode-selection screen gate ("CHANGE REGION" label) | (105, 1014) |
-| `play_screen_back.png` | BACK button on PLAY screen and region popup (dark blue border) | (1840, 1044) |
-| `region_na.png` | Detects NA (US East) is currently selected | (130, 1045) |
-| `region_eu.png` | Detects EU (Frankfurt) is currently selected | (130, 1045) |
+| `play_screen_region.png` | PLAY screen gate ("CHANGE REGION" label text) | (75, 1028) |
+| `play_screen_back.png` | BACK button on PLAY screen and region popup (dark blue border) | (1868, 1051) |
+| `region_na.png` | Detects NA (US East) is currently selected (button text, ping excluded) | (135, 1057) |
+| `region_eu.png` | Detects EU (Frankfurt) is currently selected (button text, ping excluded) | (135, 1057) |
+| `region_apac.png` | Detects Asia Pacific (Singapore) is currently selected (button text) | (135, 1057) |
 | `region_popup_header.png` | "CHOOSE YOUR REGION" popup detection | (955, 416) |
-| `region_row_na.png` | NA row in popup (reference only — not used for matching) | (740, 468) |
-| `region_row_eu.png` | EU row in popup (reference only — not used for matching) | (720, 511) |
+| `region_row_na.png` | US East row in popup (reference only — not used for matching) | (960, 482) |
+| `region_row_eu.png` | EU row in popup (reference only — not used for matching) | (960, 525) |
+| `region_row_apac.png` | Asia Pacific row in popup (reference only — not used for matching) | (960, 570) |
 | `create_custom_match.png` | CREATE NEW CUSTOM MATCH button | dynamic |
 | `solo_classic_label.png` | SOLO CLASSIC card / Create Match screen gate | dynamic |
 | `privacy_private.png` | Privacy setting is PRIVATE indicator | dynamic |

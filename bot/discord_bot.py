@@ -706,6 +706,7 @@ class DirectorCog(commands.Cog):
     @app_commands.choices(region=[
         app_commands.Choice(name="NA — US East (N. Virginia)", value="NA"),
         app_commands.Choice(name="EU — Frankfurt", value="EU"),
+        app_commands.Choice(name="APAC — Singapore", value="APAC"),
     ])
     async def custom(self, interaction: discord.Interaction, region: app_commands.Choice[str]):
         if not await self._role_check(interaction):
@@ -858,19 +859,23 @@ class DirectorCog(commands.Cog):
                 save_error_screenshot("play_screen_not_found")
                 return None
 
+            wanted = region.upper()
             screenshot = take_screenshot()
-            na_match = find_template(screenshot, "templates/region_na.png")
-            eu_match = find_template(screenshot, "templates/region_eu.png")
-            wants_na = region.upper() == "NA"
-            region_correct = (wants_na and na_match) or (not wants_na and eu_match)
-            logger.info("Custom: current region — NA=%s EU=%s  correct=%s", bool(na_match), bool(eu_match), region_correct)
+            region_matches = {
+                "NA": find_template(screenshot, "templates/region_na.png"),
+                "EU": find_template(screenshot, "templates/region_eu.png"),
+                "APAC": find_template(screenshot, "templates/region_apac.png"),
+            }
+            region_correct = bool(region_matches.get(wanted))
+            logger.info("Custom: current region — %s  wanted=%s  correct=%s",
+                        {k: bool(v) for k, v in region_matches.items()}, wanted, region_correct)
 
             if not region_correct:
                 # Open the region popup and select the right row.
                 # Row positions are fixed — we use hardcoded coords rather than
                 # template-matching because the game highlights the active row
                 # white, which breaks template detection.
-                _REGION_ROW = {"NA": (740, 468), "EU": (720, 511)}
+                _REGION_ROW = {"NA": (960, 480), "EU": (960, 525), "APAC": (960, 568)}
                 logger.info("Custom: changing region to %s", region)
                 if not hover_click(215, 1045, delay=0.5):   # CHANGE REGION button (bottom-left)
                     return None
@@ -882,7 +887,7 @@ class DirectorCog(commands.Cog):
                 # doesn't interfere before we make our deliberate click.
                 pyautogui.moveTo(960, 700)
                 time.sleep(0.3)
-                row_x, row_y = _REGION_ROW[region.upper()]
+                row_x, row_y = _REGION_ROW[wanted]
                 # Click the row — popup closes automatically and region updates
                 if not click_until(row_x, row_y, "templates/play_screen_region.png", verify_timeout=6):
                     logger.error("Custom: PLAY screen not detected after region selection")
