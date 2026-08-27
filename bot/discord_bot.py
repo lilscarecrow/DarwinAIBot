@@ -336,6 +336,9 @@ class DirectorCog(commands.Cog):
         self._lobby_expiry: Optional[float] = None
         # Profile resolved at /custom time so the same pick is used at /start.
         self._resolved_profile: Optional[dict] = None
+        # Discord IDs (strings) of scrim signup reactors, captured at /custom time
+        # so they're available to pass through to the ingest API at match end.
+        self._resolved_roster: Optional[list[str]] = None
 
     # Screen name → (BotState, label) used by the background screen watcher
     _SCREEN_STATES = {
@@ -387,8 +390,13 @@ class DirectorCog(commands.Cog):
         except Exception as e:
             logger.warning("Could not delete recording %s: %s", path, e)
 
-    async def _post_results_to_ingest(self, results_text: str):
-        """Best-effort push of the raw results screenshot to the ds.xdos.ai scrim ladder."""
+    async def _post_results_to_ingest(self, results_text: str, roster: Optional[list[str]] = None):
+        """Best-effort push of the raw results screenshot to the ds.xdos.ai scrim ladder.
+
+        roster: optional list of Discord ID strings for the players known to be in
+        this match (captured from scrim signup reactions at /custom time). Passed
+        through so the server can narrow its OCR prompt and fuzzy candidate pool.
+        """
         if not results_text.endswith(".png"):
             return
         token = self.bot.config.get("ds_ingest_token")
@@ -400,7 +408,10 @@ class DirectorCog(commands.Cog):
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(
-                None, post_results_screenshot, results_text, base_url, token, platform,
+                None,
+                lambda: post_results_screenshot(
+                    results_text, base_url, token, platform, roster=roster,
+                ),
             )
         except Exception as e:
             logger.warning("ds.xdos.ai ingest failed: %s", e)
@@ -508,6 +519,7 @@ class DirectorCog(commands.Cog):
             logger.info("Auto-start watcher cancelled by session reset")
         self._auto_start_task = None
         self._resolved_profile = None
+        self._resolved_roster = None
         self._lobby_expiry = None
         from game import tts
         tts.stop()
@@ -739,6 +751,22 @@ class DirectorCog(commands.Cog):
                     + "\n".join(f"• {w}" for w in _warnings),
                 ))
                 return
+
+        # Capture the scrim signup roster (≤10 Discord IDs of players who reacted
+        # on the signup message) so it can be passed through to the ingest API at
+        # match end for OCR/fuzzy-match narrowing. Best-effort — a missing/failed
+        # ScrimCog just means roster stays None and ingest behaves as before.
+        self._resolved_roster = None
+        try:
+            scrim_cog = self.bot.get_cog("ScrimCog")
+            if scrim_cog is not None:
+                signup_message = await scrim_cog._get_signup_message()
+                if signup_message is not None:
+                    reactors = await scrim_cog._reactors(signup_message)
+                    if reactors:
+                        self._resolved_roster = [str(u.id) for u in reactors[:10]]
+        except Exception as e:
+            logger.warning("Could not capture scrim roster for ingest: %s", e)
 
         await interaction.response.defer(thinking=True)
 
@@ -1252,6 +1280,8 @@ class DirectorCog(commands.Cog):
             profile=self._resolved_profile,
         )
         self._resolved_profile = None
+        _match_roster = self._resolved_roster
+        self._resolved_roster = None
         self._active_runner = runner
 
         # Respond immediately — match runs in the background so the interaction
@@ -1296,7 +1326,7 @@ class DirectorCog(commands.Cog):
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
-            await self._post_results_to_ingest(results_text)
+            await self._post_results_to_ingest(results_text, roster=_match_roster)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
@@ -1386,6 +1416,8 @@ class DirectorCog(commands.Cog):
                 profile=self._resolved_profile,
             )
             self._resolved_profile = None
+            _match_roster = self._resolved_roster
+            self._resolved_roster = None
             self._active_runner = runner
 
             async with self._session_lock:
@@ -1418,7 +1450,7 @@ class DirectorCog(commands.Cog):
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
-            await self._post_results_to_ingest(results_text)
+            await self._post_results_to_ingest(results_text, roster=_match_roster)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
