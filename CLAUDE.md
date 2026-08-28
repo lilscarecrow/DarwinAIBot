@@ -104,12 +104,13 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 | Command | Valid States | Description |
 |---|---|---|
 | `/launch` | IDLE | Launch game, poll for menu screen |
-| `/deck` | Any | View and edit the Director deck (purely API-driven, no game UI needed) |
 | `/custom <region>` | IN_MENU | Set region (NA/EU/APAC), create private match, return lobby code |
 | `/start` | IN_CUSTOM | Start match, responds with results when done |
 | `/menu` | IN_CUSTOM | Navigate back to main menu from any screen in the custom flow |
 | `/status` | Any | Current state + last/next action |
 | `/quit` | Any | Force close game — shows ephemeral Yes/No confirmation prompt |
+
+**`/deck` unregistered (2026-08-07):** the current Director deck (2× Electromania, Beach Party, Blood Moon, 3× Zone Closing, Give Wood, 2× Favorite Player, Telepathy) already covers every match profile via natural unlocks, so live deck editing isn't a day-to-day need anymore. The `deck()` method and its supporting code (`DeckEditorView`, `_read_deck`/`_write_deck`, `_DIRECTOR_CARDS`) are still in `discord_bot.py` — only the `@app_commands.command` decorator was removed, so it no longer syncs to Discord for anyone. Re-add the decorator to bring it back.
 
 All responses use `discord.Embed` with color-coded status (green=ok, red=fail, blue=active, orange=in-match, gray=neutral). State is shown in every embed footer.
 
@@ -227,7 +228,9 @@ Zone strategy is pluggable via `config.json → zone_selection_strategy` but the
 
 ### Director Deck Sync (`noble-hopper/`)
 
-> **Note:** `noble-hopper/` is gitignored — it is not tracked in this repo. It runs as a separate local process launched by `main.py`. `noble-hopper/state.json` contains captured auth tokens and must never be committed.
+> **Note:** `noble-hopper/` is gitignored — it is not tracked in this repo. `noble-hopper/state.json` contains captured auth tokens and must never be committed.
+>
+> **Decoupled from bot startup (2026-08-07):** `main.py` no longer spawns or manages the noble-hopper process — it used to launch `noble-hopper/launcher.py` as a subprocess on startup and kill it via `atexit`, but that coupling was removed so noble-hopper can be run, restarted, and eventually retired independently of the bot. Run it manually (`python launcher.py` from inside `noble-hopper/`) whenever deck-sync features are needed. If it isn't running, deck sync degrades gracefully — `_try_force_sync()` catches the connection failure and logs a warning, and `/deck` still reads/writes `state.json` directly (it just won't push to the live game until noble-hopper is up and the game re-requests its profile).
 
 
 The Director deck is managed entirely via the game's API — no UI automation is needed. The noble-hopper process (mitmproxy + web server) handles sync.

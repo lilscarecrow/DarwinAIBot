@@ -671,10 +671,12 @@ class DirectorCog(commands.Cog):
         return True
 
     # ------------------------------------------------------------------
-    # /deck
+    # /deck — unregistered as a slash command (2026-08-07): the current deck
+    # covers every profile via natural unlocks, so editing is no longer a
+    # day-to-day need. Left implemented (just not exposed) in case it's
+    # needed again — re-add the @app_commands.command decorator to restore it.
     # ------------------------------------------------------------------
 
-    @app_commands.command(name="deck", description="View and edit the Director deck")
     async def deck(self, interaction: discord.Interaction):
         if not await self._role_check(interaction):
             return
