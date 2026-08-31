@@ -1,0 +1,4 @@
+[queue]
+name = "darwin-aibot"
+description = "DarwinAIBot work queue"
+buckets = ["do", "investigate", "design"]
