@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import sys
@@ -50,7 +51,54 @@ def validate_config(config: dict) -> list[str]:
             f"Valid options: {valid_strategy_names()}"
         )
 
+    if config.get("twitch_enabled", False):
+        for key in ("twitch_client_id", "twitch_client_secret", "twitch_bot_id", "twitch_owner_id"):
+            if not config.get(key):
+                errors.append(f"{key} is missing or empty (required because twitch_enabled is true)")
+
     return errors
+
+
+async def _run(config: dict, session: SessionState):
+    from bot.discord_bot import DarwinBot
+    discord_bot = DarwinBot(config=config, session=session)
+
+    try:
+        if config.get("twitch_enabled", False):
+            from bot.twitch_bot import DarwinTwitchBot
+            logger.info("Connecting to Twitch and Discord...")
+
+            async def _run_twitch(bot) -> None:
+                # Never let a Twitch-side failure take down the Discord bot — they're
+                # started together below, and asyncio.gather() would otherwise propagate
+                # the first exception and cancel the other task. Twitch chat is a nice-to-
+                # have on top of the core Discord automation, not a dependency of it.
+                try:
+                    await bot.start()
+                except Exception:
+                    logger.exception("Twitch bot crashed — Discord bot continues without it")
+
+            async with DarwinTwitchBot(config=config, session=session) as twitch_bot:
+                discord_bot.twitch_bot = twitch_bot
+                await asyncio.gather(
+                    discord_bot.start(config["discord_bot_token"]),
+                    _run_twitch(twitch_bot),
+                )
+        else:
+            logger.info("Connecting to Discord...")
+            await discord_bot.start(config["discord_bot_token"])
+    finally:
+        # aiohttp's SSL connections need a moment to finish their own async teardown
+        # after close() returns — without this, asyncio.run() closes the event loop
+        # first, and a leftover ClientResponse object finalized by the garbage
+        # collector afterward tries to use the now-closed loop, printing a
+        # harmless-but-noisy "Exception ignored in: ClientResponse.__del__ ...
+        # RuntimeError: Event loop is closed" to the console. This is aiohttp's own
+        # documented mitigation for that; it's just a timing pause in a plain
+        # finally (not an except), so it doesn't suppress or interfere with
+        # whatever exception is propagating — no coupling to the cancellation/
+        # shutdown logic that was reverted above.
+        await asyncio.sleep(0.25)
 
 
 def main():
@@ -73,14 +121,20 @@ def main():
         bypass=config.get("ahk_bypass_mode", False),
     )
 
+    from game import obs_control
+    obs_control.configure(
+        enabled=config.get("obs_stream_enabled", False),
+        host=config.get("obs_websocket_host", "localhost"),
+        port=config.get("obs_websocket_port", 4455),
+        password=config.get("obs_websocket_password", ""),
+    )
+
     session = SessionState()
 
-    from bot.discord_bot import DarwinBot
-    bot = DarwinBot(config=config, session=session)
-
-    token = config["discord_bot_token"]
-    logger.info("Connecting to Discord...")
-    bot.run(token, log_handler=None)
+    try:
+        asyncio.run(_run(config, session))
+    except KeyboardInterrupt:
+        logger.info("Darwin Bot shut down")
 
 
 if __name__ == "__main__":

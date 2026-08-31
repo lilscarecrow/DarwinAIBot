@@ -29,6 +29,12 @@ templates/
 # noble-hopper proxy component (separate project)
 noble-hopper/
 
+# OpenH264 codec DLL (machine-specific runtime dependency, not source — see CLAUDE.md)
+openh264-*.dll
+
+# TwitchIO's default OAuth token store (contains live access/refresh tokens)
+.tio.tokens.json
+
 # Claude Code session data
 .claude/
 

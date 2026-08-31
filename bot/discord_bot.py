@@ -289,6 +289,10 @@ class DarwinBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
         self.session = session
+        # Set externally by main.py before start(), if twitch_enabled — None otherwise.
+        # DirectorCog checks this before every announce() call, so it's always safe to
+        # leave unset/None when the Twitch bot isn't configured.
+        self.twitch_bot = None
 
     async def setup_hook(self):
         cog = DirectorCog(self)
@@ -416,6 +420,11 @@ class DirectorCog(commands.Cog):
         except Exception as e:
             logger.warning("ds.xdos.ai ingest failed: %s", e)
 
+    async def _twitch_announce(self, text: str):
+        """Best-effort: post to Twitch chat if the Twitch bot is configured/running."""
+        if self.bot.twitch_bot is not None:
+            await self.bot.twitch_bot.announce(text)
+
     async def _mirror_results(self, results_text: str):
         """Post match results to the secondary guild channel."""
         _MIRROR_CHANNEL_ID = 1520509048540238015
@@ -513,7 +522,15 @@ class DirectorCog(commands.Cog):
         return any(r.name == required for r in interaction.user.roles)
 
     def _reset_session(self):
-        """Reset session state and clear any lobby-scoped cached values."""
+        """Reset session state and clear any lobby-scoped cached values.
+
+        Also stops the Twitch stream (if OBS streaming is enabled) — this is the one
+        function called on every path back to IDLE (/quit, the 10-min main-menu idle
+        watcher, and every other failure/timeout reset), so hooking it here covers the
+        "stream ends on quit or idle timeout" requirement without duplicating the stop
+        call at each individual call site. No-ops instantly if obs_stream_enabled is
+        false or no stream is currently running.
+        """
         if self._auto_start_task and not self._auto_start_task.done():
             self._auto_start_task.cancel()
             logger.info("Auto-start watcher cancelled by session reset")
@@ -523,6 +540,8 @@ class DirectorCog(commands.Cog):
         self._lobby_expiry = None
         from game import tts
         tts.stop()
+        from game import obs_control
+        obs_control.stop_stream()
         self.bot.session.reset()
 
     async def _role_check(self, interaction: discord.Interaction) -> bool:
@@ -795,12 +814,42 @@ class DirectorCog(commands.Cog):
                 last_action="Custom match created",
                 next_action="Await /start",
             )
+
+            from game import obs_control
+            stream_started = False
+            if obs_control.is_enabled():
+                stream_started = await loop.run_in_executor(None, obs_control.start_stream)
+
+            await self._twitch_announce(
+                "This is an automated Darwin Project scrim, run by the AI Director. "
+                "Want in on scrim signups and more? Join the Darwin Pro League Discord: "
+                "https://discord.gg/ynSjykan5C — Enjoying the stream? Support me on Ko-fi: "
+                "https://ko-fi.com/lilscarecrow"
+            )
+
             _profile_label = "Randomizer" if _active_key == "randomizer" else self._resolved_profile["display_name"]
             embed = self._ok("Custom Match Ready", "Private lobby created. Share the code with your players.")
             embed.add_field(name="Region", value=region.name, inline=True)
             embed.add_field(name="Profile", value=_profile_label, inline=True)
             embed.add_field(name="Lobby Code", value=f"```{lobby_code}```", inline=False)
+            if obs_control.is_enabled():
+                embed.add_field(
+                    name="Twitch Stream",
+                    value="🔴 Live" if stream_started else "⚠️ Could not start (check OBS/websocket connection)",
+                    inline=False,
+                )
             await interaction.followup.send(embed=embed)
+
+            # Anti-cheat: cover the minimap as soon as the lobby exists, not just once
+            # the match itself starts — the minimap is potentially visible from here on,
+            # and /start may not be called for a while after this. MatchRunner.run()'s
+            # main loop still owns the timed *hide* (obs_minimap_cover_seconds into the
+            # actual match), this just moves the *show* earlier.
+            if obs_control.is_enabled():
+                await loop.run_in_executor(
+                    None, obs_control.set_source_visible,
+                    self.bot.config.get("obs_minimap_cover_source", "Map Cover"), True,
+                )
 
             ping_ch = self.bot.get_channel(_LOBBY_PING_CHANNEL_ID)
             if ping_ch is None:
@@ -1323,6 +1372,23 @@ class DirectorCog(commands.Cog):
                 last_action="Match ended",
                 next_action="Returning to menu",
             )
+
+            # Click MAIN MENU right away — the game doesn't need to sit on the results
+            # screen waiting for the Discord/API work below (mirror, ingest, screenshot
+            # delete) to finish before moving on. The screenshot is already captured
+            # (that happened inside MatchRunner before this point), so nothing here
+            # depends on the results screen still being up.
+            loop = asyncio.get_running_loop()
+            returned = await loop.run_in_executor(None, self._do_post_match_return)
+            if returned:
+                self.bot.session.transition(
+                    BotState.IN_MENU,
+                    last_action="Returned to main menu",
+                    next_action="Await /custom",
+                )
+            else:
+                self._reset_session()
+
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
@@ -1334,17 +1400,6 @@ class DirectorCog(commands.Cog):
                     logger.warning("Could not delete results screenshot: %s", e)
             if recording_path:
                 asyncio.ensure_future(self._upload_recording(recording_path))
-
-            loop = asyncio.get_running_loop()
-            returned = await loop.run_in_executor(None, self._do_post_match_return)
-            if returned:
-                self.bot.session.transition(
-                    BotState.IN_MENU,
-                    last_action="Returned to main menu",
-                    next_action="Await /custom",
-                )
-            else:
-                self._reset_session()
 
         asyncio.ensure_future(_run_match())
 
@@ -1366,7 +1421,7 @@ class DirectorCog(commands.Cog):
 
             screenshot = await loop.run_in_executor(None, take_screenshot)
             countdown = await loop.run_in_executor(
-                None, lambda: read_lobby_countdown(screenshot, debug=True)
+                None, lambda: read_lobby_countdown(screenshot, debug=False)
             )
 
             if countdown is None:
@@ -1447,6 +1502,23 @@ class DirectorCog(commands.Cog):
                 last_action="Match ended",
                 next_action="Returning to menu",
             )
+
+            # Click MAIN MENU right away — the game doesn't need to sit on the results
+            # screen waiting for the Discord/API work below (mirror, ingest, screenshot
+            # delete) to finish before moving on. The screenshot is already captured
+            # (that happened inside MatchRunner before this point), so nothing here
+            # depends on the results screen still being up.
+            loop = asyncio.get_running_loop()
+            returned = await loop.run_in_executor(None, self._do_post_match_return)
+            if returned:
+                self.bot.session.transition(
+                    BotState.IN_MENU,
+                    last_action="Returned to main menu",
+                    next_action="Await /custom",
+                )
+            else:
+                self._reset_session()
+
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
@@ -1458,17 +1530,6 @@ class DirectorCog(commands.Cog):
                     logger.warning("Could not delete results screenshot: %s", e)
             if recording_path:
                 asyncio.ensure_future(self._upload_recording(recording_path))
-
-            loop = asyncio.get_running_loop()
-            returned = await loop.run_in_executor(None, self._do_post_match_return)
-            if returned:
-                self.bot.session.transition(
-                    BotState.IN_MENU,
-                    last_action="Returned to main menu",
-                    next_action="Await /custom",
-                )
-            else:
-                self._reset_session()
 
         except asyncio.CancelledError:
             self._lobby_expiry = None
@@ -1594,6 +1655,39 @@ class DirectorCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ------------------------------------------------------------------
+    # /pov
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="pov", description="Switch the Director's camera to a player's point of view")
+    @app_commands.describe(player="Player slot to view (matches the game's number-row hotkeys)")
+    @app_commands.choices(player=[app_commands.Choice(name=str(n), value=n) for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]])
+    async def pov(self, interaction: discord.Interaction, player: app_commands.Choice[int]):
+        if not await self._role_check(interaction):
+            return
+        if not await self._state_check(interaction, "pov"):
+            return
+
+        key = str(player.value)
+        import functools
+        from game.card_actions import press_key
+        loop = asyncio.get_running_loop()
+        # no_focus_fallback=True: if the Darwin window can't be found, don't fall back
+        # to pyautogui.press() (which would send the digit to whatever window currently
+        # has OS focus — possibly Discord itself — instead of the game).
+        sent = await loop.run_in_executor(
+            None, functools.partial(press_key, key, no_focus_fallback=True)
+        )
+
+        if sent:
+            await interaction.response.send_message(embed=self._ok(
+                "POV Changed", f"Switched to player **{key}**'s point of view."
+            ))
+        else:
+            await interaction.response.send_message(embed=self._fail(
+                "POV Change Failed", "Could not send the keystroke — Darwin window not found."
+            ))
+
+    # ------------------------------------------------------------------
     # /quit
     # ------------------------------------------------------------------
 
@@ -1643,7 +1737,8 @@ class ScrimCog(commands.Cog):
     Config keys:
       scrim_signup_channel_id  — channel where the signup message lives
       scrim_signup_message_id  — persisted ID of the tracked message
-      scrim_player_role        — role name given to signed-up players
+      scrim_player_role        — role name given to the first 10 signed-up players
+      scrim_player_role_2      — optional role name given to the next 10 (11-20) — second lobby
       scrim_admin_role         — role name pinged when the queue is full
       scrim_min_players        — number of reactions that triggers the ping (default 8)
       scrim_reaction_emoji     — emoji to count (default ✅)
@@ -1654,6 +1749,13 @@ class ScrimCog(commands.Cog):
         # Countdown to the next reaction cleanup — (re)started when the first real
         # reactor joins an empty queue, rather than pinned to the top of the hour.
         self._reset_task: asyncio.Task | None = None
+        # True signup order, tracked live as reactions come in — Discord's
+        # reaction.users() iteration order is not guaranteed to match signup time,
+        # so /role add can't rely on _reactors() alone for the first-10/next-10
+        # split. In-memory only: a bot restart loses this (same caveat as the reset
+        # timer below), and _ordered_reactors() falls back to appending anyone
+        # missing from this list in _reactors()'s own order.
+        self._signup_order: list[int] = []
 
     # ------------------------------------------------------------------
     # Startup — ensure a static signup message exists
@@ -1818,11 +1920,17 @@ class ScrimCog(commands.Cog):
         return any(r.name == role_name for r in interaction.user.roles)
 
     def _match_in_progress(self, guild: discord.Guild | None) -> bool:
-        """True if anyone currently holds scrim_player_role (i.e. a scrim is underway)."""
+        """True if anyone currently holds scrim_player_role or scrim_player_role_2 (i.e. a scrim is underway)."""
         if guild is None:
             return False
-        role = discord.utils.get(guild.roles, name=self._cfg("scrim_player_role", ""))
-        return bool(role and role.members)
+        for key in ("scrim_player_role", "scrim_player_role_2"):
+            name = self._cfg(key, "")
+            if not name:
+                continue
+            role = discord.utils.get(guild.roles, name=name)
+            if role and role.members:
+                return True
+        return False
 
     async def _get_signup_message(self) -> discord.Message | None:
         msg_id = self._signup_message_id()
@@ -1864,6 +1972,21 @@ class ScrimCog(commands.Cog):
                 return users
         return []
 
+    async def _ordered_reactors(self, message: discord.Message) -> list[discord.Member]:
+        """Return reactors ordered by actual signup time (tracked live in _signup_order via
+        on_raw_reaction_add), not by Discord's unspecified reaction.users() iteration order —
+        that's what /role add's first-10/next-10 split is based on. Anyone currently reacted
+        but missing from _signup_order (e.g. the tracking was lost to a bot restart) is
+        appended at the end in whatever order _reactors() returns them, so nobody is silently
+        dropped — just not guaranteed correctly ordered in that fallback case.
+        """
+        reactors = await self._reactors(message)
+        by_id = {u.id: u for u in reactors}
+        ordered = [by_id[uid] for uid in self._signup_order if uid in by_id]
+        tracked_ids = set(self._signup_order)
+        ordered.extend(u for u in reactors if u.id not in tracked_ids)
+        return ordered
+
     # ------------------------------------------------------------------
     # Reaction events
     # ------------------------------------------------------------------
@@ -1876,6 +1999,9 @@ class ScrimCog(commands.Cog):
             return
         if payload.user_id == self.bot.user.id:
             return
+
+        if payload.user_id not in self._signup_order:
+            self._signup_order.append(payload.user_id)
 
         message = await self._get_signup_message()
         if message is None:
@@ -1925,6 +2051,11 @@ class ScrimCog(commands.Cog):
         if payload.message_id != self._signup_message_id():
             return
 
+        # Drop from the tracked signup order too — if they react again later, that's
+        # a fresh signup and should go to the back of the queue, not keep their old spot.
+        if payload.user_id in self._signup_order:
+            self._signup_order.remove(payload.user_id)
+
         # If the last real reactor just left, there's nothing left to reset — cancel the
         # countdown so it doesn't fire against a queue that refills later from scratch.
         message = await self._get_signup_message()
@@ -1940,7 +2071,7 @@ class ScrimCog(commands.Cog):
 
     role_group = app_commands.Group(name="role", description="Manage scrim player roles")
 
-    @role_group.command(name="add", description="Give the scrim player role to all signed-up players")
+    @role_group.command(name="add", description="Give the scrim player role(s) to all signed-up players")
     async def role_add(self, interaction: discord.Interaction):
         if not self._has_scrim_admin(interaction):
             await interaction.response.send_message(
@@ -1961,45 +2092,85 @@ class ScrimCog(commands.Cog):
             await interaction.followup.send(f"Role **{player_role_name}** not found in this server.")
             return
 
+        # Second lobby role is optional — if unset, overflow past the first 10 is
+        # simply left unassigned (same behavior as before this role existed).
+        player_role_2_name = self._cfg("scrim_player_role_2", "")
+        player_role_2 = discord.utils.get(guild.roles, name=player_role_2_name) if player_role_2_name else None
+        if player_role_2_name and player_role_2 is None:
+            await interaction.followup.send(f"Role **{player_role_2_name}** not found in this server.")
+            return
+
         message = await self._get_signup_message()
         if message is None:
             await interaction.followup.send("Signup message not found. Check `scrim_signup_channel_id` in config.json.")
             return
 
-        reactors = await self._reactors(message)
+        reactors = await self._ordered_reactors(message)
         if not reactors:
             await interaction.followup.send("Nobody has signed up yet.")
             return
 
-        reactors = reactors[:10]
-        assigned, skipped = [], []
-        for user in reactors:
-            member = guild.get_member(user.id)
-            if member is None:
-                try:
-                    member = await guild.fetch_member(user.id)
-                except Exception:
-                    skipped.append(str(user))
-                    continue
-            if player_role not in member.roles:
-                try:
-                    await member.add_roles(player_role, reason="Scrim signup")
-                    assigned.append(member.display_name)
-                except Exception as e:
-                    logger.warning("Could not assign scrim role to %s: %s", member, e)
-                    skipped.append(member.display_name)
-            else:
-                assigned.append(member.display_name)  # already has it, count as success
+        # First 10 reactors in actual signup order (tracked live in _signup_order —
+        # see _ordered_reactors()) get the primary lobby role; the next 10 (11-20)
+        # get the second lobby role.
+        first_lobby = reactors[:10]
+        second_lobby = reactors[10:20] if player_role_2 else []
+        overflow_unassigned = len(reactors) > 10 and player_role_2 is None
 
+        async def _assign(users: list, role: discord.Role) -> tuple[list[str], list[str]]:
+            assigned, skipped = [], []
+            for user in users:
+                member = guild.get_member(user.id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(user.id)
+                    except Exception:
+                        skipped.append(str(user))
+                        continue
+                if role not in member.roles:
+                    try:
+                        await member.add_roles(role, reason="Scrim signup")
+                        assigned.append(member.display_name)
+                    except Exception as e:
+                        logger.warning("Could not assign scrim role to %s: %s", member, e)
+                        skipped.append(member.display_name)
+                else:
+                    assigned.append(member.display_name)  # already has it, count as success
+            return assigned, skipped
+
+        assigned, skipped = await _assign(first_lobby, player_role)
         lines = [f"Assigned **{player_role_name}** to {len(assigned)} player(s)."]
         if assigned:
             lines.append(", ".join(assigned))
         if skipped:
             lines.append(f"Could not assign to: {', '.join(skipped)}")
+
+        if second_lobby:
+            assigned_2, skipped_2 = await _assign(second_lobby, player_role_2)
+            lines.append(f"Assigned **{player_role_2_name}** to {len(assigned_2)} player(s).")
+            if assigned_2:
+                lines.append(", ".join(assigned_2))
+            if skipped_2:
+                lines.append(f"Could not assign to: {', '.join(skipped_2)}")
+
+        if overflow_unassigned:
+            extra = len(reactors) - 10
+            lines.append(
+                f"{extra} additional signup(s) beyond the first 10 were not assigned — "
+                f"set `scrim_player_role_2` in config.json to enable a second lobby."
+            )
+        elif len(reactors) > 20:
+            lines.append(f"{len(reactors) - 20} additional signup(s) beyond 20 were not assigned.")
+
         await interaction.followup.send("\n".join(lines))
 
-    @role_group.command(name="remove", description="Remove the scrim player role from everyone who has it")
-    async def role_remove(self, interaction: discord.Interaction):
+    @role_group.command(name="remove", description="Remove one lobby's scrim player role and its reactions")
+    @app_commands.describe(lobby="Which lobby to clear — 1 (scrim_player_role) or 2 (scrim_player_role_2)")
+    @app_commands.choices(lobby=[
+        app_commands.Choice(name="1", value=1),
+        app_commands.Choice(name="2", value=2),
+    ])
+    async def role_remove(self, interaction: discord.Interaction, lobby: app_commands.Choice[int]):
         if not self._has_scrim_admin(interaction):
             await interaction.response.send_message(
                 "You don't have permission to use this command.", ephemeral=True
@@ -2008,39 +2179,43 @@ class ScrimCog(commands.Cog):
 
         await interaction.response.defer()
 
-        player_role_name = self._cfg("scrim_player_role", "")
-        if not player_role_name:
-            await interaction.followup.send("No `scrim_player_role` set in config.json.")
+        role_key = "scrim_player_role" if lobby.value == 1 else "scrim_player_role_2"
+        role_name = self._cfg(role_key, "")
+        if not role_name:
+            await interaction.followup.send(f"No `{role_key}` set in config.json.")
             return
 
         guild = interaction.guild
-        player_role = discord.utils.get(guild.roles, name=player_role_name)
-        if player_role is None:
-            await interaction.followup.send(f"Role **{player_role_name}** not found in this server.")
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role is None:
+            await interaction.followup.send(f"Role **{role_name}** not found in this server.")
+            return
+
+        # Snapshot before mutating — role.members would shrink as we remove the role below.
+        members = list(role.members)
+        if not members:
+            await interaction.followup.send(f"Nobody currently has the **{role_name}** role.")
             return
 
         removed, failed = [], []
-        for member in player_role.members:
+        for member in members:
             try:
-                await member.remove_roles(player_role, reason="Scrim cleanup")
+                await member.remove_roles(role, reason="Scrim cleanup")
                 removed.append(member.display_name)
             except Exception as e:
                 logger.warning("Could not remove scrim role from %s: %s", member, e)
                 failed.append(member.display_name)
 
-        if not removed and not failed:
-            await interaction.followup.send(f"Nobody currently has the **{player_role_name}** role.")
-            return
-
-        # Clear all reactions from the signup message so the queue resets
+        # Only this lobby's reactions come off the signup message — the other lobby's
+        # players (if any) keep theirs untouched. Removing a reaction here fires a real
+        # MESSAGE_REACTION_REMOVE event per user, which on_raw_reaction_remove already
+        # handles (prunes _signup_order, cancels the reset timer once the queue is
+        # fully empty across both lobbies) — no extra bookkeeping needed here.
         message = await self._get_signup_message()
         if message is not None:
-            reactors = await self._reactors(message)
-            if reactors:
-                await self._clear_real_reactions(message, reactors)
-        self._cancel_reset_timer()
+            await self._clear_real_reactions(message, members)
 
-        lines = [f"Removed **{player_role_name}** from {len(removed)} member(s)."]
+        lines = [f"Removed **{role_name}** from {len(removed)} member(s)."]
         if failed:
             lines.append(f"Could not remove from: {', '.join(failed)}")
         await interaction.followup.send("\n".join(lines))

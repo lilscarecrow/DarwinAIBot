@@ -213,10 +213,18 @@ def _worker_loop() -> None:
         elif mode == "broadcast":
             now = time.monotonic()
             if now < _broadcast_available_at:
+                # On cooldown — can't press G, but the audio should still reach nearby
+                # players via CABLE Input. This used to `continue` here, silently
+                # dropping the phrase entirely instead of falling back to a cable-only
+                # play, so players heard nothing at all whenever /say landed mid-cooldown.
                 logger.info(
-                    "TTS: broadcast on cooldown (%.0fs remaining) — skipping: %r",
+                    "TTS: broadcast on cooldown (%.0fs remaining) — playing via CABLE only (no G press): %r",
                     _broadcast_available_at - now, text,
                 )
+                try:
+                    asyncio.run(_speak_on_cable(text))
+                except Exception as e:
+                    logger.warning("TTS cable fallback failed for %r: %s", text, e)
                 continue
             _broadcast_available_at = now + _BROADCAST_CYCLE
             try:

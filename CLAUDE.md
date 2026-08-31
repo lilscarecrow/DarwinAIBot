@@ -109,12 +109,54 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 | `/menu` | IN_CUSTOM | Navigate back to main menu from any screen in the custom flow |
 | `/status` | Any | Current state + last/next action |
 | `/quit` | Any | Force close game — shows ephemeral Yes/No confirmation prompt |
+| `/pov <player>` | IN_CUSTOM, MATCH_IN_PROGRESS | Switch the Director's camera to a player's point of view |
+
+**`/pov` (2026-08-30):** dropdown of `1`-`9`, `0` (`app_commands.Choice[int]`, matching the game's own number-row hotkeys — `0` is the 10th slot). Sends the corresponding digit key straight to the Darwin window via `press_key()` in `game/card_actions.py`, same PostMessage mechanism as every other game keystroke (`_SCAN_CODES` now includes scan codes for `0`-`9`). Valid in both the custom lobby (`IN_CUSTOM`, before `/start`) and mid-match (`MATCH_IN_PROGRESS`). Intentionally skips `_lock_check` in both states — like `/quit` — since `_session_lock` is held for the entire match duration by `/start`'s `_run_match()` (gating on it would make `/pov` uncallable mid-match, exactly when it's needed most); it isn't held throughout `IN_CUSTOM` so the skip is a no-op there, just kept for consistency with the match-time behavior. Calls `press_key(key, no_focus_fallback=True)` so a missing Darwin window reports failure back to Discord instead of silently sending the digit to whatever window happens to have OS focus.
 
 **`/deck` unregistered (2026-08-07):** the current Director deck (2× Electromania, Beach Party, Blood Moon, 3× Zone Closing, Give Wood, 2× Favorite Player, Telepathy) already covers every match profile via natural unlocks, so live deck editing isn't a day-to-day need anymore. The `deck()` method and its supporting code (`DeckEditorView`, `_read_deck`/`_write_deck`, `_DIRECTOR_CARDS`) are still in `discord_bot.py` — only the `@app_commands.command` decorator was removed, so it no longer syncs to Discord for anyone. Re-add the decorator to bring it back.
 
 All responses use `discord.Embed` with color-coded status (green=ok, red=fail, blue=active, orange=in-match, gray=neutral). State is shown in every embed footer.
 
 **Results mirroring:** end-of-match screenshots are posted **only** to the `results` channel (ID `1520509048540238015`) via `_mirror_results()` — they are no longer sent as a file attachment in whatever channel `/start` was run from (that channel gets nothing further after the initial "Match In Progress" message, except for non-screenshot abort/force-stop text results, which still post there). The local screenshot file is deleted after the mirror send and the ladder ingest upload both complete.
+
+### Twitch Chat Bot (`bot/twitch_bot.py`) (2026-08-30)
+
+A second bot — `DarwinTwitchBot(commands.Bot)`, built on **TwitchIO 3.x** — runs concurrently with the Discord bot in the same process/event loop, sharing the exact same `SessionState` instance so it can never drift out of sync with what the Discord bot and `MatchRunner` see.
+
+**Scope is deliberately narrow: `!pov` is the only chat command.** Status/profile/etc. are intentionally Discord-only and were *not* mirrored here, even though they'd have been trivial to add — a custom bot was chosen over an off-the-shelf one (Nightbot/StreamElements/Moobot) specifically so viewer-triggered actions like this can call into the same automation the Discord bot already has, which no off-the-shelf bot could do without a clunky webhook bridge. If Discord-style status/profile output in Twitch chat is ever wanted, it's a small addition to `PovComponent` (or a sibling `Component`) — not a redesign.
+
+**`!pov <1-9, 0>`** (`PovComponent` in `twitch_bot.py`) — mirrors the Discord `/pov` command exactly: same `_VALID_POV_KEYS`, same `session.is_command_valid("pov")` gate (valid in `IN_CUSTOM`/`MATCH_IN_PROGRESS`, from the same `VALID_COMMANDS` table in `session/state.py`), same `press_key(key, no_focus_fallback=True)` call via `run_in_executor`. **Mod-only**, via `@commands.is_moderator()` — a guard checked before the command body runs. `event_command_error()` is overridden to catch `commands.GuardFailure` and silently ignore it (matching the Discord bot's silent-reject-on-missing-role convention: `_role_check` sends nothing back either) rather than logging every non-mod's attempt as an error.
+
+**One announcement, not per-match:** `DarwinTwitchBot.announce(text)` posts to the broadcaster's chat and is called exactly once, in `/custom`'s success path in `discord_bot.py` (right next to the OBS `start_stream()` call) — a static message introducing the scrim, linking the Darwin Pro League Discord (`https://discord.gg/ynSjykan5C`), and linking the streamer's Ko-fi (`https://ko-fi.com/lilscarecrow`) — 242 characters, well under Twitch's 500-char chat limit. This replaced an earlier draft that announced every match start/end; that was cut in favor of a single lobby-creation announcement instead. `_twitch_announce()` (the `DirectorCog` helper that calls `announce()`) no-ops silently if `self.bot.twitch_bot` is `None` (i.e. `twitch_enabled: false`), and `announce()` itself never raises — same fire-and-forget convention as `ds_ingest`/OBS elsewhere in this codebase.
+
+**Concurrent bot execution (`main.py`):** previously `main.py` called the blocking `discord_bot.run(token)`. It's now `async def _run(config, session)`, using `asyncio.gather()` to run `discord_bot.start(token)` and the Twitch bot together on one event loop, wrapped in `async with DarwinTwitchBot(...) as twitch_bot:` for proper cleanup. When `twitch_enabled` is `false` (the default), only `discord_bot.start()` runs — behavior is unchanged from before this feature existed. `DarwinBot.twitch_bot` is set to the running `DarwinTwitchBot` instance (or left `None`) before `start()` is called, which is how `DirectorCog` reaches it.
+
+**A Twitch-side failure must never take down the Discord bot (2026-08-30 fix):** the Twitch bot's `start()` is wrapped in a local `_run_twitch()` coroutine with its own try/except before being handed to `asyncio.gather()` — without that wrapper, any unhandled exception from the Twitch side (e.g. the EventSub-subscription failure below, or any future one) propagates through `gather()` and cancels the Discord task too, killing the *entire* bot process over what should be a nice-to-have on top of the core Discord automation. This was found live: on a first run before the one-time browser OAuth step was completed, `setup_hook()`'s EventSub subscription 403'd (no authorized user token yet) and took the whole process down with it.
+
+**Ctrl+C was silently losing the Twitch OAuth token every restart — fixed by not depending on shutdown at all, not by fixing shutdown (2026-08-30):** `twitchio.Client.start()` calls `close()` (adapter close → EventSub websocket close → `save_tokens()`, in that order) in its own `finally` block, and relying on that to persist the token turned out to be **fundamentally unreliable** under a real Ctrl+C. Root cause: a Task that's mid-unwind from its own `CancelledError` stays flagged "cancelling" for the *entire* unwind — so any further `await` inside that `finally` block (i.e. every await inside `Client.close()`, including the one that reaches `save_tokens()`) can get silently re-interrupted by that same pending cancellation. Nothing gets logged when this happens: a cancelled task ending in `CancelledError` is asyncio's normal/expected outcome, not an error worth logging, so the failure was invisible — the log would show the adapter-close line but never the token-save line, no exception anywhere, and the file stayed empty.
+
+Three increasingly careful shutdown-sequence rewrites in `main.py` (cancel-then-close, close-then-cancel, a shielded cleanup task run before cancelling anything) were each tried and each still failed the same way, or introduced their own new symptom (an `aiohttp` `ClientResponse.__del__` / "Event loop is closed" warning from a later attempt). None of it was worth keeping: **`main.py`'s shutdown handling has been reverted back to plain `asyncio.gather()` with no custom `KeyboardInterrupt`/`CancelledError` handling at all** — Ctrl+C may still print something to the console, and that's accepted as cosmetic. The actual fix lives entirely in `bot/twitch_bot.py`: `DarwinTwitchBot.event_oauth_authorized()` calls `await self.save_tokens()` immediately upon receiving a token, during completely normal execution, nowhere near shutdown. By the time any Ctrl+C happens the token is already on disk, so how cleanly (or not) the rest of shutdown goes no longer matters for correctness — which is why fighting the shutdown path further wasn't worth it.
+
+Three increasingly careful fixes to the shutdown sequence in `main.py` were tried and each still failed the same way under a real Ctrl+C: cancel the bot tasks and let their own `start()`-finally trigger `close()`; cancel first, then also call `close()` explicitly (raced — whichever fired second just hit the `self._has_closed` guard and no-opped); run the explicit close as a shielded, freshly-created task before cancelling anything (still lost the token in testing). Rather than keep chasing asyncio cancellation semantics, **the actual fix is architectural**: `DarwinTwitchBot.event_oauth_authorized()` now calls `await self.save_tokens()` immediately, right when a token is granted — during completely normal execution, nowhere near shutdown or cancellation. By the time any Ctrl+C happens, the token is already safely on disk, so how cleanly the rest of shutdown goes no longer matters for correctness. `main.py`'s shutdown sequence was simplified back down accordingly (cancel tasks → await them with `return_exceptions=True` → best-effort `close()` on both bots, logged but not treated as critical if it errors).
+
+Fix, in `main.py`'s `_run()`: don't let `asyncio.run()`'s automatic mass-cancellation touch this at all. `KeyboardInterrupt`/`asyncio.CancelledError` is caught directly around `await asyncio.gather(*tasks)` inside `_run()` itself (not left to propagate out to `asyncio.run()`'s own handling), then both bots are closed **explicitly and sequentially** in a `finally` block — `twitch_bot.close()` then `discord_bot.close()`, each awaited to completion in a plain, uncancelled context — before any leftover tasks get cancelled. `main()` also wraps `asyncio.run(_run(...))` in `try/except KeyboardInterrupt` as a final backstop so nothing unhandled reaches the console. Both `Client.close()` implementations are idempotent (`if self._has_closed: return`), so calling them here even after a bot already crashed on its own is harmless.
+
+**EventSub chat subscription must tolerate "not authorized yet" (2026-08-30 fix):** `setup_hook()` no longer subscribes to `ChatMessageSubscription` directly — it calls `_subscribe_chat()`, which wraps the subscription in a try/except and just logs a warning (with the exact authorize URL to visit) if it fails, rather than raising. `event_oauth_authorized()` is overridden to call `super().event_oauth_authorized(payload)` (the default token-registration behavior) followed by another `_subscribe_chat()` attempt — so a fresh install's first `setup_hook()` call harmlessly 403s (no token yet), and the subscription completes itself automatically the moment the one-time browser authorization succeeds, with no restart needed.
+
+**Config keys** (`twitch_enabled` gates everything, default `false`; `main.py`'s `validate_config()` requires the other four only when it's `true`):
+| Key | Value |
+|---|---|
+| `twitch_enabled` | `false` by default |
+| `twitch_client_id` / `twitch_client_secret` | From a Twitch Developer Console app registration (dev.twitch.tv/console/apps) |
+| `twitch_bot_id` | Numeric Twitch user ID of the bot account (not the username) |
+| `twitch_owner_id` | Numeric Twitch user ID of the broadcaster/channel the bot posts to (not the username) |
+| `twitch_command_prefix` | `"!"` |
+
+**One-time setup still needed before this can go live** (not something Claude Code can do — requires the account owner's own Twitch login):
+1. Register an app at the Twitch Developer Console to get `twitch_client_id`/`twitch_client_secret`.
+2. Resolve the bot account's and broadcaster's usernames to numeric user IDs (Twitch Helix `GET /helix/users?login=<name>`) for `twitch_bot_id`/`twitch_owner_id`.
+3. Set `twitch_enabled: true` and start the bot. TwitchIO 3.x ships a **built-in OAuth web adapter** (`Bot.start(with_adapter=True)`, the default) that handles the authorization flow itself — no custom OAuth server was written for this. The first run requires visiting the adapter's local authorization URL once to grant the token(s); required scopes are `user:bot`, `user:read:chat`, `user:write:chat` (from the bot account) and `channel:bot` (from the broadcaster) — if the bot account and broadcaster are the same Twitch account, one grant covers all four.
+4. After that first authorization, tokens persist to `.tio.tokens.json` in the repo root (gitignored) and TwitchIO auto-refreshes them on subsequent runs — no repeat setup needed unless that file is deleted or scopes change.
 
 ### Scrim Signup System (`ScrimCog`)
 
@@ -124,18 +166,23 @@ Manages a static signup message in the configured channel. On every `on_ready`, 
 - Players react with ✅ to sign up
 - `_reactors()` excludes the bot's own seed reaction (both by `.bot` flag and explicit ID match — belt and suspenders) so the queue count reflects real players only
 - When the real reactor count reaches `scrim_min_players` (default 8), `scrim_admin_role` is pinged in the **`ai-director`** channel (ID `1520518111089000548`) — not the signup channel itself
-- A 1-hour reset countdown starts the moment the **first** real reactor joins an empty queue (`_start_reset_timer()`, triggered from `on_raw_reaction_add` when count hits 1) — this replaced the old "clear at the top of every wall-clock hour" behavior, so someone reacting at :59 doesn't get cut off a minute later. The timer is cancelled if the queue empties out before it fires (`on_raw_reaction_remove`) or is manually reset via `/role remove`, so a stale countdown from an old batch of reactors can never fire against a fresh one.
-- When the countdown fires (`_do_reaction_reset()`), it's skipped entirely if anyone currently holds `scrim_player_role` — a scrim is underway and players shouldn't get reset/pinged mid-match. Otherwise it clears reactions and pings removed players in channel ID `1520509256678506737` to re-sign up.
-- Reaction clearing (both the timer and `/role remove`) removes each real reactor's reaction **individually** (`message.remove_reaction`) rather than via a bulk `clear_reactions()` + re-add. Bulk clears appeared to leave stale names in some Discord clients' "who reacted" hover list; individual removals go through the same `MESSAGE_REACTION_REMOVE` event path used for a normal manual un-react. The bot's own seed reaction is never touched, so it doesn't need to be re-added.
-- **Bot restart caveat:** the reset countdown lives in memory only. If the bot restarts while a queue already has reactors, `_resume_reset_timer_if_needed()` starts a fresh full hour from restart time rather than knowing how long the queue had already been open — a queue that was 55 minutes old right before a restart effectively gets renewed.
+- A 1-hour reset countdown starts the moment the **first** real reactor joins an empty queue (`_start_reset_timer()`, triggered from `on_raw_reaction_add` when count hits 1) — this replaced the old "clear at the top of every wall-clock hour" behavior, so someone reacting at :59 doesn't get cut off a minute later. The timer is cancelled once the queue is fully empty across **both** lobbies — checked after every individual reaction removal in `on_raw_reaction_remove`, whether that removal came from a manual un-react, the countdown itself, or `/role remove` (see below) — so a stale countdown from an old batch of reactors can never fire against a fresh one.
+- When the countdown fires (`_do_reaction_reset()`), it's skipped entirely if anyone currently holds `scrim_player_role` **or** `scrim_player_role_2` — a scrim is underway (either lobby) and players shouldn't get reset/pinged mid-match. Otherwise it clears reactions and pings removed players in channel ID `1520509256678506737` to re-sign up.
+- Reaction clearing (the timer and `/role remove`) removes each real reactor's reaction **individually** (`message.remove_reaction`) rather than via a bulk `clear_reactions()` + re-add. Bulk clears appeared to leave stale names in some Discord clients' "who reacted" hover list; individual removals go through the same `MESSAGE_REACTION_REMOVE` event path used for a normal manual un-react. The bot's own seed reaction is never touched, so it doesn't need to be re-added.
+- **True signup order is tracked live (2026-08-30), separately from `_reactors()`:** `ScrimCog._signup_order` is a plain in-memory list of user IDs, appended to in `on_raw_reaction_add` (and pruned in `on_raw_reaction_remove` — a leave-then-rejoin goes to the back of the queue, not back to their old spot) as reactions actually happen. This exists because Discord's `reaction.users()` iteration order — what `_reactors()` returns — is **not documented or guaranteed to match signup order**, which matters once `/role add` has to decide who's in the first 10 vs. the next 10. `_ordered_reactors()` builds the real list by walking `_signup_order` and filtering to whoever's still actually reacted (via `_reactors()`), then appends any current reactor missing from that tracking (e.g. after a bot restart, since `_signup_order` is memory-only like the reset timer above) in `_reactors()`'s own order as a best-effort fallback. `/role add` uses `_ordered_reactors()`; everywhere else that only needs a count or "is anyone signed up" still uses the plain `_reactors()`.
+- **Bot restart caveat:** the reset countdown lives in memory only. If the bot restarts while a queue already has reactors, `_resume_reset_timer_if_needed()` starts a fresh full hour from restart time rather than knowing how long the queue had already been open — a queue that was 55 minutes old right before a restart effectively gets renewed. `_signup_order` has the identical caveat (see above).
 
 **Commands (scrim admin role required, i.e. `discord_required_role` — see merge note above):**
 | Command | Description |
 |---|---|
-| `/role add` | Gives `scrim_player_role` to the first 10 reactors (Discord reaction order). Response is public (not ephemeral). |
-| `/role remove` | Removes `scrim_player_role` from all who have it, clears all reactions on signup message, cancels any pending reset timer. Response is public (not ephemeral). |
+| `/role add` | Gives `scrim_player_role` to the first 10 reactors (by actual signup order — see above) and, if `scrim_player_role_2` is configured, `scrim_player_role_2` to the next 10 (11-20) — see "Two-lobby overflow" below. Response is public (not ephemeral). |
+| `/role remove <lobby>` | **Required `lobby` choice, `1` or `2`.** Removes only that lobby's role (`scrim_player_role` for `1`, `scrim_player_role_2` for `2`) from everyone who currently has it, and clears only those members' reactions from the signup message — the other lobby's role/reactions are untouched. Response is public (not ephemeral). |
 
 Both commands' permission-denial message ("You don't have permission...") remains ephemeral — only the successful-result messages were made public.
+
+**`/role remove` is lobby-scoped, not global (2026-08-30):** it used to remove both roles and clear every reaction unconditionally in one call. Now it snapshots `role.members` for whichever lobby was requested *before* removing the role (since `role.members` would shrink as members are processed), removes the role from exactly those members, then passes that same member list to `_clear_real_reactions()` — so a still-active other lobby's players and reactions are left alone. There's no explicit `_cancel_reset_timer()` call in the command anymore either; removing each member's reaction fires a real `MESSAGE_REACTION_REMOVE` event per user, and `on_raw_reaction_remove`'s existing "cancel if the queue is now fully empty" check handles it the same way a manual un-react would — cancelling only once *both* lobbies are actually clear.
+
+**Two-lobby overflow (2026-08-30):** `scrim_player_role_2` is optional. `/role add` always takes `reactors[:10]` for the primary role; only when `scrim_player_role_2` is configured does it also take `reactors[10:20]` for the second role. If more than 10 reacted and `scrim_player_role_2` is unset, the overflow beyond 10 is left unassigned and the response says so (same behavior as before this feature existed — nothing changes unless you set the key). `_match_in_progress()` (used to gate the 1-hour reset countdown) checks both roles, so an active second lobby also blocks the reset from firing. Note: the scrim-roster capture passed to the ladder ingest API (`DirectorCog._resolved_roster`, see Ladder Ingestion section) still caps at `reactors[:10]` (plain, not ordered) and was not changed — it doesn't currently account for a second lobby's players.
 
 **Config keys:**
 | Key | Value |
@@ -143,6 +190,7 @@ Both commands' permission-denial message ("You don't have permission...") remain
 | `scrim_signup_channel_id` | `1520517054988419123` |
 | `scrim_signup_message_id` | Auto-persisted — do not edit manually |
 | `scrim_player_role` | `PC Scrim Player` |
+| `scrim_player_role_2` | `PC Scrim Player 2` — optional; second-lobby role for signups 11-20, see "Two-lobby overflow" above |
 | `scrim_admin_role` | `PC Scrim Admin` (same value as `discord_required_role`) |
 | `scrim_min_players` | `8` |
 | `scrim_reaction_emoji` | `✅` |
@@ -155,17 +203,19 @@ Two channel IDs are hardcoded constants in `discord_bot.py` rather than config k
 
 1. Press B to start match (via PostMessage to Darwin hwnd — focus-independent)
 2. 5-second sync delay
-3. Announce active profile name via TTS: *"Using profile: [name]"*
-4. Start `VideoRecorder` in background thread
-5. Main loop (wrapped in `try/finally` to guarantee recorder finalization):
+3. Press `1` to default the Director's camera to player 1's POV (2026-08-31) — same key as `/pov`/`!pov`'s "1" choice, via the same `_press()` helper used for the B press above. Fires right before the profile announcement below, so viewers see live gameplay from the start of the match without needing a mod to run `/pov` or `!pov` first.
+4. Announce active profile name via TTS: *"Using profile: [name]"*
+5. Start `VideoRecorder` in background thread
+6. Main loop (wrapped in `try/finally` to guarantee recorder finalization):
    - Sleep until the next card trigger time (capped at `screen_poll_interval_seconds`) — cards fire within ~0.1s of scheduled time
    - Fire card events: check director points first, wait if insufficient, then shift-drag
    - Every 30s: sample zone pixels → `valid_closeable_zones()` → shuffle all OPEN zones → try each until one verifies
    - Every `screen_poll_interval_seconds`: double-confirm match end (two detections 2s apart, threshold 0.88)
-6. Stop recorder (`finally` block — runs on normal end, force-stop, and exceptions)
-7. Take screenshot of results screen → mirror to the `results` channel via `_mirror_results()` (not posted in the invoking channel) → push to ladder ingest → delete local screenshot file
-8. Fire background upload of recording via `_upload_recording()` — see Video Recorder section for what this actually does today
-9. Click MAIN MENU button on results screen → wait for main menu → transition to `IN_MENU`
+7. Stop recorder (`finally` block — runs on normal end, force-stop, and exceptions)
+8. Take screenshot of results screen (`_capture_results()`, inside `MatchRunner`) → returns `(screenshot_path, recording_path)` to `discord_bot.py`
+9. **Click MAIN MENU button on results screen → wait for main menu → transition to `IN_MENU`** (2026-08-31: moved here, right after the screenshot, instead of after the Discord/API step below) — the game doesn't need to sit on the results screen waiting on Discord/network calls before moving on; the screenshot is already captured by this point, so nothing below depends on the results screen still being up
+10. Mirror the screenshot to the `results` channel via `_mirror_results()` (not posted in the invoking channel) → push to ladder ingest → delete local screenshot file
+11. Fire background upload of recording via `_upload_recording()` — see Video Recorder section for what this actually does today. This one is *not awaited* (`asyncio.ensure_future`), so it genuinely races with step 10 rather than running strictly after it; every other step here is sequential.
 
 `MatchRunner.stop()` sets a `threading.Event` that the loop checks between every action. Called by `/quit`.
 
@@ -192,17 +242,19 @@ Two channel IDs are hardcoded constants in `discord_bot.py` rather than config k
 | give_wood | 1 | give_leather | 1 |
 | favorite_player | 0 | | |
 
-### Zone Logic (`zones/`)
+### Zone Logic (`zones/`) — **dormant since 2026-08-30, see below**
 
 7-zone hex grid with fixed adjacency. `valid_closeable_zones()` returns all zones currently in `OPEN` state — no connectivity filtering. The bot shuffles the list and tries each zone in order, relying on the verification step (slot pixel delta check) to detect game rejections rather than pre-filtering.
 
 The connectivity logic (`can_close_zone`, `open_zones_stay_connected`, BFS) has been removed. `neighbor_count()` is kept for the strategy classes which use it for weighting.
 
-**Zone close flow in `_attempt_zone_close()`:**
+**Zone close flow in `_attempt_zone_close_legacy()`** (not called — see below for the live path):
 - Grab zone_close card → read zone states from screenshot → `valid_closeable_zones()` → `random.shuffle()` → try each until slot pixel verifies or list exhausted
 - The game itself enforces any rules about which zones can actually be closed
 
 Zone strategy is pluggable via `config.json → zone_selection_strategy` but the live path currently ignores the strategy and uses random shuffle directly. Adding a new strategy: create a file in `zones/strategies/`, subclass `BaseZoneStrategy`, add to `STRATEGIES` dict in `strategy_factory.py`.
+
+**Superseded by the static drop-area approach (2026-08-30):** a new in-game drop area resolves zone_close to a random valid zone on the game's own side, so none of the machinery on this page runs in a live match anymore — `MatchRunner._attempt_zone_close()` now just drags the card to one static point (`zone_close_auto_drop_target` in config) and marks it played, no zone-map read, no `ZoneState` tracking, no strategy selection, and (per an explicit choice) no tray-pixel verification either — regardless of `verify_card_plays`, since the drop area makes "did it pick a valid zone" the game's problem, not the bot's. Everything described in this section — `zones/`, `_zone_states`, `valid_closeable_zones`, `zone_selection_strategy`, `zone_map_sample_points`, `zone_color_thresholds` — is left in the codebase **disconnected, not deleted** (same treatment as `/deck`, see below), preserved as `MatchRunner._attempt_zone_close_legacy()` / `_attempt_zone_close_bypass()` / `_update_zone_states_from_screenshot()` / `_vote_zone_state()`, in case the new drop area needs to be rolled back. `zone_close_auto_drop_target` is a single `[x, y]` coordinate — calibrated to `[1750, 1000]` (2026-08-30), inside the "SPECTATORS — LET THEM DECIDE" cyan corner triangle at 1920×1080. That triangle's top edge is diagonal and its label text/robot icon break up the color in places (e.g. white text glyphs, the mech icon in the upper-left of the shape) — `y ≥ 975` is solid cyan across the full `x` range in that corner with no such gaps, which is why the calibrated point sits there rather than nearer the diagonal edge.
 
 ### Screen Detection (`game/screen_detection.py`)
 
@@ -299,12 +351,12 @@ The big zone map only appears when a zone_close card is grabbed (shift+click+hol
 5. `complete_drag(keep_shift=True)` to target zone → after-screenshot → verify slot pixel changed → `shift_up()`, or `mouseUp()+shift_up()` if nothing closeable
 In bypass mode, uses cached `_zone_states` (all OPEN initially) and calls `play_card(bypass_mode=True)`.
 
-**Zone_close slot verification threshold — 80, not 40:**
-The inline pixel delta check in `_attempt_zone_close` uses `delta > 80` (not the global 40 used by `_verify_card_removed`). This is intentional.
+**Zone_close slot verification threshold — 80, not 16:**
+The inline pixel delta check in `_attempt_zone_close` uses `delta > 80` (not the global threshold used by `_verify_card_removed`). This is intentional.
 
 The zone_close card's tray position varies by profile. In the Blood profile (custom_a), beach_party is never played, so the tray always has one extra card. This pushes zone_close from x=814 (Standard/Everything) to x=852. The game world background bleeds slightly through the card art at x=852, causing a consistent small delta of ~56-58 even when the card returns to its slot after a rejection. This is not a timing issue — it is a specific background bleed at that screen coordinate. Real plays produce delta of 240+; the false-positive bleed produces delta 56-58. Threshold 80 sits safely between them.
 
-`_verify_card_removed` (used by all non-zone_close cards) remains at delta > 40 — those cards are never affected by this background bleed.
+**`_verify_card_removed` threshold lowered 40 → 16 (2026-08-28):** `_TRAY_VERIFY_DELTA_THRESHOLD` in `match_runner.py`. Log analysis across months of matches (`logs/darwin_bot.log`) found a recurring false-negative band at delta 17-39, always on the first tray-card play of the match or the first play right after a card naturally unlocks mid-match (`Electromania at 2:30`, `Beach Party at 4:00`, `Telepathy at 4:30`/`10:00`) — the tray recenters and the sampled pixel shifts to a different-but-similar card color instead of going stark. A missed verification here never adds the card's `deck_position` to `self._deck_played`, so every later `_deck_pos_to_screen()` call computes one card-width off for the rest of the match — this is the "tray out of sync" cascade: the next card's play *and* its own verification land on the wrong slot, which usually reads near-zero delta since nothing meaningful is at that wrong pixel (this also explains why zone_close attempts sometimes fail on every zone in the same match — its slot is computed the same way). Genuine non-plays across the same log are all delta ≤ 15 (mostly 0-3, one ambiguous 10); genuine clean detections are all delta ≥ 41. 16 sits in the untouched gap between the two populations, so this only reclassifies the confirmed false-negative band and leaves every previously-correct detection unchanged.
 
 **Zone visual states on the big map (what to calibrate against):**
 - **OPEN**: plain medium blue/teal hex, no border glow
@@ -313,17 +365,25 @@ The zone_close card's tray position varies by profile. In the Blood profile (cus
 
 Sample points are placed at ~110px from each tile center (near the hex edge, well outside the player icon area at center). At this distance, colors are: OPEN=blue, CLOSING=dark navy, CLOSED=dark red. The orange border glow is right at the very edge and would require sampling at ~120-125px to catch; the interior color differences are sufficient for three-way distinction. Calibrate `zone_color_thresholds` using `calibrate_zone_colors.py` while holding a zone_close card with known zone states visible.
 
+**`verify_card_plays` toggle (2026-08-30) — bypasses verification/retries without deleting them:** `config.json → verify_card_plays` (default `true`). Card plays have proven reliable enough day-to-day that the pixel-verify-and-retry safety net is no longer needed. Setting it to `false` does **not** remove any verification code — `_verify_card_removed` is untouched — it just skips calling it:
+- **Tray cards** (zone-targeted, player-targeted, and plain drop-target cards): all three now funnel through one shared `MatchRunner._play_tray_card()` helper (extracted from what used to be three near-identical ~90-line blocks in `_fire_card_event`, one per card kind). `_play_tray_card` checks, in order: `self._bypass` (ahk_bypass_mode dry-run) → `not self._verify_plays` (play once, no before/after screenshots, no retry, trust it worked) → the original verify-with-up-to-2-attempts path. `self._verify_plays` is set once in `MatchRunner.__init__` from `verify_card_plays` and is a distinct concept from `ahk_bypass_mode`: bypass mode never sends real input, `verify_card_plays: false` still plays every card for real.
+- **Zone close is not governed by this toggle at all** — as of the same date it has its own static drop-area mechanism (see the Zone Logic section above) that always plays once with no verification, regardless of `verify_card_plays`. The zone_close-specific `delta > 80` check mentioned above only still runs inside the disconnected `_attempt_zone_close_legacy()`.
+
 ### Video Recorder (`game/video_recorder.py`)
 
 Records match footage in a background thread. Started after the match countdown, stopped in a `try/finally` so the file is always finalized regardless of how the match ends.
 
-- **Format:** H.264 MP4 (`avc1`) — all three FOURCC options tested True on this machine
+**`recording_enabled` toggle (2026-08-31), off by default for now:** `config.json → recording_enabled` (default `true` if the key is absent, but currently set to `false` in this repo's `config.json`). When `false`, `MatchRunner.run()` never constructs or starts a `VideoRecorder` at all — `recorder` stays `None`, the `finally` block skips calling `recorder.stop()`, and `recording_path` stays `None` for the rest of the match. One toggle covers both "no local recording file" and "no upload attempt" — `discord_bot.py`'s `if recording_path: asyncio.ensure_future(self._upload_recording(...))` check downstream naturally never fires when there's no file to begin with, so nothing needed to change there.
+
+- **Format:** H.264 MP4 (`avc1`) — all three FOURCC options tested True on this machine ⚠️ **`cv2.VideoWriter.isOpened() == True` is not a reliable success signal for `avc1`** — see the OpenH264 gotcha below, where it stayed `True` while silently writing a ~1KB broken file with the real codec missing. If recordings are ever coming back empty/corrupt, check for the OpenH264 load error in console output before assuming it's a crash/try-finally issue.
 - **FPS:** 4 (1 frame every 0.25 seconds)
 - **Crop:** configured via `recording_crop_region: [x, y, w, h]` — currently `[755, 175, 410, 200]` (tight center band focused on the kill feed area)
 - **Output:** `screenshots/recordings/match_{timestamp}.mp4` — ~60-65 MB for a 20-min match at these settings (roughly 8x the file size of the old 0.5fps setting)
 - **Upload:** `_upload_recording(path)` fires as a detached async task after the match. The actual upload is still a stub (TODO — wire up when `recording_api_endpoint` is set in config). **The local recording file is deleted unconditionally at the end of `_upload_recording()` regardless of whether an upload happened** — this was an explicit choice to reclaim disk space now, accepting that until the upload is actually implemented, recordings aren't preserved anywhere once deleted.
 
 **Safety:** process crash will leave the file corrupt (VideoWriter MOOV atom not flushed). All other exit paths (normal end, `/quit`, exceptions, asyncio timeout) are covered by the `try/finally`.
+
+**OpenH264 DLL gotcha (Windows) (2026-08-30):** OpenCV's ffmpeg backend doesn't bundle Cisco's `libopenh264` codec — it's dynamically loaded at runtime and must be downloaded separately (H.264 patent-licensing reasons; same category of issue as the `pip-system-certs` SSL gotcha in Ladder Ingestion below). Symptom in logs: `Failed to load OpenH264 library: openh264-1.8.0-win64.dll` / `Incorrect library version loaded` / `Could not open codec libopenh264` right when a match starts (`VideoRecorder.start()`). The exact required filename/version is stated in the error itself — for this OpenCV build (opencv-python 4.13.0) it's `openh264-1.8.0-win64.dll` from Cisco's official binary host, `http://ciscobinary.openh264.org/openh264-1.8.0-win64.dll.bz2` (`.bz2`-compressed; verify the decompressed DLL's Authenticode signature is `Cisco WebEx LLC` before trusting it — the signing cert being expired is normal for a 2018-era release and doesn't invalidate a timestamped signature). **Placement matters and is not where you'd expect:** putting it next to `cv2`'s own `opencv_videoio_ffmpeg*.dll` in `site-packages/cv2/` does **not** work — that folder isn't on the DLL search path FFmpeg uses for this dependency. It has to go in **the same directory as `python.exe`** and/or **the process's current working directory** (the repo root, since that's where `main.py` runs from) — both were populated for redundancy here. Gitignored via `openh264-*.dll` since it's a machine-specific runtime binary, not source, matching the `templates/` and `noble-hopper/` precedent above.
 
 ### Ladder Ingestion (`game/ingest.py`)
 
@@ -352,8 +412,10 @@ All TTS is **fire-and-forget** — no call blocks the match loop. A single `_wor
 
 **TTS functions:**
 - `speak_cable(text)` — queues audio to CABLE Input, no G press. Use for all in-broadcast announcements (broadcast window already open).
-- `speak(text, broadcast=True)` — queues audio; if `broadcast=True`, the worker checks cooldown, presses G, plays audio (standalone use — not used in the match loop).
+- `speak(text, broadcast=True)` — queues audio; if `broadcast=True`, the worker checks cooldown, presses G, plays audio (standalone use — not used in the match loop; `/say` is the one caller, via `broadcast=in_match`).
 - `try_open_broadcast()` + `speak_cable(...)` + `queue_close_broadcast()` — the correct pattern for in-match card announcements.
+
+**`broadcast` mode on cooldown now falls back to CABLE-only instead of dropping the phrase entirely (2026-08-31 fix):** in `_worker_loop()`, the `mode == "broadcast"` branch used to `continue` when `_broadcast_available_at` hadn't passed yet — silently discarding the queued phrase with no audio played at all. Found via `/say` mid-match: whenever the megaphone was on cooldown, players heard nothing, since the G-press gate was also gating the audio itself rather than just the G press. It now still calls `_speak_on_cable(text)` (no G press, CABLE Input only) in that case before `continue`-ing, so the phrase is always audible — the cooldown only ever withholds the G press/broadcast-window opening, never the audio.
 
 **Waiting-on-points broadcast close:**
 If `_wait_for_points()` needs to wait and the broadcast window is open, it queues `speak_cable("Waiting on points for X")` then `queue_close_broadcast()` immediately — the 90s cooldown starts ticking while waiting for points. When points arrive, `_fire_card_event` tries `try_open_broadcast()` again (may fail if cooldown hasn't expired).
@@ -361,6 +423,26 @@ If `_wait_for_points()` needs to wait and the broadcast window is open, it queue
 **Pre-caching:** `precache_async(phrases)` fires a background thread that generates and caches all TTS audio via edge-tts before cards fire, so every queued phrase hits the cache instead of making a live network request.
 
 **Discord voice mirroring:** `/voice join` connects the bot to the user's voice channel — all TTS audio then plays concurrently to both CABLE Input and the Discord channel. Set/cleared via `tts.set_voice_client(vc)`.
+
+### OBS Twitch Streaming (`game/obs_control.py`) (2026-08-30)
+
+Controls OBS Studio remotely via **obs-websocket** (built into OBS 28+, enabled under Tools → WebSocket Server Settings) to start/stop a Twitch stream around the automated Director session. **This does not launch or configure OBS** — OBS Studio must already be running, with its own Settings → Stream panel already pointed at Twitch with a stream key entered, and its websocket server enabled. The bot only ever sends `StartStream`/`StopStream` over the websocket — it never sees or handles the Twitch stream key itself.
+
+**Lifecycle:**
+- **Starts** when `/custom` successfully creates the lobby (`bot/discord_bot.py`, the `if lobby_code:` branch) — this is deliberately the *only* driven-lobby's session, since only one of the two scrim lobbies runs the AI Director (see the Scrim Signup System section — the second lobby is run manually and never touches this bot).
+- **Stops** inside `_reset_session()`, not at individual call sites. `_reset_session()` is the one function invoked on every path back to `IDLE` — `/quit`'s confirmation (`_EndConfirmView._do_end`), the 10-minute main-menu idle-close in `_screen_watcher()` (`_IDLE_CLOSE_SECONDS = 600`, see the Discord Bot background-watcher code), and every other failure/timeout reset (`/custom` timeout, `/launch` failure, match-runner timeout, etc.). Hooking the single shared reset function means the stream reliably stops on the two triggers that were asked for (`/quit`, 10-min idle) plus every other path that already resets the session, without duplicating the stop call at each site.
+- Runs continuously across the whole session, including idle time at the main menu between matches — it is not restarted per match. Only one `/custom`→`/quit` (or →idle-timeout) cycle drives one continuous stream.
+
+**Config-gated, off by default:** `obs_stream_enabled` (bool, default `false`) is the master switch — `game/obs_control.py`'s `is_enabled()` gates every call, so leaving it `false` makes this feature fully inert (no connection attempts at all). `obs_websocket_host`/`obs_websocket_port`/`obs_websocket_password` must match what's configured in OBS's WebSocket Server Settings (defaults: `localhost` / `4455` / no password — OBS 28+'s own defaults).
+
+**Best-effort, matching the `ds_ingest`/noble-hopper convention elsewhere in this codebase:** `start_stream()` and `stop_stream()` never raise — any connection failure (OBS not running, wrong port/password) is logged as a warning and swallowed. A failed `start_stream()` does not block lobby creation; the `/custom` response embed just shows "⚠️ Could not start" instead of "🔴 Live" in that case. Both functions also check `GetStreamStatus` first and no-op (return `True`) if the stream is already in the requested state, so a spurious extra start/stop call is harmless.
+
+**Threading:** `obsws_python.ReqClient` does blocking websocket I/O (connect, send, disconnect all block). The `/custom` call site wraps `start_stream()` in `run_in_executor` to keep it off the event loop; `stop_stream()` inside `_reset_session()` is called directly (synchronous, un-executor-wrapped) — `_reset_session()` itself is a plain sync method called from many places, some of which (e.g. `_EndConfirmView._do_end`'s `close_game()` call) already accept a brief direct blocking call in the same spot, so this follows existing precedent rather than threading every one of `_reset_session()`'s ~12 call sites through an executor.
+
+**Anti-cheat minimap cover (2026-08-31, show moved earlier same day):** an OBS source named `obs_minimap_cover_source` (config, default `"Map Cover"`) keeps the Director's minimap off-stream from lobby creation through the first `obs_minimap_cover_seconds` (config, default `120`) of the match, so early positions aren't visible to viewers. The source itself — an image, sized/positioned over the minimap — is set up manually in OBS; the bot only ever toggles its visibility via `obs_control.set_source_visible(source_name, visible)`, which looks up `GetCurrentProgramScene()` fresh on every call rather than hardcoding a scene name, so it keeps working if the scene is ever renamed.
+- **Show** happens in `discord_bot.py`, right after `/custom`'s success embed (with the lobby code) is sent — not at match start. The minimap is potentially visible as soon as the lobby exists, and `/start` may not be called for a while after `/custom`, so covering it early is the safer anti-cheat default. Wrapped in `run_in_executor` since `set_source_visible` is a blocking websocket call.
+- **Hide** is still owned by `MatchRunner`'s main loop, timed off actual match elapsed time (not lobby time) — a one-shot check (`self._minimap_uncovered`) fires once `elapsed >= obs_minimap_cover_seconds` into the match itself. Precision is bounded by `screen_poll_interval_seconds`, not exact to the second, which is fine for this purpose.
+- Gated the same way as the rest of this section: no-ops entirely if `obs_stream_enabled` is `false`.
 
 ## Custom Lobby Creation Flow (`_do_create_custom`)
 
@@ -473,6 +555,26 @@ On each retry, moves mouse to `(960, 300)` first to force a fresh `MouseEnter` o
 - Avoid including ping/ms values in region templates (they change between sessions)
 - **"REWARD" text on the results screen does NOT render in pyautogui screenshots** (it lives on a separate GPU layer). Use the MAIN MENU button (`placement_badge.png`) for match-end detection instead.
 
+### How Claude Code captures the live game screen for calibration (2026-08-30)
+
+When a human needs to hold a card/menu open so Claude can read off coordinates (e.g. calibrating `zone_close_auto_drop_target`), the `mcp__computer-use__*` tools **do not work for this game** — two separate problems, both bypassed by going straight to Bash instead:
+
+1. **`request_access` grants the wrong process.** The Start Menu entry "Darwin Project" resolves to the Steam launch shortcut (`bundleId: steam://rungameid/544920`), but the actual running window belongs to `Darwin-Win64-Shipping.exe` — a different process spawned by Steam (same stub-vs-real-exe split documented in the Game Launcher section above). Any `left_click` on the game window fails with "`Darwin-win64-shipping` is not in the allowed applications", and re-requesting access under "Darwin Project" doesn't fix it — the grant always resolves to the same launcher bundle id, never the real process.
+2. **`computer_batch`'s own `screenshot` action comes back solid black** over the game window regardless of the above. Likely cause: the game (Unreal Engine, per the UE5 update notes above) stops presenting frames — or something in the capture path gets blocked — when the window doesn't have real OS focus, and computer-use's failed clicks mean focus never actually reached the game.
+
+**The fix — use the bot's own working code path via Bash instead of computer-use:**
+```bash
+python -c "from game.card_actions import focus_darwin_window; print(focus_darwin_window())"
+python -c "
+from game.screen_detection import take_screenshot
+import cv2
+cv2.imwrite(r'<scratchpad>\shot.png', take_screenshot())
+"
+```
+Then `Read` the saved PNG directly — it renders as an image, no computer-use involved. This is exactly the `focus_darwin_window()` → `take_screenshot()` sequence the bot already calls before every real card play, so if it works during a live match it works here too. It also sidesteps the resolution mismatch noted in Template capture rules above (`take_screenshot()` is native 1920×1080, not computer-use's 1456×816).
+
+Two side notes from doing this live: `pyautogui.screenshot()` alone only captures the **primary** monitor — if the game is on a secondary display, either move the game window first or grab the full virtual desktop and crop (`PIL.ImageGrab.grab(all_screens=True)`, then crop using `ctypes.windll.user32.GetSystemMetrics(76/77/78/79)` for the virtual-screen origin/size — the secondary monitor's region is `(0, 0, primary_width, primary_height)` in the combined image when it sits to the left of the primary at virtual x-origin `-primary_width`). And once a coordinate is picked from the screenshot, cross-check it with a quick pixel-color scan (`img[y, x]`, BGR order from `cv2.imread`) across a small grid rather than eyeballing it — that's how the exact `y ≥ 975` boundary for the zone_close drop area (see Zone Logic section) was confirmed solid with no text/icon gaps before committing it to config.
+
 ### Match end detection pitfalls
 
 `placement_badge.png` is the "MAIN MENU" button (white text on dark blue, 98×30px). It appears on the results screen and is also used by `_do_post_match_return()` to find and click MAIN MENU after the match.
@@ -487,7 +589,11 @@ Profiles define the card play schedule. Active profile is set in `config.json �
 
 **Standard profile** (default): Electromania 2:30 · Beach Party 4:00 · Electromania 6:30 · Blood Moon 9:00
 
-Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The bot picks it up via `get_profile()` — no other changes needed.
+**Beach Shuffle profile** (2026-08-29): based on Standard, with two changes. First, Beach Party's play time is randomized once per match — a random 15s-aligned time between 4:00 and 6:00 (i.e. one of 4:00, 4:15, 4:30 ... 6:00); the two zone closes that used to bracket Beach Party in Standard are fixed at later times to make room regardless of the draw: 5:00 → 7:00, 8:00 → 9:00. Electromania at 6:30 is unaffected and can now fire before the (now 7:00) zone close on a late Beach Party draw — that reordering was a deliberate, explicit choice, not an oversight. Second, Telepathy at 10:00 is swapped for Blood Moon at 10:00.
+
+Implemented via a profile-level `random_play_times` key: `{card_type: (min_seconds, max_seconds, step_seconds)}`. `resolve_profile()` deep-copies the profile and substitutes a `random.randrange()` draw into that card's `play_time_seconds` — resolved once per match (at `/custom` time, cached in `_resolved_profile`) so the same draw is used for both the Discord profile-summary display and the actual match schedule. `profile_summary()` shows the configured range (e.g. `Beach Party 4:00-6:00 (random)`) rather than a single time when a card has a `random_play_times` entry.
+
+Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The bot picks it up via `get_profile()` — no other changes needed. Add a `random_play_times` entry only if a card's time should vary per match.
 
 ## Config Reference (`config.json`)
 
@@ -500,6 +606,7 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "zone_selection_strategy": "weighted_outer",
     "active_profile": "standard",        // Match card play profile (see game/profiles.py)
     "ahk_bypass_mode": false,            // true = log actions instead of executing
+    "verify_card_plays": true,           // false = play once and trust it, skip pixel-verify/retries (kept, not deleted)
     "tts_device": "CABLE Input",         // Sounddevice output name for TTS; omit to disable TTS
     "tts_voice": "en-US-AriaNeural",  // edge-tts voice name
     "card_play_lead_time_seconds": 2,    // Fire card events this many seconds early to account for drag time
@@ -520,13 +627,14 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
             "drop_target": null
         }
     },
-    "zone_map_sample_points": {          // 3-5 [x,y] points per zone tile on the big map (appears when grabbing a zone_close card)
+    "zone_close_auto_drop_target": [1750, 1000], // [x, y] single static drop point — game auto-picks the zone. Live path, calibrated at 1920×1080.
+    "zone_map_sample_points": {          // dormant (_attempt_zone_close_legacy only) — 3-5 [x,y] points per zone tile on the big map
         "1": null, "2": null, "3": null, "4": null, "5": null, "6": null, "7": null
     },
-    "zone_drop_coordinates": {           // [x, y] drag target per zone — calibrate
+    "zone_drop_coordinates": {           // dormant (_attempt_zone_close_legacy only) — [x, y] drag target per zone
         "1": null, ..., "7": null
     },
-    "zone_color_thresholds": {           // RGB tuples for open/closing/closed — calibrate against whichever source above is active
+    "zone_color_thresholds": {           // dormant (_attempt_zone_close_legacy only) — RGB tuples for open/closing/closed
         "open": null,
         "closing": null,
         "closed": null
@@ -540,6 +648,7 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "launch_timeout_seconds": 180,
 
     // Video recording
+    "recording_enabled": false,          // false = no local recording at all, and therefore no upload attempt either — currently off
     "recording_api_endpoint": "",        // POST endpoint for upload — upload is still a TODO stub; local file is deleted after each match regardless (see Video Recorder section)
     "recording_crop_region": [755, 175, 410, 200],   // [x, y, w, h] crop at 1920×1080 — tight center band on kill feed
 
@@ -552,9 +661,19 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "scrim_signup_channel_id": "1520517054988419123",
     "scrim_signup_message_id": null,     // Auto-persisted by bot on startup — do not edit manually
     "scrim_player_role": "PC Scrim Player",
+    "scrim_player_role_2": "PC Scrim Player 2", // optional — second-lobby role for signups 11-20
     "scrim_admin_role": "PC Scrim Admin", // same value as discord_required_role — see merge note above
     "scrim_min_players": 8,
-    "scrim_reaction_emoji": "✅"
+    "scrim_reaction_emoji": "✅",
+
+    // OBS Twitch streaming — see game/obs_control.py. Off by default; OBS must already
+    // be running with Stream settings pointed at Twitch and websocket server enabled.
+    "obs_stream_enabled": false,
+    "obs_websocket_host": "localhost",
+    "obs_websocket_port": 4455,
+    "obs_websocket_password": "",
+    "obs_minimap_cover_source": "Map Cover", // OBS source name toggled to hide the minimap for the first obs_minimap_cover_seconds
+    "obs_minimap_cover_seconds": 120
 }
 ```
 
@@ -597,10 +716,8 @@ All templates captured at **1920×1080** via pyautogui. Centers listed are for t
 - [x] All custom lobby flow templates captured (see table above)
 - [ ] `card_slots` coordinates for Electromania and Beach Party slots
 - [ ] `cards.electromania.slot` / `drop_target` and `cards.beach_party.slot` / `drop_target`
-- [ ] `zone_close_card_slot`
-- [ ] `zone_sample_coordinates` (all 7 zones)
-- [ ] `zone_drop_coordinates` (all 7 zones)
-- [ ] `zone_color_thresholds` (open / closing / closed RGB values)
+- [x] `zone_close_auto_drop_target` — calibrated to `[1750, 1000]` (2026-08-30), inside the "SPECTATORS — LET THEM DECIDE" corner triangle
+- [ ] ~~`zone_close_card_slot`~~ / ~~`zone_sample_coordinates`~~ / ~~`zone_drop_coordinates`~~ (all 7 zones) / ~~`zone_color_thresholds`~~ — dormant, only needed if `_attempt_zone_close_legacy()` is ever restored
 - [ ] `results_ocr_regions` (x,y,w,h per column per row) — not needed if sending screenshot to Discord
 - [x] `templates/placement_badge.png` captured (MAIN MENU button, 98×30px — self-match 1.0, in-game HUD 0.50)
 - [x] `director_points_region` calibrated to `[808, 1002, 20, 24]` (2-digit numerator only)

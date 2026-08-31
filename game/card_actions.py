@@ -31,6 +31,11 @@ _SCAN_CODES: dict[str, int] = {
     "g":      0x22,
     "escape": 0x01,
     "shift":  0x2A,
+    # Number row (scan code set 1) — used by /pov to switch the Director's
+    # camera to a given player slot. VK for digits is already ord(key), so
+    # no _VK_CODES entry is needed for these.
+    "1": 0x02, "2": 0x03, "3": 0x04, "4": 0x05, "5": 0x06,
+    "6": 0x07, "7": 0x08, "8": 0x09, "9": 0x0A, "0": 0x0B,
 }
 _VK_CODES: dict[str, int] = {
     "escape": 0x1B,

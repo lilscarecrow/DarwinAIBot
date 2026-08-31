@@ -54,6 +54,19 @@ class MatchRunner:
         self._skip_start = skip_start
         self._profile = profile
         self._bypass = config.get("ahk_bypass_mode", False)
+        # Master toggle for the tray-pixel and zone-map verification/retry logic (kept
+        # intact, not deleted) — card plays have proven reliable enough that the extra
+        # screenshots and retries are no longer needed day-to-day. Distinct from
+        # ahk_bypass_mode: that's a dry-run mode that never sends real input; this
+        # still plays every card for real, it just trusts the play worked instead of
+        # verifying it with a before/after pixel check.
+        self._verify_plays = config.get("verify_card_plays", True)
+        # Anti-cheat minimap cover — see _fire_card_event's sibling logic in run() for the
+        # show, and the main loop below for the timed hide. One-shot flag so the hide
+        # only fires once per match even though the loop polls elapsed time repeatedly.
+        self._minimap_cover_source = config.get("obs_minimap_cover_source", "Map Cover")
+        self._minimap_cover_seconds = config.get("obs_minimap_cover_seconds", 120)
+        self._minimap_uncovered = False
         self._strategy = get_strategy(config.get("zone_selection_strategy", "weighted_outer"))
         self._zone_states: dict[int, str] = {i: ZoneState.OPEN for i in range(1, 8)}
         self._deck_played: set[int] = set()
@@ -133,12 +146,23 @@ class MatchRunner:
         phrases.append(profile_announce)
         tts.precache_async(phrases)
         if not self._stop.wait(5):
+            # Default the Director's camera to player 1's POV as soon as the match is
+            # underway, so viewers see live gameplay immediately without needing a mod
+            # to run /pov or !pov first. Same key as /pov's "1" choice.
+            self._press("1")
             self._announce_card_lineup(profile_announce)
         poll_interval = self._config.get("screen_poll_interval_seconds", 12)
 
-        from game.video_recorder import VideoRecorder
-        recorder = VideoRecorder(self._config)
-        recorder.start()
+        # recording_enabled: false skips creating/starting the recorder entirely — no
+        # local file gets written, and recording_path stays None throughout, so
+        # discord_bot.py's `if recording_path:` upload check downstream naturally
+        # never fires either. One toggle covers both "no local recording" and "no
+        # upload attempt" since there's nothing to upload without a file.
+        recorder = None
+        if self._config.get("recording_enabled", True):
+            from game.video_recorder import VideoRecorder
+            recorder = VideoRecorder(self._config)
+            recorder.start()
         recording_path = None
 
         try:
@@ -152,6 +176,15 @@ class MatchRunner:
                 for event in card_schedule:
                     if not event.done and elapsed >= event.trigger_seconds:
                         self._fire_card_event(event, card_schedule)
+
+                # Anti-cheat: uncover the minimap once the covered window has elapsed.
+                # One-shot — self._minimap_uncovered stops this from firing again on
+                # every subsequent loop iteration for the rest of the match.
+                if not self._minimap_uncovered and elapsed >= self._minimap_cover_seconds:
+                    from game import obs_control
+                    if obs_control.is_enabled():
+                        obs_control.set_source_visible(self._minimap_cover_source, False)
+                    self._minimap_uncovered = True
 
                 # Poll for match end (placement badge on screen)
                 if self._match_has_ended():
@@ -173,7 +206,8 @@ class MatchRunner:
                 sleep_time = min(poll_interval, min(pending_times)) if pending_times else poll_interval
                 self._stop.wait(max(0.1, sleep_time))
         finally:
-            recording_path = recorder.stop()
+            if recorder is not None:
+                recording_path = recorder.stop()
 
         if self._stop.is_set():
             return "Match ended early (force stopped)."
@@ -406,58 +440,7 @@ class MatchRunner:
                         broadcast_open = tts.try_open_broadcast()
                 if not self._stop.is_set():
                     tts.speak_cable(f"Deploying {card_label}")
-                    slot_coord = self._deck_pos_to_screen(event.deck_position)
-                    from game.card_actions import play_card
-                    played = False
-                    if self._bypass:
-                        play_card(slot_coordinate=slot_coord, target_coordinate=target,
-                                  card_name=event.name, bypass_mode=True)
-                        self._deck_played.add(event.deck_position)
-                        played = True
-                    else:
-                        from game.card_actions import shift_down, shift_up
-                        from game.screen_detection import take_screenshot, save_error_screenshot
-                        tray_configured = all([
-                            self._config.get("card_tray_center_x"),
-                            self._config.get("card_tray_card_width"),
-                            self._config.get("card_tray_card_y"),
-                        ])
-                        if tray_configured:
-                            shift_down()
-                            time.sleep(0.25)
-                            before = take_screenshot()
-                            for attempt in range(1, 3):
-                                if attempt > 1:
-                                    tts.speak_cable("Retrying")
-                                play_card(slot_coordinate=slot_coord, target_coordinate=target,
-                                          card_name=event.name, keep_shift=True)
-                                time.sleep(0.4)
-                                after = take_screenshot()
-                                if self._verify_card_removed(slot_coord, before, after):
-                                    self._deck_played.add(event.deck_position)
-                                    played = True
-                                    break
-                                logger.warning("Card '%s' not verified in tray (attempt %d/2)", event.name, attempt)
-                                if self._stop.is_set():
-                                    break
-                            if not played and not self._stop.is_set():
-                                logger.error("Card '%s' failed to play after 2 attempts", event.name)
-                                save_error_screenshot(f"card_play_failed_{event.name.replace(' ', '_').replace(':', '_')}")
-                            shift_up()
-                        else:
-                            if play_card(slot_coordinate=slot_coord, target_coordinate=target,
-                                         card_name=event.name):
-                                self._deck_played.add(event.deck_position)
-                                played = True
-                    if not self._stop.is_set():
-                        if played:
-                            ann = self._next_card_announce(next_event)
-                            if ann:
-                                tts.speak_cable(ann)
-                        else:
-                            tts.speak_cable(f"Sorry, failed to deploy {card_label}")
-                        if broadcast_open:
-                            tts.queue_close_broadcast()
+                    self._play_tray_card(event, target, card_label, next_event, broadcast_open)
         elif event.card_type in _PLAYER_TARGETED_CARDS:
             player_coords = self._config.get("player_target_coordinates") or []
             if not player_coords:
@@ -473,58 +456,7 @@ class MatchRunner:
                         broadcast_open = tts.try_open_broadcast()
                 if not self._stop.is_set():
                     tts.speak_cable(f"Deploying {card_label}")
-                    slot_coord = self._deck_pos_to_screen(event.deck_position)
-                    from game.card_actions import play_card
-                    played = False
-                    if self._bypass:
-                        play_card(slot_coordinate=slot_coord, target_coordinate=target,
-                                  card_name=event.name, bypass_mode=True)
-                        self._deck_played.add(event.deck_position)
-                        played = True
-                    else:
-                        from game.card_actions import shift_down, shift_up
-                        from game.screen_detection import take_screenshot, save_error_screenshot
-                        tray_configured = all([
-                            self._config.get("card_tray_center_x"),
-                            self._config.get("card_tray_card_width"),
-                            self._config.get("card_tray_card_y"),
-                        ])
-                        if tray_configured:
-                            shift_down()
-                            time.sleep(0.25)
-                            before = take_screenshot()
-                            for attempt in range(1, 3):
-                                if attempt > 1:
-                                    tts.speak_cable("Retrying")
-                                play_card(slot_coordinate=slot_coord, target_coordinate=target,
-                                          card_name=event.name, keep_shift=True)
-                                time.sleep(0.4)
-                                after = take_screenshot()
-                                if self._verify_card_removed(slot_coord, before, after):
-                                    self._deck_played.add(event.deck_position)
-                                    played = True
-                                    break
-                                logger.warning("Card '%s' not verified in tray (attempt %d/2)", event.name, attempt)
-                                if self._stop.is_set():
-                                    break
-                            if not played and not self._stop.is_set():
-                                logger.error("Card '%s' failed to play after 2 attempts", event.name)
-                                save_error_screenshot(f"card_play_failed_{event.name.replace(' ', '_').replace(':', '_')}")
-                            shift_up()
-                        else:
-                            if play_card(slot_coordinate=slot_coord, target_coordinate=target,
-                                         card_name=event.name):
-                                self._deck_played.add(event.deck_position)
-                                played = True
-                    if not self._stop.is_set():
-                        if played:
-                            ann = self._next_card_announce(next_event)
-                            if ann:
-                                tts.speak_cable(ann)
-                        else:
-                            tts.speak_cable(f"Sorry, failed to deploy {card_label}")
-                        if broadcast_open:
-                            tts.queue_close_broadcast()
+                    self._play_tray_card(event, target, card_label, next_event, broadcast_open)
         elif not event.drop_target:
             logger.warning("Card event '%s' has no drop_target configured — skipping", event.name)
         else:
@@ -535,64 +467,92 @@ class MatchRunner:
                     broadcast_open = tts.try_open_broadcast()
             if not self._stop.is_set():
                 tts.speak_cable(f"Deploying {card_label}")
-                slot_coord = self._deck_pos_to_screen(event.deck_position)
-                from game.card_actions import play_card
-                played = False
-                if self._bypass:
-                    play_card(slot_coordinate=slot_coord, target_coordinate=event.drop_target,
-                              card_name=event.name, bypass_mode=True)
-                    self._deck_played.add(event.deck_position)
-                    played = True
-                else:
-                    from game.card_actions import play_card, shift_down, shift_up
-                    from game.screen_detection import take_screenshot, save_error_screenshot
-                    tray_configured = all([
-                        self._config.get("card_tray_center_x"),
-                        self._config.get("card_tray_card_width"),
-                        self._config.get("card_tray_card_y"),
-                    ])
-                    if tray_configured:
-                        # Hold shift once for the entire attempt block:
-                        # before-screenshot → play → after-screenshot → [retry plays] → release.
-                        shift_down()
-                        time.sleep(0.25)
-                        before = take_screenshot()
-                        for attempt in range(1, 3):
-                            if attempt > 1:
-                                tts.speak_cable("Retrying")
-                            play_card(slot_coordinate=slot_coord, target_coordinate=event.drop_target,
-                                      card_name=event.name, keep_shift=True)
-                            time.sleep(0.4)
-                            after = take_screenshot()
-                            if self._verify_card_removed(slot_coord, before, after):
-                                self._deck_played.add(event.deck_position)
-                                played = True
-                                break
-                            logger.warning("Card '%s' not verified in tray (attempt %d/2)", event.name, attempt)
-                            if self._stop.is_set():
-                                break
-                        if not played and not self._stop.is_set():
-                            logger.error("Card '%s' failed to play after 2 attempts", event.name)
-                            save_error_screenshot(f"card_play_failed_{event.name.replace(' ', '_').replace(':', '_')}")
-                        shift_up()
-                    else:
-                        if play_card(slot_coordinate=slot_coord, target_coordinate=event.drop_target,
-                                     card_name=event.name):
-                            self._deck_played.add(event.deck_position)
-                            played = True
-
-                if not self._stop.is_set():
-                    if played:
-                        ann = self._next_card_announce(next_event)
-                        if ann:
-                            tts.speak_cable(ann)
-                    else:
-                        tts.speak_cable(f"Sorry, failed to deploy {card_label}")
-                    if broadcast_open:
-                        tts.queue_close_broadcast()
+                self._play_tray_card(event, event.drop_target, card_label, next_event, broadcast_open)
 
         next_label = next_event.name if next_event else "Match end polling"
         self._update(f"Played {event.name}", next_label)
+
+    def _play_tray_card(
+        self,
+        event: CardEvent,
+        target: tuple[int, int],
+        card_label: str,
+        next_event: Optional[CardEvent],
+        broadcast_open: bool,
+    ) -> None:
+        """
+        Shared play/verify/announce logic for zone-targeted, player-targeted, and plain
+        (fixed drop_target) cards — the only difference between those three cases is
+        how `target` was computed by the caller.
+
+        Three modes, checked in order:
+        - self._bypass (ahk_bypass_mode): dry run, logs and waits for Enter, never
+          touches the game.
+        - not self._verify_plays (verify_card_plays: false): plays once and trusts it
+          worked — no before/after screenshots, no retry loop.
+        - default: the original before/after tray-pixel verify with up to 2 attempts.
+        """
+        from game import tts
+        from game.card_actions import play_card
+
+        slot_coord = self._deck_pos_to_screen(event.deck_position)
+        played = False
+
+        if self._bypass:
+            play_card(slot_coordinate=slot_coord, target_coordinate=target,
+                      card_name=event.name, bypass_mode=True)
+            self._deck_played.add(event.deck_position)
+            played = True
+        elif not self._verify_plays:
+            play_card(slot_coordinate=slot_coord, target_coordinate=target, card_name=event.name)
+            self._deck_played.add(event.deck_position)
+            played = True
+        else:
+            from game.card_actions import shift_down, shift_up
+            from game.screen_detection import take_screenshot, save_error_screenshot
+            tray_configured = all([
+                self._config.get("card_tray_center_x"),
+                self._config.get("card_tray_card_width"),
+                self._config.get("card_tray_card_y"),
+            ])
+            if tray_configured:
+                # Hold shift once for the entire attempt block:
+                # before-screenshot → play → after-screenshot → [retry plays] → release.
+                shift_down()
+                time.sleep(0.25)
+                before = take_screenshot()
+                for attempt in range(1, 3):
+                    if attempt > 1:
+                        tts.speak_cable("Retrying")
+                    play_card(slot_coordinate=slot_coord, target_coordinate=target,
+                              card_name=event.name, keep_shift=True)
+                    time.sleep(0.4)
+                    after = take_screenshot()
+                    if self._verify_card_removed(slot_coord, before, after):
+                        self._deck_played.add(event.deck_position)
+                        played = True
+                        break
+                    logger.warning("Card '%s' not verified in tray (attempt %d/2)", event.name, attempt)
+                    if self._stop.is_set():
+                        break
+                if not played and not self._stop.is_set():
+                    logger.error("Card '%s' failed to play after 2 attempts", event.name)
+                    save_error_screenshot(f"card_play_failed_{event.name.replace(' ', '_').replace(':', '_')}")
+                shift_up()
+            else:
+                if play_card(slot_coordinate=slot_coord, target_coordinate=target, card_name=event.name):
+                    self._deck_played.add(event.deck_position)
+                    played = True
+
+        if not self._stop.is_set():
+            if played:
+                ann = self._next_card_announce(next_event)
+                if ann:
+                    tts.speak_cable(ann)
+            else:
+                tts.speak_cable(f"Sorry, failed to deploy {card_label}")
+            if broadcast_open:
+                tts.queue_close_broadcast()
 
     def _build_tts_phrases(self, card_schedule: list[CardEvent]) -> list[str]:
         """Return every TTS phrase this match might speak, for pre-caching."""
@@ -662,10 +622,55 @@ class MatchRunner:
 
     def _attempt_zone_close(self) -> bool:
         """
+        Drag the zone_close card to a single static drop area (zone_close_auto_drop_target
+        in config.json) that the game itself resolves to a random valid zone — the bot no
+        longer reads the zone map or picks a zone itself. Always "succeeds" once the drag
+        completes: there is no tray-pixel verification here regardless of verify_card_plays,
+        since the drop area handles zone validity on the game's side. Returns False only if
+        no zone_close card remains in the deck or the drop target isn't calibrated yet.
+
+        The old per-zone selection path (zone-map reading, ZoneState tracking, the
+        pluggable zone_selection_strategy system in zones/) is left in place, disconnected,
+        as _attempt_zone_close_legacy() below — not called from here, kept for reference/
+        rollback in case the new drop area needs to be abandoned.
+        """
+        from game import tts
+        from game.card_actions import play_card
+
+        deck_pos = self._next_available_deck_pos(self._positions_for_card_type("zone_close"))
+        if deck_pos is None:
+            logger.info("Zone close: no ZoneClose cards remaining")
+            return False
+
+        target = self._config.get("zone_close_auto_drop_target")
+        if not target:
+            logger.warning("Zone close: zone_close_auto_drop_target not calibrated — skipping")
+            return False
+
+        tts.speak_cable("Deploying Zone Close")
+        slot_coord = self._deck_pos_to_screen(deck_pos)
+
+        play_card(
+            slot_coordinate=slot_coord,
+            target_coordinate=tuple(target),
+            card_name="zone_close",
+            bypass_mode=self._bypass,
+        )
+        self._deck_played.add(deck_pos)
+        tts.speak_cable("Closing a zone")
+        self._update("Closed a zone", "Continue match")
+        return True
+
+    def _attempt_zone_close_legacy(self) -> bool:
+        """
         Every 30s: grab the zone_close card to reveal the big zone map, read zone states
         from multiple sample points per tile, pick the best zone, then play or cancel.
         In bypass mode, uses cached zone states (no grab possible without a real game).
         Returns True if a zone was successfully closed, False otherwise.
+
+        Superseded by _attempt_zone_close() above (2026-08-30) — kept, not deleted, in
+        case the new static drop-area approach needs to be rolled back. Not called from
+        anywhere; _fire_card_event() calls _attempt_zone_close() instead.
         """
         from game import tts
 
@@ -707,6 +712,26 @@ class MatchRunner:
         zones_to_try = list(valid_closeable_zones(self._zone_states))
         random.shuffle(zones_to_try)
         zone_drop_coords = self._config.get("zone_drop_coordinates", {})
+
+        if not self._verify_plays:
+            # verify_card_plays: false — single attempt, no pixel-delta check, no
+            # retry across zones. Picks one valid zone (still via the per-zone
+            # zone_drop_coordinates) and trusts the drag worked.
+            for zone_id in zones_to_try:
+                raw_target = zone_drop_coords.get(str(zone_id))
+                if not raw_target:
+                    continue
+                complete_drag(target_coordinate=tuple(raw_target), card_name=f"close_zone_{zone_id}")
+                self._zone_states[zone_id] = ZoneState.CLOSING
+                self._deck_played.add(deck_pos)
+                tts.speak_cable(f"Closing zone {zone_id}")
+                self._update(f"Closed zone {zone_id}", "Continue match")
+                return True
+            logger.warning("Zone close: no candidate zone had a calibrated drop coordinate")
+            _pag.mouseUp()
+            shift_up()
+            tts.speak_cable("Sorry, failed to close a zone")
+            return False
 
         center_x = self._config.get("card_tray_center_x")
         card_width = self._config.get("card_tray_card_width")
@@ -822,6 +847,23 @@ class MatchRunner:
                 logger.info("Zone %d: %s → %s", zone_id, self._zone_states.get(zone_id), state)
             self._zone_states[zone_id] = state
 
+    # Threshold for _verify_card_removed's single-pixel delta check. Lowered from 40
+    # (2026-08-28): log analysis across ~130k lines / months of matches showed a
+    # recurring false-negative band at delta 17-39 — always on the first tray-card
+    # play of the match or the first play right after a new card naturally unlocks
+    # (Electromania at 2:30, Beach Party at 4:00, Telepathy at 4:30/10:00), where the
+    # tray recenters and the slot pixel shifts to a different-but-similar card color
+    # instead of going stark. A missed verification here never gets the card's
+    # deck_position added to self._deck_played, so every later _deck_pos_to_screen()
+    # call computes one card-width off — the "tray out of sync" failure cascade
+    # (next card's play AND its verification both land on the wrong slot, usually
+    # reading near-zero delta since nothing meaningful is at that wrong pixel).
+    # Genuine non-plays across the same log are all delta <= 15 (mostly 0-3, one
+    # ambiguous 10); genuine clean detections are all delta >= 41. 16 sits in the
+    # untouched gap between the two, so this only reclassifies the confirmed
+    # false-negative band and leaves every previously-correct call unchanged.
+    _TRAY_VERIFY_DELTA_THRESHOLD = 16
+
     def _verify_card_removed(self, slot_coord: tuple, before_screenshot, after_screenshot) -> bool:
         """
         Compare the pixel at slot_coord between two shift-held screenshots.
@@ -839,15 +881,16 @@ class MatchRunner:
         bgr_after = after_screenshot[y_check, x_check]
         delta = int(sum(abs(int(a) - int(b)) for a, b in zip(bgr_before, bgr_after)))
 
+        threshold = self._TRAY_VERIFY_DELTA_THRESHOLD
         logger.info(
             "Tray verify: slot=(%d,%d) before=%s after=%s delta=%d — %s",
             x_check, y_check,
             tuple(int(v) for v in bgr_before),
             tuple(int(v) for v in bgr_after),
             delta,
-            "verified" if delta > 40 else "unchanged",
+            "verified" if delta > threshold else "unchanged",
         )
-        return delta > 40
+        return delta > threshold
 
     def _positions_for_card_type(self, card_type: str) -> list[int]:
         """Return all visual deck positions that contain cards of the given type."""
