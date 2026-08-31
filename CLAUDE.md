@@ -656,6 +656,7 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "ds_ingest_base_url": "https://darwinstalker.com",
     "ds_ingest_token": "",                // Bearer token, issued out of band — leave empty to skip ingest
     "ds_ingest_platform": "pc",           // "pc" | "xbox"
+    "ds_ingest_twitch_channel": "",       // Twitch channel name for the director's stream, forwarded to the darwinstalker ingest API's open-draft call so the ladder can link the draft to the live broadcast — omitted from the request entirely when unset/empty
 
     // Scrim signup system
     "scrim_signup_channel_id": "1520517054988419123",

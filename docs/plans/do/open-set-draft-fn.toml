@@ -1,0 +1,24 @@
+slug = "open-set-draft-fn"
+bucket = "do"
+status = "open"
+priority = "P1"
+effort = "S"
+source = "fable-review-2026-08-30"
+filed_at = 2026-08-31
+body = """
+Add open_set_draft() to game/ingest.py.
+
+- signature: open_set_draft(player_names, base_url, token, platform=\"pc\") -> int | None
+- filter empty/blank OCR names before sending: [n for n in player_names if n.strip()]
+- skip POST and return None if filtered list is empty
+- use 5s timeout (not the module default 30s — sits before the B-press at match start)
+- error handling: log warning, return None on any failure, never raise — matches post_results_screenshot pattern (ingest.py:44-51)
+- on 200: parse and return draft_id from response JSON
+- also add optional draft_id param to post_results_screenshot(draft_id: Optional[int] = None) — send as form field only when set (mirrors roster omit-when-None at ingest.py:41-42)"""
+
+[[notes]]
+date = 2026-08-31
+body = """
+ori, review: the server half of the draft_id threading needs no work — /api/ingest/screenshot has accepted an optional draft_id multipart field since before this was filed (darwin-stalker drafts.rs:567 field struct, :602 parse, :1083-1085 passed into target_draft, which validates status and rejects a cross-platform target at :90-111; documented at docs/INGEST.md:130). The companion darwin-stalker item accept-draft-id-on-screenshot has been dropped as already-implemented; it also cited a companion slug \"draft-id-screenshot-threading\" that never existed.
+
+So the draft_id param on post_results_screenshot in THIS item is real and still wanted — send it as a form field only when set, and the server will honour it. Nothing on the darwin-stalker side gates it."""

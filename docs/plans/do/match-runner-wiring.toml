@@ -1,0 +1,19 @@
+slug = "match-runner-wiring"
+bucket = "do"
+status = "open"
+priority = "P1"
+effort = "S"
+source = "fable-review-2026-08-30"
+filed_at = 2026-08-31
+body = """
+Wire open_set_draft into MatchRunner and thread draft_id back to the cog.
+
+game/match_runner.py:
+- add self._draft_id = None in __init__ (alongside _player_names, ~line 42-70) — NOT in run(), which can abort at line 86 before any assignment
+- in run(), immediately after _init_player_bar() (~line 92): call open_set_draft using self._config values (ds_ingest_base_url, ds_ingest_token, ds_ingest_platform), assign result to self._draft_id
+
+bot/discord_bot.py:
+- do NOT extend the run() return tuple — multiple early-return shapes exist (tuple vs bare string), normalized at 1318 and 1442
+- instead: runner local stays in scope after run() completes — read runner._draft_id there, pass as kwarg to _post_results_to_ingest(...)
+- add draft_id kwarg to _post_results_to_ingest (discord_bot.py:393) and forward in the executor lambda (discord_bot.py:410-414)
+- two call sites: discord_bot.py:1329 and 1453"""
