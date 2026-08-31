@@ -95,7 +95,7 @@ class MatchRunner:
         from game.ingest import open_set_draft
         ds_token = self._config.get("ds_ingest_token")
         if ds_token:
-            ds_base_url = self._config.get("ds_ingest_base_url", "https://ds.xdos.ai")
+            ds_base_url = self._config.get("ds_ingest_base_url", "https://darwinstalker.com")
             ds_platform = self._config.get("ds_ingest_platform", "pc")
             ds_twitch_channel = self._config.get("ds_ingest_twitch_channel")
             try:

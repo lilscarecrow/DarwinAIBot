@@ -53,18 +53,18 @@ def post_results_screenshot(
         with open(screenshot_path, "rb") as f:
             files = {"screenshot": (os.path.basename(screenshot_path), f, "image/png")}
             resp = requests.post(url, headers=headers, data=data, files=files, timeout=_TIMEOUT_SECONDS)
+
+        if resp.status_code == 200:
+            body = resp.json()
+            logger.info(
+                "ds.xdos.ai ingest ok: draft_id=%s game_index=%s ocr_error=%s",
+                body.get("draft_id"), body.get("game_index"), body.get("ocr_error"),
+            )
+        else:
+            logger.warning("ds.xdos.ai ingest failed: HTTP %d — %s", resp.status_code, resp.text[:300])
     except Exception as e:
         logger.warning("ds.xdos.ai ingest request failed: %s", e)
         return
-
-    if resp.status_code == 200:
-        body = resp.json()
-        logger.info(
-            "ds.xdos.ai ingest ok: draft_id=%s game_index=%s ocr_error=%s",
-            body.get("draft_id"), body.get("game_index"), body.get("ocr_error"),
-        )
-    else:
-        logger.warning("ds.xdos.ai ingest failed: HTTP %d — %s", resp.status_code, resp.text[:300])
 
 
 def open_set_draft(
@@ -104,15 +104,15 @@ def open_set_draft(
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=_OPEN_DRAFT_TIMEOUT_SECONDS)
+
+        if resp.status_code == 200:
+            body = resp.json()
+            draft_id = body.get("draft_id")
+            logger.info("ds.xdos.ai open-draft ok: draft_id=%s", draft_id)
+            return draft_id
+        else:
+            logger.warning("ds.xdos.ai open-draft failed: HTTP %d — %s", resp.status_code, resp.text[:300])
+            return None
     except Exception as e:
         logger.warning("ds.xdos.ai open-draft request failed: %s", e)
-        return None
-
-    if resp.status_code == 200:
-        body = resp.json()
-        draft_id = body.get("draft_id")
-        logger.info("ds.xdos.ai open-draft ok: draft_id=%s", draft_id)
-        return draft_id
-    else:
-        logger.warning("ds.xdos.ai open-draft failed: HTTP %d — %s", resp.status_code, resp.text[:300])
         return None

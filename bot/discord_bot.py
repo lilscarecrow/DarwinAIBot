@@ -408,7 +408,7 @@ class DirectorCog(commands.Cog):
         token = self.bot.config.get("ds_ingest_token")
         if not token:
             return
-        base_url = self.bot.config.get("ds_ingest_base_url", "https://ds.xdos.ai")
+        base_url = self.bot.config.get("ds_ingest_base_url", "https://darwinstalker.com")
         platform = self.bot.config.get("ds_ingest_platform", "pc")
         from game.ingest import post_results_screenshot
         loop = asyncio.get_running_loop()
