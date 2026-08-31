@@ -390,12 +390,18 @@ class DirectorCog(commands.Cog):
         except Exception as e:
             logger.warning("Could not delete recording %s: %s", path, e)
 
-    async def _post_results_to_ingest(self, results_text: str, roster: Optional[list[str]] = None):
+    async def _post_results_to_ingest(
+        self, results_text: str, roster: Optional[list[str]] = None, draft_id: Optional[int] = None,
+    ):
         """Best-effort push of the raw results screenshot to the ds.xdos.ai scrim ladder.
 
         roster: optional list of Discord ID strings for the players known to be in
         this match (captured from scrim signup reactions at /custom time). Passed
         through so the server can narrow its OCR prompt and fuzzy candidate pool.
+
+        draft_id: optional draft id from a prior open_set_draft() call (captured
+        on the MatchRunner during run()). Passed through so the server targets
+        that existing draft instead of creating a new one.
         """
         if not results_text.endswith(".png"):
             return
@@ -410,7 +416,7 @@ class DirectorCog(commands.Cog):
             await loop.run_in_executor(
                 None,
                 lambda: post_results_screenshot(
-                    results_text, base_url, token, platform, roster=roster,
+                    results_text, base_url, token, platform, roster=roster, draft_id=draft_id,
                 ),
             )
         except Exception as e:
@@ -1326,7 +1332,7 @@ class DirectorCog(commands.Cog):
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
-            await self._post_results_to_ingest(results_text, roster=_match_roster)
+            await self._post_results_to_ingest(results_text, roster=_match_roster, draft_id=runner._draft_id)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
@@ -1450,7 +1456,7 @@ class DirectorCog(commands.Cog):
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
-            await self._post_results_to_ingest(results_text, roster=_match_roster)
+            await self._post_results_to_ingest(results_text, roster=_match_roster, draft_id=runner._draft_id)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
