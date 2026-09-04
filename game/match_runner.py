@@ -67,6 +67,11 @@ class MatchRunner:
         self._minimap_cover_source = config.get("obs_minimap_cover_source", "Map Cover")
         self._minimap_cover_seconds = config.get("obs_minimap_cover_seconds", 120)
         self._minimap_uncovered = False
+        # Tournament mode (toggled via Discord's /tournament, config key tournament_mode):
+        # the minimap cover stays up for the entire match instead of revealing at
+        # _minimap_cover_seconds — see the main loop below, which skips the timed hide
+        # entirely when this is set.
+        self._tournament_mode = bool(config.get("tournament_mode", False))
         self._strategy = get_strategy(config.get("zone_selection_strategy", "weighted_outer"))
         self._zone_states: dict[int, str] = {i: ZoneState.OPEN for i in range(1, 8)}
         self._deck_played: set[int] = set()
@@ -194,8 +199,9 @@ class MatchRunner:
 
                 # Anti-cheat: uncover the minimap once the covered window has elapsed.
                 # One-shot — self._minimap_uncovered stops this from firing again on
-                # every subsequent loop iteration for the rest of the match.
-                if not self._minimap_uncovered and elapsed >= self._minimap_cover_seconds:
+                # every subsequent loop iteration for the rest of the match. Skipped
+                # entirely in tournament mode — the cover stays up the whole match.
+                if not self._tournament_mode and not self._minimap_uncovered and elapsed >= self._minimap_cover_seconds:
                     from game import obs_control
                     if obs_control.is_enabled():
                         obs_control.set_source_visible(self._minimap_cover_source, False)
@@ -348,14 +354,27 @@ class MatchRunner:
         Read current director points conservatively.
         Pips are always decremented by 1 to guard against a partially-filled pip being
         counted as full. OCR is used for cross-validation: if it agrees with pip-1, we
-        log as confirmed; otherwise pip-1 still wins as the safer value.
+        log as confirmed; if it's exactly one higher, the last pip is trusted as genuinely
+        full. On any other disagreement we take the lower of the two, not pip-1 unconditionally
+        — pip reads can be biased either direction (a partially-filled pip undercounts, but a
+        single bright background pixel at a pip's sample coordinate overcounts), so only the
+        lower reading is guaranteed safe against a false "enough points" pass, whichever source
+        it came from.
         Falls back to whichever source is available.
+
+        director_points_use_pips (config, default True) gates the pip path entirely — set to
+        False to read OCR alone. Added 2026-09-04: single-pixel brightness sampling at some pip
+        coordinates was catching bright background elements and over-reading, causing cards to
+        be attempted before enough points actually existed. The pip-reading code and the
+        director_points_pips calibration itself are both left in place (same "disconnected, not
+        deleted" precedent as zone_close's legacy per-zone logic) in case pip reading is
+        revisited later (e.g. multi-pixel voting instead of single-pixel sampling).
         """
         from game.ocr import count_director_point_pips, read_director_points
         pip_count = None
         ocr_count = None
 
-        pips_cfg = self._config.get("director_points_pips")
+        pips_cfg = self._config.get("director_points_pips") if self._config.get("director_points_use_pips", True) else None
         if pips_cfg:
             raw = count_director_point_pips(screenshot, pips_cfg)
             if raw is not None:
@@ -373,7 +392,12 @@ class MatchRunner:
                     logger.debug("Points: pip-1=%d ocr=%d — OCR confirms last pip full, trusting OCR", pip_count, ocr_count)
                     return ocr_count
                 else:
-                    logger.debug("Points: pip-1=%d ocr=%d — discrepancy, using pip-1", pip_count, ocr_count)
+                    safe = min(pip_count, ocr_count)
+                    logger.debug(
+                        "Points: pip-1=%d ocr=%d — discrepancy, using the lower reading (%d)",
+                        pip_count, ocr_count, safe,
+                    )
+                    return safe
             return pip_count
 
         return ocr_count

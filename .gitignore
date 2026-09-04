@@ -35,6 +35,9 @@ openh264-*.dll
 # TwitchIO's default OAuth token store (contains live access/refresh tokens)
 .tio.tokens.json
 
+# Saved console window position (machine-specific, see console_window.py)
+window_pos.json
+
 # Claude Code session data
 .claude/
 

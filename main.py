@@ -20,6 +20,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# obsws_python logs "Connecting with parameters: host='...' port=... password='...'"
+# at INFO level on every connect — that would print the websocket password in
+# plain text to the console and darwin_bot.log. Raise it to WARNING to suppress
+# that (and its other INFO/DEBUG noise) while still surfacing real errors.
+logging.getLogger("obsws_python").setLevel(logging.WARNING)
+
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -103,6 +109,11 @@ async def _run(config: dict, session: SessionState):
 
 def main():
     logger.info("Darwin Bot starting up")
+
+    import console_window
+    console_window.restore_position()
+    console_window.start_position_tracker()
+
     config = load_config()
 
     errors = validate_config(config)
@@ -128,6 +139,17 @@ def main():
         port=config.get("obs_websocket_port", 4455),
         password=config.get("obs_websocket_password", ""),
     )
+
+    # /say's profanity filter (bot/discord_bot.py) — tunable without a code change.
+    # tts_profanity_whitelist loosens it (exempt specific default-flagged words, e.g.
+    # a mild word this stream is fine with); tts_profanity_extra_words tightens it
+    # (block additional words/slang not in the library's default list). Both optional
+    # and empty by default — omitting them leaves the library's default word list as-is.
+    from better_profanity import profanity
+    profanity.load_censor_words(whitelist_words=config.get("tts_profanity_whitelist") or [])
+    extra_words = config.get("tts_profanity_extra_words") or []
+    if extra_words:
+        profanity.add_censor_words(extra_words)
 
     session = SessionState()
 

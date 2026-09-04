@@ -181,6 +181,10 @@ _MATCH_TIMEOUT  = 3600.0   # 60 min: safety net — real matches can exceed 20 m
 _LOBBY_PING_CHANNEL_ID = 1520520910006779915
 _LOBBY_PING_ROLE_ID = 1520526014600577134
 
+# Tournament mode (toggled via /tournament, persisted in config.json as tournament_mode):
+# delays /custom's OBS stream start by this long instead of going live instantly.
+_TOURNAMENT_STREAM_DELAY_SECONDS = 120
+
 # Embed accent colors
 _COLOR_OK      = 0x2ECC71  # green   — success
 _COLOR_FAIL    = 0xE74C3C  # red     — failure / error
@@ -431,6 +435,67 @@ class DirectorCog(commands.Cog):
         if self.bot.twitch_bot is not None:
             await self.bot.twitch_bot.announce(text)
 
+    async def _set_streaming_presence(self):
+        """Switch the Discord bot's own presence to the special purple 'Streaming'
+        status, linking to the Twitch channel. Discord only shows that indicator
+        when the activity's url matches a recognized twitch.tv/youtube.com watch
+        URL — a plain custom status text does not trigger it.
+
+        Reuses ds_ingest_twitch_channel (already the broadcaster's Twitch channel
+        name, set for the darwinstalker ladder-ingest link) instead of adding a
+        second config key for the same fact. No-ops if that key isn't set. Never
+        raises — same fire-and-forget convention as the rest of this integration.
+        """
+        channel = self.bot.config.get("ds_ingest_twitch_channel")
+        if not channel:
+            return
+        try:
+            await self.bot.change_presence(
+                activity=discord.Streaming(name="Darwin Project — AI Director Live", url=f"https://twitch.tv/{channel}")
+            )
+        except Exception as e:
+            logger.warning("Could not set Discord streaming presence: %s", e)
+
+    async def _clear_streaming_presence(self):
+        """Best-effort: revert the Discord bot's presence back to no activity.
+        Harmless to call even if a streaming presence was never set."""
+        try:
+            await self.bot.change_presence(activity=None)
+        except Exception as e:
+            logger.warning("Could not clear Discord streaming presence: %s", e)
+
+    async def _twitch_start_ad_break(self):
+        """Fire a Twitch ad break at match end, gated by twitch_ads_enabled (default
+        false — off until the broadcaster token is re-authorized with
+        channel:edit:commercial, see start_ad_break()'s docstring in twitch_bot.py).
+
+        Not awaited past the initial gate check — fired via ensure_future so the
+        actual Start Commercial API call runs concurrently with the MAIN MENU click
+        and the mirror/ingest work below, rather than adding to the delay before the
+        next match can be started. The whole point of firing here (at match end,
+        not later) is to give the ad the maximum runway to play out during the
+        downtime before /custom starts the next match.
+        """
+        if not self.bot.config.get("twitch_ads_enabled", False):
+            return
+        if self.bot.twitch_bot is None:
+            return
+        length = int(self.bot.config.get("twitch_ad_break_seconds", 180))
+        asyncio.ensure_future(self.bot.twitch_bot.start_ad_break(length))
+
+    async def _delayed_stream_start(self):
+        """Tournament mode: start the OBS stream _TOURNAMENT_STREAM_DELAY_SECONDS after
+        /custom creates the lobby, instead of instantly. Fire-and-forget — scheduled via
+        asyncio.ensure_future, not awaited by the caller, so this never blocks /custom's
+        response or the rest of its success-path work (announce, minimap cover, ping)."""
+        await asyncio.sleep(_TOURNAMENT_STREAM_DELAY_SECONDS)
+        from game import obs_control
+        loop = asyncio.get_running_loop()
+        started = await loop.run_in_executor(None, obs_control.start_stream)
+        logger.info("Tournament mode: delayed stream start %s", "succeeded" if started else "failed")
+        if started:
+            await self._set_streaming_presence()
+
     async def _mirror_results(self, results_text: str):
         """Post match results to the secondary guild channel."""
         _MIRROR_CHANNEL_ID = 1520509048540238015
@@ -451,6 +516,23 @@ class DirectorCog(commands.Cog):
                 await ch.send(embed=self._info("Match Complete", results_text))
         except Exception as e:
             logger.warning("Failed to post to mirror channel: %s", e)
+
+    def _persist_config_value(self, key: str, value) -> None:
+        """Write a single config key to both the in-memory config and config.json on
+        disk, preserving every other key. Same read-modify-write pattern as
+        ScrimCog._save_message_id(), just generalized to any key/value."""
+        self.bot.config[key] = value
+        import json as _json
+        try:
+            from pathlib import Path as _Path
+            cfg_path = _Path("config.json")
+            with cfg_path.open("r", encoding="utf-8") as f:
+                raw = _json.load(f)
+            raw[key] = value
+            with cfg_path.open("w", encoding="utf-8") as f:
+                _json.dump(raw, f, indent=4)
+        except Exception as e:
+            logger.warning("Could not persist config key %s: %s", key, e)
 
     def _ok(self, title: str, description: str = "") -> discord.Embed:
         return self._embed(title, description, color=_COLOR_OK)
@@ -548,6 +630,7 @@ class DirectorCog(commands.Cog):
         tts.stop()
         from game import obs_control
         obs_control.stop_stream()
+        asyncio.ensure_future(self._clear_streaming_presence())
         self.bot.session.reset()
 
     async def _role_check(self, interaction: discord.Interaction) -> bool:
@@ -822,9 +905,22 @@ class DirectorCog(commands.Cog):
             )
 
             from game import obs_control
+            tournament_mode = bool(self.bot.config.get("tournament_mode", False))
             stream_started = False
+            stream_status_text = None
             if obs_control.is_enabled():
-                stream_started = await loop.run_in_executor(None, obs_control.start_stream)
+                if tournament_mode:
+                    # Fire-and-forget: don't block /custom's response or anything else in
+                    # this flow on a 2-minute sleep. Whether the delayed start actually
+                    # succeeds isn't known yet at response time, hence the different
+                    # embed wording below (no "Live"/"Could not start" claim).
+                    asyncio.ensure_future(self._delayed_stream_start())
+                    stream_status_text = f"🕐 Starting in {_TOURNAMENT_STREAM_DELAY_SECONDS // 60} min (tournament mode)"
+                else:
+                    stream_started = await loop.run_in_executor(None, obs_control.start_stream)
+                    stream_status_text = "🔴 Live" if stream_started else "⚠️ Could not start (check OBS/websocket connection)"
+                    if stream_started:
+                        await self._set_streaming_presence()
 
             await self._twitch_announce(
                 "This is an automated Darwin Project scrim, run by the AI Director. "
@@ -839,11 +935,7 @@ class DirectorCog(commands.Cog):
             embed.add_field(name="Profile", value=_profile_label, inline=True)
             embed.add_field(name="Lobby Code", value=f"```{lobby_code}```", inline=False)
             if obs_control.is_enabled():
-                embed.add_field(
-                    name="Twitch Stream",
-                    value="🔴 Live" if stream_started else "⚠️ Could not start (check OBS/websocket connection)",
-                    inline=False,
-                )
+                embed.add_field(name="Twitch Stream", value=stream_status_text, inline=False)
             await interaction.followup.send(embed=embed)
 
             # Anti-cheat: cover the minimap as soon as the lobby exists, not just once
@@ -1379,6 +1471,10 @@ class DirectorCog(commands.Cog):
                 next_action="Returning to menu",
             )
 
+            # Fire the Twitch ad break as early as possible — see _twitch_start_ad_break()
+            # — so it has the whole post-match/spin-up window to play out.
+            await self._twitch_start_ad_break()
+
             # Click MAIN MENU right away — the game doesn't need to sit on the results
             # screen waiting for the Discord/API work below (mirror, ingest, screenshot
             # delete) to finish before moving on. The screenshot is already captured
@@ -1509,6 +1605,10 @@ class DirectorCog(commands.Cog):
                 next_action="Returning to menu",
             )
 
+            # Fire the Twitch ad break as early as possible — see _twitch_start_ad_break()
+            # — so it has the whole post-match/spin-up window to play out.
+            await self._twitch_start_ad_break()
+
             # Click MAIN MENU right away — the game doesn't need to sit on the results
             # screen waiting for the Discord/API work below (mirror, ingest, screenshot
             # delete) to finish before moving on. The screenshot is already captured
@@ -1625,8 +1725,17 @@ class DirectorCog(commands.Cog):
             )
             return
 
+        from better_profanity import profanity
+        if profanity.contains_profanity(message):
+            await interaction.response.send_message(
+                embed=self._fail("Message Blocked", "That message contains language that can't be spoken on stream."),
+                ephemeral=True,
+            )
+            return
+
         in_match = self.bot.session.state == BotState.MATCH_IN_PROGRESS
-        tts.speak(message, broadcast=in_match)
+        spoken_text = f"{interaction.user.display_name} said {message}"
+        tts.speak(spoken_text, broadcast=in_match)
         context_note = "via broadcast (G key)" if in_match else "via game voice chat"
         embed = self._ok("Director Says", f"_{message}_")
         embed.add_field(name="Sent by", value=interaction.user.display_name, inline=True)
@@ -1692,6 +1801,39 @@ class DirectorCog(commands.Cog):
             await interaction.response.send_message(embed=self._fail(
                 "POV Change Failed", "Could not send the keystroke — Darwin window not found."
             ))
+
+    # ------------------------------------------------------------------
+    # /tournament
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="tournament",
+        description="Toggle tournament mode: delayed stream start + minimap stays covered all match",
+    )
+    @app_commands.describe(enabled="Turn tournament mode on or off")
+    @app_commands.choices(enabled=[
+        app_commands.Choice(name="On", value=1),
+        app_commands.Choice(name="Off", value=0),
+    ])
+    async def tournament(self, interaction: discord.Interaction, enabled: app_commands.Choice[int]):
+        if not await self._role_check(interaction):
+            return
+
+        value = bool(enabled.value)
+        self._persist_config_value("tournament_mode", value)
+
+        if value:
+            description = (
+                f"Tournament mode is now **ON**.\n"
+                f"- `/custom`'s stream start is delayed {_TOURNAMENT_STREAM_DELAY_SECONDS // 60} minutes "
+                f"instead of going live instantly.\n"
+                f"- The minimap cover stays up for the entire match instead of revealing "
+                f"{self.bot.config.get('obs_minimap_cover_seconds', 120)}s in."
+            )
+        else:
+            description = "Tournament mode is now **OFF** — normal instant stream start and timed minimap reveal."
+
+        await interaction.response.send_message(embed=self._ok("Tournament Mode", description))
 
     # ------------------------------------------------------------------
     # /quit
@@ -1968,6 +2110,44 @@ class ScrimCog(commands.Cog):
             except Exception as e:
                 logger.warning("Could not remove reaction for %s: %s", user, e)
 
+    async def _delete_and_repost_signup_message(self) -> None:
+        """Delete the current signup message and post a fresh one via
+        _ensure_signup_message(), instead of clearing its reaction in place.
+
+        This exists specifically for /role remove. Two approaches were tried before
+        landing here:
+        - The original per-user removal loop (_clear_real_reactions, still used by the
+          1-hour reset timer) left a race window — many sequential awaits during which
+          a player re-reacting mid-loop, or an individual removal silently failing
+          under Discord rate limits, could leave a stale checkmark behind.
+        - A bulk clear_reaction() + add_reaction() closed that race (two calls total,
+          no per-user loop) but introduced a different problem: clear_reaction() fires
+          MESSAGE_REACTION_REMOVE_EMOJI rather than a per-user MESSAGE_REACTION_REMOVE,
+          and some Discord clients don't fully refresh their cached "who reacted"
+          hover-list off that event — stale names could linger visually (server-side
+          state was correct; _reactors() always hits the API fresh) even though the
+          reaction was genuinely cleared.
+
+        Deleting and reposting sidesteps both: there is no per-user loop to race, and
+        a brand-new message can't carry any stale reaction cache. Trade-off: a new
+        message appears in the channel (and gets a new tracked ID, handled the same
+        way _ensure_signup_message() already handles "the tracked message was
+        deleted") each time /role remove runs, instead of a quiet in-place reset.
+
+        No raw reaction-remove events fire for a deleted message, so — same as the
+        bulk-clear approach before it — _signup_order and the reset timer are reset
+        manually here rather than relying on on_raw_reaction_remove's usual bookkeeping.
+        """
+        message = await self._get_signup_message()
+        if message is not None:
+            try:
+                await message.delete()
+            except Exception as e:
+                logger.warning("Could not delete signup message for repost: %s", e)
+        self._signup_order.clear()
+        self._cancel_reset_timer()
+        await self._ensure_signup_message()
+
     async def _reactors(self, message: discord.Message) -> list[discord.Member]:
         """Return all non-bot members who reacted with the signup emoji (excludes this bot's own seed reaction)."""
         emoji = self._emoji()
@@ -2123,7 +2303,7 @@ class ScrimCog(commands.Cog):
         second_lobby = reactors[10:20] if player_role_2 else []
         overflow_unassigned = len(reactors) > 10 and player_role_2 is None
 
-        async def _assign(users: list, role: discord.Role) -> tuple[list[str], list[str]]:
+        async def _assign(users: list, role: discord.Role) -> tuple[list[discord.Member], list[str]]:
             assigned, skipped = [], []
             for user in users:
                 member = guild.get_member(user.id)
@@ -2136,28 +2316,31 @@ class ScrimCog(commands.Cog):
                 if role not in member.roles:
                     try:
                         await member.add_roles(role, reason="Scrim signup")
-                        assigned.append(member.display_name)
+                        assigned.append(member)
                     except Exception as e:
                         logger.warning("Could not assign scrim role to %s: %s", member, e)
                         skipped.append(member.display_name)
                 else:
-                    assigned.append(member.display_name)  # already has it, count as success
+                    assigned.append(member)  # already has it, count as success
             return assigned, skipped
 
         assigned, skipped = await _assign(first_lobby, player_role)
         lines = [f"Assigned **{player_role_name}** to {len(assigned)} player(s)."]
         if assigned:
-            lines.append(", ".join(assigned))
+            lines.append(", ".join(m.display_name for m in assigned))
         if skipped:
             lines.append(f"Could not assign to: {', '.join(skipped)}")
+
+        all_assigned = list(assigned)
 
         if second_lobby:
             assigned_2, skipped_2 = await _assign(second_lobby, player_role_2)
             lines.append(f"Assigned **{player_role_2_name}** to {len(assigned_2)} player(s).")
             if assigned_2:
-                lines.append(", ".join(assigned_2))
+                lines.append(", ".join(m.display_name for m in assigned_2))
             if skipped_2:
                 lines.append(f"Could not assign to: {', '.join(skipped_2)}")
+            all_assigned += assigned_2
 
         if overflow_unassigned:
             extra = len(reactors) - 10
@@ -2168,7 +2351,35 @@ class ScrimCog(commands.Cog):
         elif len(reactors) > 20:
             lines.append(f"{len(reactors) - 20} additional signup(s) beyond 20 were not assigned.")
 
+        region_table = self._build_region_table(all_assigned)
+        if region_table:
+            lines.append(region_table)
+
         await interaction.followup.send("\n".join(lines))
+
+    def _build_region_table(self, members: list[discord.Member]) -> str:
+        """Monospace table of assigned players and whether each holds the NA/EU region
+        role, so an admin can see at a glance which server region the lobby should use.
+        Role names come from region_role_na/region_role_eu (config, default 'NA'/'EU').
+        Returns '' if there's nothing to show (no members, or neither role exists)."""
+        if not members:
+            return ""
+        guild = members[0].guild
+        na_role_name = self._cfg("region_role_na", "NA")
+        eu_role_name = self._cfg("region_role_eu", "EU")
+        na_role = discord.utils.get(guild.roles, name=na_role_name) if na_role_name else None
+        eu_role = discord.utils.get(guild.roles, name=eu_role_name) if eu_role_name else None
+        if na_role is None and eu_role is None:
+            return ""
+
+        name_width = max(len("Player"), max(len(m.display_name) for m in members))
+        header = f"{'Player'.ljust(name_width)}  NA  EU"
+        rows = [header, "-" * len(header)]
+        for m in members:
+            has_na = "X" if na_role and na_role in m.roles else "-"
+            has_eu = "X" if eu_role and eu_role in m.roles else "-"
+            rows.append(f"{m.display_name.ljust(name_width)}  {has_na.center(2)}  {has_eu.center(2)}")
+        return "**Region Breakdown:**\n```\n" + "\n".join(rows) + "\n```"
 
     @role_group.command(name="remove", description="Remove one lobby's scrim player role and its reactions")
     @app_commands.describe(lobby="Which lobby to clear — 1 (scrim_player_role) or 2 (scrim_player_role_2)")
@@ -2186,6 +2397,7 @@ class ScrimCog(commands.Cog):
         await interaction.response.defer()
 
         role_key = "scrim_player_role" if lobby.value == 1 else "scrim_player_role_2"
+        other_key = "scrim_player_role_2" if lobby.value == 1 else "scrim_player_role"
         role_name = self._cfg(role_key, "")
         if not role_name:
             await interaction.followup.send(f"No `{role_key}` set in config.json.")
@@ -2203,6 +2415,14 @@ class ScrimCog(commands.Cog):
             await interaction.followup.send(f"Nobody currently has the **{role_name}** role.")
             return
 
+        # The delete-and-repost below (_delete_and_repost_signup_message) clears BOTH
+        # lobbies' signups at once — check now, before anything changes, whether the
+        # other lobby still has active players so we can warn the admin their
+        # reactions are about to go too.
+        other_role_name = self._cfg(other_key, "")
+        other_role = discord.utils.get(guild.roles, name=other_role_name) if other_role_name else None
+        other_lobby_active = bool(other_role and other_role.members)
+
         removed, failed = [], []
         for member in members:
             try:
@@ -2212,16 +2432,18 @@ class ScrimCog(commands.Cog):
                 logger.warning("Could not remove scrim role from %s: %s", member, e)
                 failed.append(member.display_name)
 
-        # Only this lobby's reactions come off the signup message — the other lobby's
-        # players (if any) keep theirs untouched. Removing a reaction here fires a real
-        # MESSAGE_REACTION_REMOVE event per user, which on_raw_reaction_remove already
-        # handles (prunes _signup_order, cancels the reset timer once the queue is
-        # fully empty across both lobbies) — no extra bookkeeping needed here.
-        message = await self._get_signup_message()
-        if message is not None:
-            await self._clear_real_reactions(message, members)
+        # Delete and repost the signup message rather than clearing its reaction in
+        # place — see _delete_and_repost_signup_message() for why (avoids both the old
+        # per-user race and bulk-clear's stale client-side "who reacted" display).
+        await self._delete_and_repost_signup_message()
 
         lines = [f"Removed **{role_name}** from {len(removed)} member(s)."]
         if failed:
             lines.append(f"Could not remove from: {', '.join(failed)}")
+        lines.append("All signup reactions were reset — everyone will need to react again to rejoin the queue.")
+        if other_lobby_active:
+            lines.append(
+                f"⚠️ **{other_role_name}** still has active players — their reactions were cleared too, "
+                f"so they'll need to react again as well."
+            )
         await interaction.followup.send("\n".join(lines))
