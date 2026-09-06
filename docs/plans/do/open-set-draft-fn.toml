@@ -1,10 +1,13 @@
 slug = "open-set-draft-fn"
 bucket = "do"
-status = "open"
+status = "done"
 priority = "P1"
 effort = "S"
 source = "fable-review-2026-08-30"
 filed_at = 2026-08-31
+landed = "8ada1b0"
+landed_via = "commit"
+landed_at = 2026-08-31
 body = """
 Add open_set_draft() to game/ingest.py.
 

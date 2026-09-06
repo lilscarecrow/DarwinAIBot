@@ -1,10 +1,13 @@
 slug = "match-runner-wiring"
 bucket = "do"
-status = "open"
+status = "done"
 priority = "P1"
 effort = "S"
 source = "fable-review-2026-08-30"
 filed_at = 2026-08-31
+landed = "8ada1b0"
+landed_via = "commit"
+landed_at = 2026-08-31
 body = """
 Wire open_set_draft into MatchRunner and thread draft_id back to the cog.
 
