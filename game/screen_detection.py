@@ -217,7 +217,7 @@ def detect_current_screen(threshold: float = 0.8) -> str | None:
     screenshot = take_screenshot()
     for screen_name, template_path in _SCREEN_SIGNATURES:
         if find_template(screenshot, template_path, threshold):
-            logger.info("Screen detected: %s", screen_name)
+            logger.debug("Screen detected: %s", screen_name)
             return screen_name
-    logger.info("Screen detection: no known screen matched")
+    logger.debug("Screen detection: no known screen matched")
     return None

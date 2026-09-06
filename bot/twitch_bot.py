@@ -11,6 +11,12 @@ logger = logging.getLogger(__name__)
 
 _VALID_POV_KEYS = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
 
+# How long _resubscribe_missing() waits after a reconnect before checking which
+# subscriptions are enabled — gives TwitchIO's own internal resubscribe-on-reconnect
+# time to finish first (observed taking a few seconds for 6 subscriptions), so we're
+# checking real post-migration state rather than racing it.
+_RESUBSCRIBE_GRACE_SECONDS = 8
+
 # Global cooldown between channel-points-triggered POV changes from regular viewers
 # (see event_custom_redemption_add). Does not apply to /pov or !pov — both are
 # already mod/admin-gated with no cooldown, and mods/the broadcaster bypass this
@@ -50,6 +56,18 @@ class DarwinTwitchBot(commands.Bot):
         # monotonic timestamp: channel-points POV redemptions from non-mods are
         # rejected (refunded) until this passes — see event_custom_redemption_add.
         self._pov_redemption_available_at: float = 0.0
+        # True once the first EventSub websocket welcome has been seen — see
+        # event_websocket_welcome(): setup_hook() already subscribes on that first
+        # one, so re-subscribing there too would just race it and log a harmless but
+        # noisy 409 on every single startup. Only welcomes after the first (i.e.
+        # genuine reconnects) trigger the resubscribe safety net.
+        self._seen_first_welcome: bool = False
+        # Set once setup_hook() finishes its initial subscribe pass — main.py's
+        # startup summary waits on this to report whether Twitch actually connected.
+        # chat_subscribed / events_subscribed hold that pass's outcome for the report.
+        self.startup_done = asyncio.Event()
+        self.chat_subscribed: bool = False
+        self.events_subscribed: tuple[int, int] = (0, 0)  # (succeeded, attempted)
         super().__init__(
             client_id=config["twitch_client_id"],
             client_secret=config["twitch_client_secret"],
@@ -67,23 +85,79 @@ class DarwinTwitchBot(commands.Bot):
         # would never reach the point of completing that OAuth step. The
         # subscription is retried in event_oauth_authorized() once a token actually
         # gets granted, so a fresh setup completes itself automatically.
-        await self._subscribe_chat()
-        await self._subscribe_events()
+        self.chat_subscribed = await self._subscribe_chat()
+        self.events_subscribed = await self._subscribe_events()
+        self.startup_done.set()
         logger.info("Twitch bot: setup complete, listening for !pov")
 
-    async def _subscribe_chat(self) -> None:
+    async def event_websocket_welcome(self, payload) -> None:
+        """Fires on every new EventSub websocket session — the initial connect AND
+        every reconnect. Skips the very first welcome (setup_hook() already
+        subscribes at that exact moment); every welcome after that is a genuine
+        reconnect, handled by _resubscribe_missing() below.
+        """
+        if not self._seen_first_welcome:
+            self._seen_first_welcome = True
+            return
+        await self._resubscribe_missing()
+
+    async def _resubscribe_missing(self) -> None:
+        """Reconnect safety net for event_websocket_welcome().
+
+        An earlier version of this called _subscribe_chat()/_subscribe_events()
+        unconditionally on every reconnect. That was found live to double every
+        !pov reply, sub/cheer shoutout, and channel-points action: TwitchIO's own
+        client already tries to migrate subscriptions to the new session on every
+        reconnect internally, and blindly creating ours again raced that attempt.
+        Once the old session's subscriptions are gone (the normal case — Twitch
+        auto-revokes websocket-transport subscriptions when their connection
+        closes), both the internal attempt and ours look like a fresh,
+        non-conflicting creation, so both can succeed independently — leaving two
+        live subscriptions for the same event instead of one.
+
+        Fix: wait for TwitchIO's own attempt to finish, then check what's actually
+        enabled before creating anything. Only subscription types that are missing
+        get (re-)created — this is what actually recovers from the original failure
+        mode (the internal migration 400ing and never being retried) without
+        risking a duplicate when the internal migration already worked, which is
+        the common case.
+        """
+        await asyncio.sleep(_RESUBSCRIBE_GRACE_SECONDS)
+
+        enabled_types: set[str] | None = set()
+        try:
+            result = await self.fetch_eventsub_subscriptions(token_for=self.owner_id, user_id=self.owner_id)
+            async for sub in result.subscriptions:
+                if sub.status == "enabled":
+                    enabled_types.add(sub.type)
+        except Exception as e:
+            logger.warning(
+                "Twitch bot: could not check existing EventSub subscriptions after reconnect (%s) — "
+                "resubscribing to everything as a fallback (may briefly duplicate events "
+                "if the migration actually succeeded).",
+                e,
+            )
+            enabled_types = None  # None means "couldn't check — assume nothing is enabled"
+
+        if enabled_types is None or "channel.chat.message" not in enabled_types:
+            await self._subscribe_chat()
+        await self._subscribe_events(skip_types=enabled_types)
+
+    async def _subscribe_chat(self) -> bool:
         try:
             payload = eventsub.ChatMessageSubscription(broadcaster_user_id=self.owner_id, user_id=self.bot_id)
             await self.subscribe_websocket(payload=payload)
             logger.info("Twitch bot: subscribed to chat messages")
+            return True
         except Exception as e:
             logger.warning(
                 "Twitch bot: could not subscribe to chat yet (%s) — visit %s "
                 "to authorize; the subscription completes automatically afterward.",
                 e, _OAUTH_URL,
             )
+            return False
 
-    async def _subscribe_events(self) -> None:
+    async def _subscribe_events(self, *, skip_types: set[str] | None = None) -> tuple[int, int]:
         """Subscribe to the non-chat EventSub types this bot reacts to: subs, gift
         subs, resub messages, cheers, and channel-points redemptions. Each one
         subscribes independently (its own try/except) so a scope that hasn't been
@@ -92,6 +166,14 @@ class DarwinTwitchBot(commands.Bot):
         Retried the same way as chat — best-effort here on startup (harmlessly
         failing pre-authorization) and again from event_oauth_authorized() once a
         token is actually granted, so nothing needs a restart once the scopes land.
+
+        skip_types: subscription type strings (e.g. "channel.cheer") to leave alone
+        because _resubscribe_missing() already confirmed they're enabled. None (the
+        default, used by setup_hook()/event_oauth_authorized()) subscribes to all of
+        them unconditionally, since nothing can already exist at those call sites.
+
+        Returns (succeeded, attempted) counting only the ones actually attempted
+        (skipped ones count toward neither) — main.py's startup summary uses this.
         """
         subs = (
             (eventsub.ChannelSubscribeSubscription(broadcaster_user_id=self.owner_id), "new subs"),
@@ -100,15 +182,22 @@ class DarwinTwitchBot(commands.Bot):
             (eventsub.ChannelCheerSubscription(broadcaster_user_id=self.owner_id), "cheers"),
             (eventsub.ChannelPointsRedeemAddSubscription(broadcaster_user_id=self.owner_id), "channel points redemptions"),
         )
+        succeeded = 0
+        attempted = 0
         for sub_payload, label in subs:
+            if skip_types and sub_payload.type in skip_types:
+                continue
+            attempted += 1
             try:
                 await self.subscribe_websocket(payload=sub_payload)
                 logger.info("Twitch bot: subscribed to %s", label)
+                succeeded += 1
             except Exception as e:
                 logger.warning(
                     "Twitch bot: could not subscribe to %s yet (%s) — visit %s to authorize.",
                     label, e, _OAUTH_URL,
                 )
+        return succeeded, attempted
 
     async def event_oauth_authorized(self, payload: UserTokenPayload) -> None:
         await super().event_oauth_authorized(payload)

@@ -35,6 +35,9 @@ openh264-*.dll
 # TwitchIO's default OAuth token store (contains live access/refresh tokens)
 .tio.tokens.json
 
+# darwinstalker.com ingest API spec (external doc, not source)
+SHOW_DIRECTOR_HANDOFF.md
+
 # Saved console window position (machine-specific, see console_window.py)
 window_pos.json
 

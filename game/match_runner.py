@@ -83,6 +83,15 @@ class MatchRunner:
         self._player_names: list[str] = []
         self._player_alive: list[bool] = []
         self._first_blood_logged: bool = False
+        # Latest confirmed director-points reading — see _update_points_reading().
+        # Sampled continuously throughout the match (main loop, every
+        # screen_poll_interval_seconds) as well as reactively in _wait_for_points(),
+        # so a card that needs to check affordability usually already has a recent
+        # confirmed value instead of needing a fresh read at that exact moment.
+        # Invalidated (set back to None) immediately after every card play attempt in
+        # _fire_card_event(), since a real decrease is expected right then.
+        self._last_confirmed_points: Optional[int] = None
+        self._last_points_sample_time: float = 0.0
         from game.deck_utils import deck_layout_from_state
         live_layout = deck_layout_from_state()
         self._deck_layout: list[str] = live_layout if live_layout else config.get("deck_layout", [])
@@ -210,6 +219,22 @@ class MatchRunner:
                 if not self._first_blood_logged and self._player_slot_xs:
                     from game.screen_detection import take_screenshot as _take_ss
                     self._poll_player_bar(_take_ss())
+
+                # Continuously sample director points throughout the match, not just
+                # reactively when a card is about to fire — a small, steady cost (one
+                # screenshot + OCR read every poll_interval) that means _wait_for_points()
+                # usually already has a recent confirmed value to check against instead
+                # of needing a fresh, possibly-failed read at the exact moment a card
+                # needs to check affordability. Same ratchet-up guard as everywhere else
+                # (see _update_points_reading) — a bad read here is disregarded, not
+                # trusted, so this can only ever raise confidence, never lower it.
+                if self._config.get("director_points_pips") or self._config.get("director_points_region"):
+                    now_ts = time.monotonic()
+                    if now_ts - self._last_points_sample_time >= poll_interval:
+                        from game.screen_detection import take_screenshot as _take_ss2
+                        sample = self._read_points(_take_ss2())
+                        self._update_points_reading(sample, "background poll")
+                        self._last_points_sample_time = now_ts
 
                 # Sleep until the next card trigger, but no longer than poll_interval
                 now = time.monotonic()
@@ -396,9 +421,40 @@ class MatchRunner:
 
         return ocr_count
 
+    def _update_points_reading(self, current: Optional[int], context: str) -> Optional[int]:
+        """Merge a fresh points read into self._last_confirmed_points with a ratchet-up
+        guard: a failed read (None), or one that comes back lower than the last
+        confirmed value, is treated as noise (a transient OCR misread) and disregarded
+        rather than trusted — the confirmed value only ever moves up from an actual
+        higher reading. It never moves down on its own, because points only decrease
+        when this bot plays a card, and that path (_fire_card_event) explicitly
+        invalidates the confirmed value first so the next read — whatever it is — is
+        trusted as the new baseline instead of being compared against a now-stale one.
+
+        Returns the resulting confirmed value (possibly unchanged).
+        """
+        if current is None:
+            logger.debug("Points read failed (%s) — keeping last known value (%s)", context, self._last_confirmed_points)
+        elif self._last_confirmed_points is None or current >= self._last_confirmed_points:
+            self._last_confirmed_points = current
+        else:
+            logger.debug(
+                "Points read %d (%s) is lower than last known good %d — disregarding as a misread",
+                current, context, self._last_confirmed_points,
+            )
+        return self._last_confirmed_points
+
     def _wait_for_points(self, needed: int, card_name: str,
                          broadcast_open: bool = False, card_label: str = "") -> bool:
         """Block until the director has enough points. No-op if neither pip nor OCR config is set.
+
+        Never fails open on a bad read — "ready" is only ever declared off
+        self._last_confirmed_points (see _update_points_reading), which is fed both by
+        this loop's own reads and by the main loop's continuous background sampling, so
+        a card usually already has a recent confirmed value to check against instead of
+        needing a fresh read at the exact moment it fires. Found live: a single failed
+        read used to make this return immediately as if points were sufficient, and the
+        card would then be attempted without actually having enough.
 
         If broadcast_open and we actually need to wait, announces 'Waiting on points for X'
         async and immediately closes the broadcast so the 90s cooldown starts ticking.
@@ -412,13 +468,13 @@ class MatchRunner:
         closed_broadcast = False
         while not self._stop.is_set():
             current = self._read_points(take_screenshot())
-            if current is None:
-                logger.warning("Points read failed for '%s' — proceeding anyway", card_name)
+            confirmed = self._update_points_reading(current, card_name)
+
+            if confirmed is not None and confirmed >= needed:
+                logger.info("Points ready for '%s': %d/%d", card_name, confirmed, needed)
                 return closed_broadcast
-            if current >= needed:
-                logger.info("Points ready for '%s': %d/%d", card_name, current, needed)
-                return closed_broadcast
-            logger.info("Waiting for points: have %d, need %d for '%s'", current, needed, card_name)
+
+            logger.info("Waiting for points: have %s, need %d for '%s'", confirmed, needed, card_name)
             if not closed_broadcast and card_label:
                 from game import tts as _tts
                 _tts.speak_cable(f"Waiting on points for {card_label}")
@@ -578,6 +634,11 @@ class MatchRunner:
                     played = True
 
         if not self._stop.is_set():
+            # A real points decrease is likely now (a play attempt was just made,
+            # whether or not it verified) — invalidate the confirmed reading so the
+            # next read, whatever it is, becomes the new trusted baseline instead of
+            # being compared against a now-stale pre-attempt value.
+            self._last_confirmed_points = None
             if played:
                 ann = self._next_card_announce(next_event)
                 if ann:
@@ -690,7 +751,15 @@ class MatchRunner:
             bypass_mode=self._bypass,
         )
         self._deck_played.add(deck_pos)
-        tts.speak_cable("Closing a zone")
+        # See the matching comment in _play_tray_card() — a real points decrease is
+        # likely now, so invalidate the confirmed reading rather than let a later wait
+        # trust a now-stale pre-play value.
+        self._last_confirmed_points = None
+        # No "Closing a zone" TTS confirmation here (2026-09-06) — this drag is never
+        # verified regardless of verify_card_plays (the drop area handles zone validity
+        # on the game's side, see the docstring above), so that line always spoke as if
+        # confirmed even though nothing was actually checked. "Deploying Zone Close"
+        # above still announces the attempt; nothing here claims it worked.
         self._update("Closed a zone", "Continue match")
         return True
 

@@ -65,6 +65,54 @@ def validate_config(config: dict) -> list[str]:
     return errors
 
 
+_STARTUP_SUMMARY_TIMEOUT_SECONDS = 30.0
+
+
+async def _log_startup_summary(discord_bot, twitch_bot, config: dict) -> None:
+    """Waits for each service to report ready (or times out) and logs one clear,
+    easy-to-grep block so it's obvious whether the bot came up fully connected or
+    something specific failed — the individual connect/subscribe attempts already
+    log their own detail above this; this is just the at-a-glance summary.
+    """
+    from game import obs_control
+
+    try:
+        await asyncio.wait_for(discord_bot.startup_done.wait(), timeout=_STARTUP_SUMMARY_TIMEOUT_SECONDS)
+        discord_line = f"Discord: OK (logged in as {discord_bot.user})"
+    except asyncio.TimeoutError:
+        discord_line = "Discord: TIMED OUT — did not finish connecting (see errors above)"
+
+    twitch_enabled = config.get("twitch_enabled", False)
+    if not twitch_enabled:
+        twitch_lines = ["Twitch: disabled (twitch_enabled is false)"]
+    elif twitch_bot is None:
+        twitch_lines = ["Twitch: FAILED — bot crashed before setup completed (see errors above)"]
+    else:
+        try:
+            await asyncio.wait_for(twitch_bot.startup_done.wait(), timeout=_STARTUP_SUMMARY_TIMEOUT_SECONDS)
+            chat_status = "OK" if twitch_bot.chat_subscribed else "FAILED (see warning above)"
+            ok_n, total_n = twitch_bot.events_subscribed
+            events_status = f"{ok_n}/{total_n} OK" if total_n else "OK"
+            if ok_n < total_n:
+                events_status += " — see warnings above"
+            twitch_lines = [
+                f"Twitch chat (!pov): {chat_status}",
+                f"Twitch events (subs/cheers/channel points): {events_status}",
+            ]
+        except asyncio.TimeoutError:
+            twitch_lines = ["Twitch: TIMED OUT — setup did not finish (see errors above)"]
+
+    obs_check = obs_control.last_check_ok()
+    if obs_check is None:
+        obs_line = "OBS: disabled (obs_stream_enabled is false)"
+    else:
+        obs_line = "OBS: OK (see connection check above)" if obs_check else "OBS: FAILED (see warning above)"
+
+    lines = ["=== Startup Summary ===", discord_line, *twitch_lines, obs_line, "========================"]
+    for line in lines:
+        logger.info(line)
+
+
 async def _run(config: dict, session: SessionState):
     from bot.discord_bot import DarwinBot
     discord_bot = DarwinBot(config=config, session=session)
@@ -89,10 +137,14 @@ async def _run(config: dict, session: SessionState):
                 await asyncio.gather(
                     discord_bot.start(config["discord_bot_token"]),
                     _run_twitch(twitch_bot),
+                    _log_startup_summary(discord_bot, twitch_bot, config),
                 )
         else:
             logger.info("Connecting to Discord...")
-            await discord_bot.start(config["discord_bot_token"])
+            await asyncio.gather(
+                discord_bot.start(config["discord_bot_token"]),
+                _log_startup_summary(discord_bot, None, config),
+            )
     finally:
         # aiohttp's SSL connections need a moment to finish their own async teardown
         # after close() returns — without this, asyncio.run() closes the event loop
@@ -139,6 +191,7 @@ def main():
         port=config.get("obs_websocket_port", 4455),
         password=config.get("obs_websocket_password", ""),
     )
+    obs_control.check_connection()
 
     # /say's profanity filter (bot/discord_bot.py) — tunable without a code change.
     # tts_profanity_whitelist loosens it (exempt specific default-flagged words, e.g.

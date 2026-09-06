@@ -177,6 +177,13 @@ _LAUNCH_TIMEOUT = 420.0    # 7 min: game start + splash + menu detection (slow H
 _CUSTOM_TIMEOUT = 180.0    # 3 min: menu navigation to lobby (lobby load can be slow)
 _MATCH_TIMEOUT  = 3600.0   # 60 min: safety net — real matches can exceed 20 min
 
+# Ceiling for a single Discord API call (fetch channel/message, send, delete, add
+# reaction) in the scrim signup message lifecycle. Found live: a stalled/dead
+# connection left one of these hanging for 7+ minutes with the /role remove
+# interaction stuck "thinking" the whole time — asyncio.wait_for() at this ceiling
+# turns that into a clear, fast failure instead of an indefinite hang.
+_DISCORD_API_TIMEOUT_SECONDS = 15.0
+
 # Lobby-ready ping: posted to this channel, pinging this role, when /custom captures a lobby code.
 # Hardcoded like _AI_DIRECTOR_CHANNEL_ID below — update in code, not config, if the guild changes.
 _LOBBY_PING_CHANNEL_ID = 1520520910006779915
@@ -298,6 +305,9 @@ class DarwinBot(commands.Bot):
         # DirectorCog checks this before every announce() call, so it's always safe to
         # leave unset/None when the Twitch bot isn't configured.
         self.twitch_bot = None
+        # Set once on_ready() fires — main.py's startup summary waits on this to
+        # report whether Discord actually finished connecting.
+        self.startup_done = asyncio.Event()
 
     async def setup_hook(self):
         cog = DirectorCog(self)
@@ -324,6 +334,7 @@ class DarwinBot(commands.Bot):
         logger.info("Logged in as %s (id %d)", self.user, self.user.id)
         from game import tts
         tts.set_event_loop(asyncio.get_event_loop())
+        self.startup_done.set()
 
 
 class DirectorCog(commands.Cog):
@@ -1968,7 +1979,9 @@ class ScrimCog(commands.Cog):
         ch = self.bot.get_channel(int(ch_id))
         if ch is None:
             try:
-                ch = await self.bot.fetch_channel(int(ch_id))
+                ch = await asyncio.wait_for(
+                    self.bot.fetch_channel(int(ch_id)), timeout=_DISCORD_API_TIMEOUT_SECONDS
+                )
             except Exception as e:
                 logger.warning("ScrimCog: could not fetch signup channel %s: %s", ch_id, e)
                 return
@@ -1977,7 +1990,7 @@ class ScrimCog(commands.Cog):
         existing_id = self._signup_message_id()
         if existing_id:
             try:
-                await ch.fetch_message(existing_id)
+                await asyncio.wait_for(ch.fetch_message(existing_id), timeout=_DISCORD_API_TIMEOUT_SECONDS)
                 logger.info("ScrimCog: signup message %d still exists — tracking it", existing_id)
                 return
             except discord.NotFound:
@@ -1997,8 +2010,12 @@ class ScrimCog(commands.Cog):
             ),
             color=_COLOR_OK,
         )
-        msg = await ch.send(embed=embed)
-        await msg.add_reaction(emoji)
+        try:
+            msg = await asyncio.wait_for(ch.send(embed=embed), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+            await asyncio.wait_for(msg.add_reaction(emoji), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+        except Exception as e:
+            logger.warning("ScrimCog: could not post new signup message: %s", e)
+            return
         logger.info("ScrimCog: posted new signup message %d in channel %s", msg.id, ch_id)
 
         self._save_message_id(msg.id)
@@ -2120,11 +2137,13 @@ class ScrimCog(commands.Cog):
         ch = self.bot.get_channel(int(ch_id))
         if ch is None:
             try:
-                ch = await self.bot.fetch_channel(int(ch_id))
+                ch = await asyncio.wait_for(
+                    self.bot.fetch_channel(int(ch_id)), timeout=_DISCORD_API_TIMEOUT_SECONDS
+                )
             except Exception:
                 return None
         try:
-            return await ch.fetch_message(msg_id)
+            return await asyncio.wait_for(ch.fetch_message(msg_id), timeout=_DISCORD_API_TIMEOUT_SECONDS)
         except Exception:
             return None
 
@@ -2173,7 +2192,7 @@ class ScrimCog(commands.Cog):
         message = await self._get_signup_message()
         if message is not None:
             try:
-                await message.delete()
+                await asyncio.wait_for(message.delete(), timeout=_DISCORD_API_TIMEOUT_SECONDS)
             except Exception as e:
                 logger.warning("Could not delete signup message for repost: %s", e)
         self._signup_order.clear()

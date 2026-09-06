@@ -32,6 +32,39 @@ def is_enabled() -> bool:
     return _enabled
 
 
+_last_check_ok: bool | None = None  # None = never checked (obs_stream_enabled is false)
+
+
+def last_check_ok() -> bool | None:
+    """Result of the most recent check_connection() call — for the startup summary
+    in main.py. None means it was never checked (obs_stream_enabled is false)."""
+    return _last_check_ok
+
+
+def check_connection() -> bool:
+    """One-time startup probe: try connecting to OBS and fetching its version, so a
+    bad host/port/password or OBS not running is reported clearly at startup instead
+    of only surfacing the first time /custom tries to use it. No-ops (returns True —
+    nothing to check) if obs_stream_enabled is false."""
+    global _last_check_ok
+    if not _enabled:
+        return True
+    with _lock:
+        try:
+            client = _connect()
+            try:
+                v = client.get_version()
+                logger.info("OBS: connected (version %s, websocket %s)", v.obs_version, v.obs_web_socket_version)
+                _last_check_ok = True
+                return True
+            finally:
+                client.disconnect()
+        except Exception as e:
+            logger.warning("OBS: connection check failed — %s (%s:%s)", e, _host, _port)
+            _last_check_ok = False
+            return False
+
+
 def _connect():
     import obsws_python as obs
     return obs.ReqClient(host=_host, port=_port, password=_password, timeout=_connect_timeout)
