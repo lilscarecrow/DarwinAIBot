@@ -10,13 +10,25 @@ class FakeTransport:
     def __init__(self, open_result=11, close_result=True):
         self.calls = []
         self.rosters = []
+        self.slugs = []
         self.open_result = open_result
         self.close_result = close_result
 
-    def open_set_draft(self, names, base_url, token, platform="pc", twitch_channel=None, draft_id=None, roster=None):
+    def open_set_draft(self, names, base_url, token, platform="pc", twitch_channel=None, draft_id=None,
+                       roster=None, tournament_slug=None):
         self.calls.append(("open", list(names), platform, twitch_channel, draft_id, base_url, token))
         self.rosters.append(list(roster or []))
+        self.slugs.append(tournament_slug)
         return self.open_result() if callable(self.open_result) else self.open_result
+
+    # relay transport (DraftLifecycle shares this object with its DsRelay)
+    def post_events(self, draft_id, game_index, events, base_url, token):
+        self.calls.append(("events", draft_id, game_index, list(events)))
+        return True
+
+    def post_log(self, entries, base_url, token):
+        self.calls.append(("log", list(entries)))
+        return True
 
     def close_set_draft(self, draft_id, base_url, token, reason=""):
         self.calls.append(("close", draft_id, reason, base_url, token))
@@ -221,3 +233,99 @@ def test_defaults_when_config_sparse():
     assert t.calls[0][2] == "pc"
     assert t.calls[0][5] == "https://darwinstalker.com"
     assert t.calls[0][3] is None
+
+
+# ---- tournament slug ---------------------------------------------------------
+
+def test_tournament_slug_forwarded_only_when_given():
+    ds, t = make()
+    ds.open_lobby()
+    ds.open_lobby(tournament_slug="hotdog-hoedown")
+    ds.open_lobby(tournament_slug="")
+    assert t.slugs == [None, "hotdog-hoedown", None]
+
+
+# ---- game index + live events + log relay ---------------------------------------
+
+def test_game_index_tracks_lobby_results_close():
+    ds, t = make()
+    assert ds.game_index == 0
+    ds.open_lobby()
+    assert ds.game_index == 1
+    ds.post_results("/tmp/g1.png")
+    assert ds.game_index == 2
+    ds.post_results("/tmp/g2.png")
+    assert ds.game_index == 3
+    ds.close("quit")
+    assert ds.game_index == 0
+
+
+def test_event_shape_splits_top_level_from_data():
+    ds, t = make()
+    ds.open_lobby()
+    ds.event("eliminated", slot=3, player="Bael", elapsed_ms=12345, alive=6)
+    ds.event("match_end", elapsed_ms=99)
+    ds.event("say", text="gg", by="lo")
+    ds.relay.flush()
+    ev_calls = [c for c in t.calls if c[0] == "events"]
+    assert len(ev_calls) == 1
+    _, draft_id, game_index, events = ev_calls[0]
+    assert draft_id == 11 and game_index == 1
+    e0, e1, e2 = events
+    assert e0["kind"] == "eliminated" and e0["slot"] == 3 and e0["player"] == "Bael"
+    assert e0["elapsed_ms"] == 12345 and e0["data"] == {"alive": 6} and isinstance(e0["at"], int)
+    assert e1 == {"kind": "match_end", "at": e1["at"], "elapsed_ms": 99}
+    assert e2["data"] == {"text": "gg", "by": "lo"} and "slot" not in e2
+
+
+def test_events_carry_the_game_they_happened_in():
+    ds, t = make()
+    ds.open_lobby()
+    ds.event("match_start", elapsed_ms=0, slots=["A"])
+    ds.post_results("/tmp/g1.png")        # flushes game 1, then moves to game 2
+    ds.event("match_start", elapsed_ms=0, slots=["A"])
+    ds.relay.flush()
+    ev = [(c[2], [e["kind"] for e in c[3]]) for c in t.calls if c[0] == "events"]
+    assert ev == [(1, ["match_start"]), (2, ["match_start"])]
+    # and the game-1 events were posted BEFORE the screenshot
+    kinds = [c[0] for c in t.calls]
+    assert kinds.index("events") < kinds.index("shot")
+
+
+def test_close_flushes_events_before_close_draft():
+    ds, t = make()
+    ds.open_lobby()
+    ds.event("aborted", reason="force stopped")
+    ds.log("warn", "warning", "something odd")
+    ds.close("quit")
+    kinds = [c[0] for c in t.calls]
+    assert kinds.index("events") < kinds.index("close")
+    assert kinds.index("log") < kinds.index("close")
+    assert ds.draft_id is None and ds.game_index == 0
+
+
+def test_log_relay_entries_shape():
+    ds, t = make()
+    ds.log("error", "error", "boom", {"logger": "x"})
+    ds.relay.flush()
+    log_calls = [c for c in t.calls if c[0] == "log"]
+    assert len(log_calls) == 1
+    e = log_calls[0][1][0]
+    assert (e["level"], e["kind"], e["message"], e["fields"]) == ("error", "error", "boom", {"logger": "x"})
+
+
+def test_events_and_logs_noop_when_disabled():
+    ds, t = make({"ds_ingest_twitch_channel": "x"})
+    ds.event("say", text="hi")
+    ds.log("warn", "warning", "w")
+    ds.relay.flush()
+    assert t.calls == []
+    assert ds.relay.pending() == (0, 0)
+
+
+def test_events_without_open_draft_are_dropped_not_sent():
+    ds, t = make()
+    ds.event("status", last="a", next="b")
+    ds.relay.flush()
+    assert [c for c in t.calls if c[0] == "events"] == []
+    assert ds.relay.dropped_events == 1

@@ -69,8 +69,39 @@ sends `Authorization: Bearer <ds_ingest_token>`. JSON unless noted.
   ids. The match-start open sends OCR names only; the server matches them
   against the seeded roster by identity, so a nameplate read of a seeded
   player never becomes a duplicate row.
+- `tournament_slug`: optional — the darwinstalker.com tournament this lobby
+  belongs to. Sent only while tournament mode is on (see "Tournament mode"
+  below); the server answers `400 {"error": "unknown tournament"}` for a slug
+  it does not know, which the bot logs like any other open failure (and the
+  draft is then not opened — fix the slug and re-run `/custom`).
 - `200 {"draft_id": 245, "created": true, "rows": 2, "roster_resolved": 2}` —
   `roster_resolved` = how many Discord IDs became rows.
+
+### POST /api/ingest/events (live match events)
+
+```json
+{"draft_id": 245, "game_index": 3, "events": [
+  {"kind": "eliminated", "elapsed_ms": 412300, "at": 1788730000, "slot": 4, "player": "Bael", "data": {"alive": 6}}
+]}
+```
+
+- ≤100 events per call; `draft_id` optional (server falls back to this token's
+  open draft, `404` if none), `game_index` optional 1–4.
+- Each event: `kind` (`[a-z0-9_]{1,40}`), optional `elapsed_ms` (from match
+  start), `at` (epoch seconds), `slot` (0-based), `player` (≤64 chars), `data`
+  (any JSON ≤2 KB).
+- `200 {"draft_id": 245, "game_index": 3, "recorded": 1}`. `400` validation,
+  `401` token, `404` no open draft, `422` malformed.
+
+### POST /api/ingest/log (bot log relay)
+
+```json
+{"entries": [{"level": "warn", "kind": "warning", "message": "state.json unavailable", "at": 1788730000, "fields": {"logger": "game.match_runner"}}]}
+```
+
+- ≤50 entries per call; `level` is `info` | `warn` | `error`; `message` ≤500
+  chars. `200 {"recorded": 1}`. Shows on the ladder's `/admin/observability`
+  as kind `bot.<kind>`.
 - `400` validation (bad platform, a name over 64 chars, channel empty or over
   64 chars), `401` bad token, `422` malformed body.
 
@@ -98,14 +129,73 @@ of Discord ids), optional `draft_id`. `200 {"draft_id", "game_index", "ocr_error
 `{"drafts": [{"players": [...], "n_games": 0, "twitch_channel": "yourchannel", ...}]}`.
 A bot draft that carries a channel is listed even with zero players.
 
+## 3a. Live match events
+
+The bot streams what it sees during a match to the draft, and the ladder's
+LIVE card renders it (alive count, elimination order, first blood, match
+clock, the director's card plays and megaphone lines). Nothing here blocks
+the match: `DraftLifecycle.event(kind, ...)` appends to an in-memory queue
+and a daemon thread (`game/ds_relay.py`) POSTs batches once a second, ≤100
+events per call, grouped by game. Events are dropped (and counted) when no
+draft is open; a queue over 1000 drops the newest.
+
+| kind          | when                                   | top-level         | data                                   |
+|---------------|----------------------------------------|-------------------|----------------------------------------|
+| `match_start` | after the lobby nameplates are read    | `elapsed_ms: 0`   | `slots`: name or null per slot          |
+| `first_blood` | first alive→dead flip (once per game)  | `slot`, `player`  | `notification`: OCR'd kill text or null |
+| `eliminated`  | every alive→dead flip, all match       | `slot`, `player`  | `alive`: players still alive after it   |
+| `match_end`   | placement badge detected               | `elapsed_ms`      | —                                       |
+| `card_play`   | the director fires a card              | —                 | `card`: card_type, `name`: event name   |
+| `say`         | `/say` megaphone                       | —                 | `text`, `by` (Discord display name)     |
+| `status`      | every `MatchRunner._update`            | —                 | `last`, `next`                          |
+| `aborted`     | the match loop was force-stopped       | —                 | `reason`                                |
+
+Player-targeted cards pick a screen coordinate, not a slot, so `card_play`
+carries no slot. The game index is tracked by the lifecycle: 1 from
+`open_lobby`, +1 after each results upload (the game's last events are
+flushed BEFORE the screenshot goes up), 0 after `close`. `close()` flushes
+the queues before the close-draft call so nothing is lost with the draft.
+
+The bot now polls the player bar for the whole match (it used to stop after
+first blood) — one extra screenshot per poll interval.
+
+## 3b. Bot log relay
+
+`game/ds_log_handler.py::DsLogHandler` is attached to the root logger when
+the cog starts. It forwards, through the same relay, every WARNING / ERROR
+from any logger (kind `warning` / `error`) and the INFO lines of the ladder
+loggers `game.ds_lifecycle` and `game.ingest` (kind `lifecycle`: open, roster
+push, results upload, close). They appear on
+`https://darwinstalker.com/admin/observability` as `bot.warning`,
+`bot.error`, `bot.lifecycle`, actor = this bot's token. Everything else
+(card plays, screen polls) stays in `logs/darwin_bot.log`. Rate limit: 60
+lines a minute, then one `bot.log_ratelimited` entry with the dropped count.
+Lines from `game.ds_relay*` are never forwarded (a failing relay POST must
+not become another relay POST).
+
+## 3c. Tournament mode
+
+`/tournament on slug:<slug>` stores the darwinstalker.com tournament slug as
+`ds_ingest_tournament_slug` (lower-cased) alongside `tournament_mode: true`;
+every draft opened while tournament mode is on is tagged with it, and the
+ladder then resolves names against that tournament's checked-in roster. The
+reply embed names the slug in effect, or warns when none is set. `/tournament
+off` keeps the slug for next time. An unknown slug is refused by the server
+(`400 unknown tournament`) — the open fails, the bot logs it (relayed too),
+and the draft is not opened until the slug is corrected.
+
 ## 4. Config (`config.json`, gitignored)
 
 ```json
 "ds_ingest_base_url": "https://darwinstalker.com",
 "ds_ingest_token": "<issued by the ladder admins>",
 "ds_ingest_platform": "pc",
-"ds_ingest_twitch_channel": "yourchannel"
+"ds_ingest_twitch_channel": "yourchannel",
+"ds_ingest_tournament_slug": ""
 ```
+
+- `ds_ingest_tournament_slug` is written by `/tournament on slug:<slug>`; it
+  only matters while `tournament_mode` is true.
 
 - `ds_ingest_token` empty ⇒ the whole lifecycle is off (no calls at all).
 - `ds_ingest_twitch_channel` **must be non-empty** or there is no embed. The

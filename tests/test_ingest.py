@@ -59,6 +59,16 @@ def test_open_omits_roster_when_empty(requests_mock, roster):
     assert "roster" not in m.last_request.json()
 
 
+def test_open_forwards_tournament_slug_only_when_truthy(requests_mock):
+    m = requests_mock.post(_open_url(), json={"draft_id": 42})
+    ingest.open_set_draft([], BASE, TOKEN, tournament_slug=" hotdog-hoedown ")
+    assert m.last_request.json()["tournament_slug"] == "hotdog-hoedown"
+    ingest.open_set_draft([], BASE, TOKEN, tournament_slug=None)
+    assert "tournament_slug" not in m.last_request.json()
+    ingest.open_set_draft([], BASE, TOKEN, tournament_slug="")
+    assert "tournament_slug" not in m.last_request.json()
+
+
 def test_open_omits_draft_id_when_none(requests_mock):
     m = requests_mock.post(_open_url(), json={"draft_id": 1})
     ingest.open_set_draft(["A"], BASE, TOKEN)
@@ -141,3 +151,51 @@ def test_screenshot_sends_draft_id_form_field(requests_mock, tmp_path):
     text = body.decode("latin-1") if isinstance(body, bytes) else str(body)
     assert 'name="draft_id"' in text and "\r\n3\r\n" in text
     assert 'name="roster"' in text
+
+
+# ---- events + log relay -------------------------------------------------------
+
+def test_events_wire_shape(requests_mock):
+    m = requests_mock.post(f"{BASE}/api/ingest/events", json={"draft_id": 9, "game_index": 2, "recorded": 2})
+    evs = [{"kind": "eliminated", "slot": 1, "player": "A", "elapsed_ms": 10, "data": {"alive": 8}},
+           {"kind": "match_end", "elapsed_ms": 20}]
+    assert ingest.post_events(9, 2, evs, BASE, TOKEN) is True
+    assert m.last_request.json() == {"draft_id": 9, "game_index": 2, "events": evs}
+    assert m.last_request.headers["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_events_omit_draft_and_game_when_none_and_cap_100(requests_mock):
+    m = requests_mock.post(f"{BASE}/api/ingest/events", json={"recorded": 100})
+    ingest.post_events(None, None, [{"kind": "x"}] * 150, BASE, TOKEN)
+    body = m.last_request.json()
+    assert "draft_id" not in body and "game_index" not in body and len(body["events"]) == 100
+
+
+@pytest.mark.parametrize("status", [400, 401, 404, 422, 500])
+def test_events_failure_returns_false_and_warns_on_relay_logger(requests_mock, caplog, status):
+    requests_mock.post(f"{BASE}/api/ingest/events", status_code=status, json={"error": "no"})
+    with caplog.at_level(logging.WARNING):
+        assert ingest.post_events(1, 1, [{"kind": "x"}], BASE, TOKEN) is False
+    rec = [r for r in caplog.records if f"HTTP {status}" in r.message]
+    assert rec and rec[0].name.startswith("game.ds_relay")
+
+
+def test_events_network_error_returns_false(requests_mock):
+    requests_mock.post(f"{BASE}/api/ingest/events", exc=requests.ConnectionError("down"))
+    assert ingest.post_events(1, 1, [{"kind": "x"}], BASE, TOKEN) is False
+
+
+def test_log_wire_shape_and_cap_50(requests_mock):
+    m = requests_mock.post(f"{BASE}/api/ingest/log", json={"recorded": 1})
+    entries = [{"level": "warn", "kind": "warning", "message": "m", "at": 1, "fields": {"logger": "x"}}]
+    assert ingest.post_log(entries, BASE, TOKEN) is True
+    assert m.last_request.json() == {"entries": entries}
+    ingest.post_log(entries * 70, BASE, TOKEN)
+    assert len(m.last_request.json()["entries"]) == 50
+
+
+def test_log_failure_returns_false_without_using_forwarded_loggers(requests_mock, caplog):
+    requests_mock.post(f"{BASE}/api/ingest/log", status_code=500, text="x")
+    with caplog.at_level(logging.WARNING):
+        assert ingest.post_log([{"level": "info", "kind": "k", "message": "m"}], BASE, TOKEN) is False
+    assert all(r.name.startswith("game.ds_relay") for r in caplog.records if "log relay" in r.message)

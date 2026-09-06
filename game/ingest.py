@@ -1,7 +1,7 @@
 """
 Client for the darwinstalker.com scrim ladder ingestion API.
 
-Three calls, all fire-and-forget: they log and swallow every failure, never
+Five calls, all fire-and-forget: they log and swallow every failure, never
 retry, and never raise. The bot must keep running a match even if the ladder
 is unreachable. The full contract (shapes, status codes, what the LIVE tab
 shows when) is in docs/DS_LIFECYCLE_HANDOFF.md.
@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 _TIMEOUT_SECONDS = 30
 _OPEN_DRAFT_TIMEOUT_SECONDS = 5
 _CLOSE_DRAFT_TIMEOUT_SECONDS = 5
+_RELAY_TIMEOUT_SECONDS = 5
+
+# The two relay calls log through the relay's logger, which DsLogHandler
+# ignores: a failing log POST must not warn its way into another log POST.
+_relay_logger = logging.getLogger("game.ds_relay.ingest")
 
 
 def post_results_screenshot(
@@ -83,9 +88,15 @@ def open_set_draft(
     twitch_channel: Optional[str] = None,
     draft_id: Optional[int] = None,
     roster: Optional[list[str]] = None,
+    tournament_slug: Optional[str] = None,
 ) -> Optional[int]:
     """
     POST to /api/ingest/open-draft: open (or refresh) the draft for this lobby.
+
+    tournament_slug: the ladder tournament this lobby belongs to (config
+    ds_ingest_tournament_slug, only while tournament_mode is on). Sent only
+    when truthy; the server answers 400 "unknown tournament" for a slug it
+    does not know, which lands in the log like any other open failure.
 
     roster: the lobby's Discord IDs (the scrim signup reactors). The server
     pre-seeds every id that is linked to a player on the ladder with that
@@ -121,6 +132,8 @@ def open_set_draft(
     ids = [str(r).strip() for r in (roster or []) if str(r).strip()]
     if ids:
         payload["roster"] = ids[:20]
+    if tournament_slug:
+        payload["tournament_slug"] = str(tournament_slug).strip()
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=_OPEN_DRAFT_TIMEOUT_SECONDS)
@@ -186,4 +199,64 @@ def close_set_draft(
         return False
     except Exception as e:
         logger.warning("darwinstalker close-draft request failed: %s", e)
+        return False
+
+
+def post_events(
+    draft_id: Optional[int],
+    game_index: Optional[int],
+    events: list[dict],
+    base_url: str,
+    token: str,
+) -> bool:
+    """
+    POST a batch (≤100) of live match events to /api/ingest/events.
+
+    Each event: {"kind", "elapsed_ms"?, "at"?, "slot"?, "player"?, "data"?}
+    (see docs/DS_LIFECYCLE_HANDOFF.md "Live match events" for the kinds).
+    draft_id / game_index are omitted when None (the server then targets this
+    token's open draft / the next game). Called only by DsRelay's thread.
+    Returns True on 200. Never raises.
+    """
+    url = f"{base_url.rstrip('/')}/api/ingest/events"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload: dict = {"events": list(events)[:100]}
+    if draft_id is not None:
+        payload["draft_id"] = draft_id
+    if game_index is not None:
+        payload["game_index"] = game_index
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=_RELAY_TIMEOUT_SECONDS)
+        if resp.status_code == 200:
+            return True
+        _relay_logger.warning(
+            "darwinstalker events failed: HTTP %d — %s", resp.status_code, resp.text[:300]
+        )
+        return False
+    except Exception as e:
+        _relay_logger.warning("darwinstalker events request failed: %s", e)
+        return False
+
+
+def post_log(entries: list[dict], base_url: str, token: str) -> bool:
+    """
+    POST a batch (≤50) of the bot's own log lines to /api/ingest/log. They show
+    up on the ladder's /admin/observability as `bot.<kind>` events.
+
+    Each entry: {"level": "info"|"warn"|"error", "kind", "message" (≤500), "at"?, "fields"?}.
+    Called only by DsRelay's thread. Returns True on 200. Never raises.
+    """
+    url = f"{base_url.rstrip('/')}/api/ingest/log"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"entries": list(entries)[:50]}
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=_RELAY_TIMEOUT_SECONDS)
+        if resp.status_code == 200:
+            return True
+        _relay_logger.warning(
+            "darwinstalker log relay failed: HTTP %d — %s", resp.status_code, resp.text[:300]
+        )
+        return False
+    except Exception as e:
+        _relay_logger.warning("darwinstalker log relay request failed: %s", e)
         return False

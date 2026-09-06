@@ -83,6 +83,8 @@ class MatchRunner:
         self._player_names: list[str] = []
         self._player_alive: list[bool] = []
         self._first_blood_logged: bool = False
+        # monotonic clock at match start; every live event carries elapsed_ms from it
+        self._match_started_at: Optional[float] = None
         # Latest confirmed director-points reading — see _update_points_reading().
         # Sampled continuously throughout the match (main loop, every
         # screen_poll_interval_seconds) as well as reactively in _wait_for_points(),
@@ -126,6 +128,7 @@ class MatchRunner:
         # one now if none is). Empty OCR is logged, never silently skipped.
         if self._ds is not None:
             self._ds.on_match_start(self._player_names)
+            self._ds.event("match_start", elapsed_ms=0, slots=[n or None for n in self._player_names])
 
         from game import tts
 
@@ -162,6 +165,7 @@ class MatchRunner:
         _first_label = f"{_first['card'].replace('_', ' ').title()} at {_m}:{_s:02d}"
         self._update("Match in progress", _first_label)
         start_time = time.monotonic()
+        self._match_started_at = start_time
 
         card_schedule = self._build_card_schedule(_profile)
         phrases = self._build_tts_phrases(card_schedule)
@@ -213,10 +217,12 @@ class MatchRunner:
                 # Poll for match end (placement badge on screen)
                 if self._match_has_ended():
                     logger.info("Match end detected at %.1fs elapsed", elapsed)
+                    self._emit("match_end", elapsed_ms=int(elapsed * 1000))
                     break
 
-                # Poll player bar for first blood
-                if not self._first_blood_logged and self._player_slot_xs:
+                # Poll the player bar all match: first blood once, and every
+                # elimination as a live event for the ladder's LIVE card.
+                if self._player_slot_xs:
                     from game.screen_detection import take_screenshot as _take_ss
                     self._poll_player_bar(_take_ss())
 
@@ -250,6 +256,7 @@ class MatchRunner:
                 recording_path = recorder.stop()
 
         if self._stop.is_set():
+            self._emit("aborted", reason="force stopped")
             return "Match ended early (force stopped)."
 
         # ------------------------------------------------------------------
@@ -295,7 +302,7 @@ class MatchRunner:
         On the first death (first blood), logs the victim and attempts to OCR
         the kill notification text to identify the killer.
         """
-        if not self._player_slot_xs or self._first_blood_logged:
+        if not self._player_slot_xs:
             return
 
         from game.screen_detection import sample_player_alive
@@ -307,12 +314,12 @@ class MatchRunner:
 
         prev_dead = sum(1 for a in self._player_alive if not a)
         curr_dead = sum(1 for a in new_alive if not a)
+        newly_dead = [
+            i for i, (was, now) in enumerate(zip(self._player_alive, new_alive))
+            if was and not now
+        ]
 
-        if prev_dead == 0 and curr_dead >= 1:
-            newly_dead = [
-                i for i, (was, now) in enumerate(zip(self._player_alive, new_alive))
-                if was and not now
-            ]
+        if not self._first_blood_logged and prev_dead == 0 and curr_dead >= 1:
             victim_name = (
                 self._player_names[newly_dead[0]]
                 if self._player_names and newly_dead
@@ -326,8 +333,37 @@ class MatchRunner:
                 victim_name, notif,
             )
             self._first_blood_logged = True
+            if newly_dead:
+                self._emit("first_blood", slot=newly_dead[0], player=victim_name, notification=notif)
+
+        # Every alive→dead flip is an elimination event; `alive` counts down as
+        # this poll's flips are applied in slot order.
+        alive_after = sum(1 for a in self._player_alive if a)
+        for i in newly_dead:
+            alive_after -= 1
+            self._emit("eliminated", slot=i, player=self._slot_name(i), alive=alive_after)
 
         self._player_alive = new_alive
+
+    def _slot_name(self, i: int) -> str:
+        if self._player_names and i < len(self._player_names) and self._player_names[i]:
+            return self._player_names[i]
+        return f"slot {i + 1}"
+
+    def _elapsed_ms(self) -> int:
+        if self._match_started_at is None:
+            return 0
+        return int((time.monotonic() - self._match_started_at) * 1000)
+
+    def _emit(self, kind: str, **fields) -> None:
+        """Queue a live event for the ladder (no-op without a lifecycle; never raises)."""
+        if self._ds is None:
+            return
+        try:
+            fields.setdefault("elapsed_ms", self._elapsed_ms())
+            self._ds.event(kind, **fields)
+        except Exception as e:
+            logger.debug("live event %s dropped: %s", kind, e)
 
     # ------------------------------------------------------------------
     # Card schedule
@@ -487,6 +523,9 @@ class MatchRunner:
     def _fire_card_event(self, event: CardEvent, all_events: list[CardEvent]):
         event.done = True
         logger.info("Firing card event: %s", event.name)
+        # Player-targeted cards pick a screen coordinate, not a slot, so the
+        # event names the card only; the target slot is unknown to the bot.
+        self._emit("card_play", card=event.card_type, name=event.name)
 
         from game import tts
         next_event = next((e for e in all_events if not e.done), None)
@@ -1082,6 +1121,7 @@ class MatchRunner:
     def _update(self, last: str, next_: str):
         self._on_action_update(last, next_)
         logger.info("Match action — last: %s | next: %s", last, next_)
+        self._emit("status", last=last, next=next_)
 
     def _save_error_screenshot(self, label: str):
         from game.screen_detection import save_error_screenshot

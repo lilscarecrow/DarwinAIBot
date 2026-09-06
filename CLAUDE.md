@@ -65,7 +65,9 @@ DarwinAIBot/
 │   ├── match_runner.py         # Full match loop (card timers, zone closes, end detection)
 │   ├── video_recorder.py       # Background match recording (H.264 MP4, cropped, 4fps)
 │   ├── ingest.py               # HTTP calls to the darwinstalker.com scrim ladder (open/close draft, screenshot)
-│   └── ds_lifecycle.py         # DraftLifecycle: the ONE place the bot drives the ladder draft (see docs/DS_LIFECYCLE_HANDOFF.md)
+│   ├── ds_lifecycle.py         # DraftLifecycle: the ONE place the bot drives the ladder draft (see docs/DS_LIFECYCLE_HANDOFF.md)
+│   ├── ds_relay.py             # background thread batching live match events + relayed log lines to the ladder
+│   └── ds_log_handler.py       # logging.Handler forwarding WARNING+ (and ladder INFO) lines to the ladder's event stream
 ├── session/
 │   └── state.py                # BotState enum + SessionState machine
 ├── zones/
@@ -459,6 +461,9 @@ The bot keeps one **draft** (an unpublished set) open on the **`darwinstalker.co
 - `game/ingest.py` — the three HTTP calls (`open_set_draft`, `close_set_draft`, `post_results_screenshot`). Fire-and-forget: log and swallow, never retry, never raise. `open_set_draft` ALWAYS sends when called (an empty roster is a legitimate "lobby forming" open); deciding whether to call is the lifecycle's job.
 - `game/ds_lifecycle.py::DraftLifecycle` — pure-Python state machine holding the draft id: `open_lobby()`, `on_match_start(names)`, `post_results(png, roster)`, `close(reason)`. Takes an injectable `transport` so it is tested headlessly (`tests/test_ds_lifecycle.py`). `DirectorCog._ds` is the single instance; `MatchRunner` gets it via the `draft_lifecycle` constructor arg. **Nothing else may call `game.ingest` directly.**
 - Wiring: `DirectorCog.custom` → `_open_ds_draft()` right after the `IN_CUSTOM` transition; `MatchRunner.run()` → `on_match_start(self._player_names)` after `_init_player_bar()` (empty OCR = WARNING, not a silent skip — that silent skip is why the Twitch embed never lit for a week); `_post_results_to_ingest` → `post_results`; `_reset_session(reason)` → `_close_ds_draft(reason)`.
+- Live match events (2026-09-06): `MatchRunner` emits `match_start`, `first_blood`, `eliminated` (the player bar is now polled ALL match, not just until first blood), `match_end`, `card_play`, `status`, `aborted`; `/say` emits `say`. All go through `DraftLifecycle.event()` → `game/ds_relay.py` (daemon thread, batched POSTs to `/api/ingest/events`, never blocks the match loop). Game index: 1 at `open_lobby`, +1 after each `post_results` (which flushes first), 0 at `close` (which flushes first).
+- Bot log relay: `game/ds_log_handler.py::DsLogHandler` (installed on the root logger in `DirectorCog.__init__`) forwards WARNING+ from any logger and INFO from `game.ds_lifecycle`/`game.ingest` to `/api/ingest/log` → shown as `bot.*` on the ladder's `/admin/observability`. `game.ds_relay*` loggers are excluded to prevent recursion. 60/min rate limit.
+- Tournament mode: `/tournament on slug:<slug>` persists `ds_ingest_tournament_slug`; `_open_ds_draft` sends it as `tournament_slug` only while `tournament_mode` is on. Unknown slug ⇒ server 400, draft not opened.
 - Tests: `pip install -r requirements-dev.txt && pytest tests -q` (headless; `tests/conftest.py` stubs the screen/Windows libs). The env-gated contract test (`tests/test_contract_darwin_stalker.py`) runs the real client against a LOCAL darwin-stalker only — it creates real drafts.
 - Success response of the screenshot call: `{"draft_id": ..., "game_index": ..., "ocr_error": ...}` — logged at INFO. `ocr_error: null` means the server's OCR read the scorecard cleanly.
 
@@ -737,6 +742,7 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "ds_ingest_token": "",                // Bearer token, issued out of band — leave empty to skip ingest
     "ds_ingest_platform": "pc",           // "pc" | "xbox"
     "ds_ingest_twitch_channel": "",       // Twitch channel name for the director's stream. The LIVE tab's Twitch embed ONLY appears when this is non-empty (and the bot restarted after editing) — empty means the open-draft call omits it and the bot logs "opened WITHOUT a twitch_channel" at every /custom
+    "ds_ingest_tournament_slug": "",      // darwinstalker.com tournament slug; written by /tournament on slug:<slug>, sent on open-draft only while tournament_mode is true
 
     // Scrim signup system
     "scrim_signup_channel_id": "1520517054988419123",

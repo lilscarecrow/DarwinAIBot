@@ -12,6 +12,7 @@ from discord.ext import commands
 
 from game.match_runner import MatchRunner
 from game.ds_lifecycle import DraftLifecycle
+from game.ds_log_handler import DsLogHandler
 from session.state import SessionState, BotState
 
 # Path to noble-hopper state.json — one level up from bot/, into noble-hopper/
@@ -363,6 +364,11 @@ class DirectorCog(commands.Cog):
         # roster pushed at match start, screenshot per game, closed on every
         # path back to IDLE (_reset_session). See docs/DS_LIFECYCLE_HANDOFF.md.
         self._ds = DraftLifecycle(self.bot.config)
+        # Relay this bot's WARNING+ lines (and the ladder lifecycle's INFO lines)
+        # to the ladder's event stream (/admin/observability, kind bot.*), so a
+        # ladder-side diagnosis no longer needs this machine's log file.
+        if not any(isinstance(h, DsLogHandler) for h in logging.getLogger().handlers):
+            logging.getLogger().addHandler(DsLogHandler(self._ds))
 
     # Screen name → (BotState, label) used by the background screen watcher
     _SCREEN_STATES = {
@@ -640,8 +646,12 @@ class DirectorCog(commands.Cog):
         """
         loop = asyncio.get_running_loop()
         roster = self._resolved_roster
+        # Tag the draft with the ladder tournament only while tournament mode is on.
+        slug = self.bot.config.get("ds_ingest_tournament_slug") if self.bot.config.get("tournament_mode") else None
         try:
-            await loop.run_in_executor(None, lambda: self._ds.open_lobby(roster=roster))
+            await loop.run_in_executor(
+                None, lambda: self._ds.open_lobby(roster=roster, tournament_slug=slug)
+            )
         except Exception as e:
             logger.warning("darwinstalker open_lobby failed: %s", e)
 
@@ -1784,6 +1794,8 @@ class DirectorCog(commands.Cog):
         in_match = self.bot.session.state == BotState.MATCH_IN_PROGRESS
         spoken_text = f"{interaction.user.display_name} said {message}"
         tts.speak(spoken_text, broadcast=in_match)
+        # The megaphone is part of the show: it goes on the ladder's live feed too.
+        self._ds.event("say", text=message, by=interaction.user.display_name)
         context_note = "via broadcast (G key)" if in_match else "via game voice chat"
         embed = self._ok("Director Says", f"_{message}_")
         embed.add_field(name="Sent by", value=interaction.user.display_name, inline=True)
@@ -1858,17 +1870,31 @@ class DirectorCog(commands.Cog):
         name="tournament",
         description="Toggle tournament mode: delayed stream start + minimap stays covered all match",
     )
-    @app_commands.describe(enabled="Turn tournament mode on or off")
+    @app_commands.describe(
+        enabled="Turn tournament mode on or off",
+        slug="darwinstalker.com tournament slug to tag this session's sets with (e.g. hotdog-hoedown)",
+    )
     @app_commands.choices(enabled=[
         app_commands.Choice(name="On", value=1),
         app_commands.Choice(name="Off", value=0),
     ])
-    async def tournament(self, interaction: discord.Interaction, enabled: app_commands.Choice[int]):
+    async def tournament(
+        self,
+        interaction: discord.Interaction,
+        enabled: app_commands.Choice[int],
+        slug: Optional[str] = None,
+    ):
         if not await self._role_check(interaction):
             return
 
         value = bool(enabled.value)
         self._persist_config_value("tournament_mode", value)
+        if value and slug and slug.strip():
+            # The ladder tags every draft opened while tournament mode is on with
+            # this slug (name resolution then uses the tournament's checked-in
+            # roster). The key survives "Off" so the next "On" reuses it.
+            self._persist_config_value("ds_ingest_tournament_slug", slug.strip().lower())
+        slug_in_effect = (self.bot.config.get("ds_ingest_tournament_slug") or "").strip()
 
         if value:
             description = (
@@ -1876,10 +1902,19 @@ class DirectorCog(commands.Cog):
                 f"- `/custom`'s stream start is delayed {_TOURNAMENT_STREAM_DELAY_SECONDS // 60} minutes "
                 f"instead of going live instantly.\n"
                 f"- The minimap cover stays up for the entire match instead of revealing "
-                f"{self.bot.config.get('obs_minimap_cover_seconds', 120)}s in."
+                f"{self.bot.config.get('obs_minimap_cover_seconds', 120)}s in.\n"
             )
+            if slug_in_effect:
+                description += f"- Ladder drafts are tagged with tournament **`{slug_in_effect}`**."
+            else:
+                description += (
+                    "- ⚠️ No ladder tournament slug set — drafts will NOT be tagged. "
+                    "Run `/tournament on slug:<slug>` with the darwinstalker.com tournament slug."
+                )
         else:
             description = "Tournament mode is now **OFF** — normal instant stream start and timed minimap reveal."
+            if slug_in_effect:
+                description += f"\nLadder tournament slug `{slug_in_effect}` is kept for the next time it is turned on."
 
         await interaction.response.send_message(embed=self._ok("Tournament Mode", description))
 
