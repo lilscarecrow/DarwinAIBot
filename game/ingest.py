@@ -1,6 +1,13 @@
 """
-Client for the ds.xdos.ai scrim ladder ingestion API.
-See SHOW_DIRECTOR_HANDOFF.md for the full API contract.
+Client for the darwinstalker.com scrim ladder ingestion API.
+
+Three calls, all fire-and-forget: they log and swallow every failure, never
+retry, and never raise. The bot must keep running a match even if the ladder
+is unreachable. The full contract (shapes, status codes, what the LIVE tab
+shows when) is in docs/DS_LIFECYCLE_HANDOFF.md.
+
+Only game/ds_lifecycle.py should call these directly — the cog and the match
+runner go through DraftLifecycle so the draft id is tracked in one place.
 """
 import json
 import logging
@@ -13,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT_SECONDS = 30
 _OPEN_DRAFT_TIMEOUT_SECONDS = 5
+_CLOSE_DRAFT_TIMEOUT_SECONDS = 5
 
 
 def post_results_screenshot(
@@ -57,13 +65,13 @@ def post_results_screenshot(
         if resp.status_code == 200:
             body = resp.json()
             logger.info(
-                "ds.xdos.ai ingest ok: draft_id=%s game_index=%s ocr_error=%s",
+                "darwinstalker ingest ok: draft_id=%s game_index=%s ocr_error=%s",
                 body.get("draft_id"), body.get("game_index"), body.get("ocr_error"),
             )
         else:
-            logger.warning("ds.xdos.ai ingest failed: HTTP %d — %s", resp.status_code, resp.text[:300])
+            logger.warning("darwinstalker ingest failed: HTTP %d — %s", resp.status_code, resp.text[:300])
     except Exception as e:
-        logger.warning("ds.xdos.ai ingest request failed: %s", e)
+        logger.warning("darwinstalker ingest request failed: %s", e)
         return
 
 
@@ -73,46 +81,100 @@ def open_set_draft(
     token: str,
     platform: str = "pc",
     twitch_channel: Optional[str] = None,
+    draft_id: Optional[int] = None,
 ) -> Optional[int]:
     """
-    POST to /api/ingest/open-draft to pre-open a draft for the upcoming match.
+    POST to /api/ingest/open-draft: open (or refresh) the draft for this lobby.
 
-    Called before the match starts (before the B press) so the server has a
-    draft ready to receive the end-of-match screenshot via draft_id. Like
-    post_results_screenshot, this is fire-and-forget: failures are logged and
-    swallowed rather than retried, and never raise.
+    ALWAYS sends the request when called — an empty roster is a legitimate
+    "lobby forming" open, sent as `"players": []`. (Earlier versions skipped the
+    POST silently when OCR returned no names, which meant the draft never
+    existed until the first results screenshot and the Twitch embed never lit.)
+    Deciding whether to call at all is DraftLifecycle's job, not this function's.
 
-    player_names: OCR'd lobby nameplates. Blank/whitespace-only entries are
-    filtered out before sending. If nothing remains after filtering, the POST
-    is skipped entirely and None is returned.
-
-    twitch_channel: optional Twitch channel name for the director's stream.
-    Included in the JSON payload only when set — omitted (not sent as null)
-    otherwise, mirroring the roster omit-when-None pattern above.
+    player_names: lobby nameplates from OCR (blank entries are dropped) or [].
+    twitch_channel: the director's Twitch channel — included only when truthy,
+        omitted (never sent as null) otherwise.
+    draft_id: the draft opened earlier this session, so the server refreshes
+        THAT draft (adds names, re-sets the channel) instead of creating
+        another. Omitted when None; the server then reuses this token's most
+        recent open draft or creates a fresh one.
 
     Returns the draft_id from the response on success, None on any failure.
+    Fire-and-forget: never raises.
     """
-    names = [n for n in player_names if n.strip()]
-    if not names:
-        return None
+    names = [n.strip() for n in player_names if n and n.strip()]
 
     url = f"{base_url.rstrip('/')}/api/ingest/open-draft"
     headers = {"Authorization": f"Bearer {token}"}
-    payload = {"platform": platform, "player_names": names}
+    payload: dict = {"platform": platform, "players": names}
     if twitch_channel:
         payload["twitch_channel"] = twitch_channel
+    if draft_id is not None:
+        payload["draft_id"] = draft_id
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=_OPEN_DRAFT_TIMEOUT_SECONDS)
-
         if resp.status_code == 200:
             body = resp.json()
-            draft_id = body.get("draft_id")
-            logger.info("ds.xdos.ai open-draft ok: draft_id=%s", draft_id)
-            return draft_id
-        else:
-            logger.warning("ds.xdos.ai open-draft failed: HTTP %d — %s", resp.status_code, resp.text[:300])
-            return None
-    except Exception as e:
-        logger.warning("ds.xdos.ai open-draft request failed: %s", e)
+            new_id = body.get("draft_id")
+            logger.info(
+                "darwinstalker open-draft ok: draft_id=%s created=%s rows=%s twitch_channel=%s",
+                new_id, body.get("created"), body.get("rows"), twitch_channel or "(none)",
+            )
+            return new_id
+        logger.warning(
+            "darwinstalker open-draft failed: HTTP %d — %s", resp.status_code, resp.text[:300]
+        )
         return None
+    except Exception as e:
+        logger.warning("darwinstalker open-draft request failed: %s", e)
+        return None
+
+
+def close_set_draft(
+    draft_id: int,
+    base_url: str,
+    token: str,
+    reason: str = "",
+) -> bool:
+    """
+    POST to /api/ingest/close-draft: tell the ladder this lobby is over.
+
+    The server discards the draft if it holds no game data and no screenshot
+    (`discarded: true`), otherwise keeps it for moderator review and just clears
+    the Twitch channel so the LIVE embed drops (`discarded: false`). Closing a
+    draft that is already published/rejected is harmless (`closed: false`).
+
+    Returns True when the server answered 200, False otherwise. Fire-and-forget:
+    never raises. A False here needs no retry — the server's hourly sweep
+    discards abandoned empty drafts and clears stale channels on its own.
+    """
+    url = f"{base_url.rstrip('/')}/api/ingest/close-draft"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload: dict = {"draft_id": draft_id}
+    if reason:
+        payload["reason"] = reason[:200]
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=_CLOSE_DRAFT_TIMEOUT_SECONDS)
+        if resp.status_code == 200:
+            body = resp.json()
+            if body.get("closed"):
+                logger.info(
+                    "darwinstalker close-draft ok: draft_id=%s discarded=%s reason=%s",
+                    body.get("draft_id"), body.get("discarded"), reason or "(none)",
+                )
+            else:
+                logger.info(
+                    "darwinstalker close-draft: draft_id=%s already %s — nothing to do",
+                    body.get("draft_id"), body.get("status"),
+                )
+            return True
+        logger.warning(
+            "darwinstalker close-draft failed: HTTP %d — %s", resp.status_code, resp.text[:300]
+        )
+        return False
+    except Exception as e:
+        logger.warning("darwinstalker close-draft request failed: %s", e)
+        return False

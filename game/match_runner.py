@@ -46,8 +46,12 @@ class MatchRunner:
         on_action_update: Callable[[str, str], None],
         skip_start: bool = False,
         profile: Optional[dict] = None,
+        draft_lifecycle=None,
     ):
         self._config = config
+        # DraftLifecycle (game/ds_lifecycle.py) owned by the cog: the one place
+        # that talks to the darwinstalker ladder. None = ingest not wired.
+        self._ds = draft_lifecycle
         self._session = session
         self._on_action_update = on_action_update
         self._stop = threading.Event()
@@ -79,7 +83,6 @@ class MatchRunner:
         self._player_names: list[str] = []
         self._player_alive: list[bool] = []
         self._first_blood_logged: bool = False
-        self._draft_id: Optional[int] = None
         from game.deck_utils import deck_layout_from_state
         live_layout = deck_layout_from_state()
         self._deck_layout: list[str] = live_layout if live_layout else config.get("deck_layout", [])
@@ -110,19 +113,10 @@ class MatchRunner:
         # moment to read names and establish slot order.
         self._init_player_bar()
 
-        from game.ingest import open_set_draft
-        ds_token = self._config.get("ds_ingest_token")
-        if ds_token:
-            ds_base_url = self._config.get("ds_ingest_base_url", "https://darwinstalker.com")
-            ds_platform = self._config.get("ds_ingest_platform", "pc")
-            ds_twitch_channel = self._config.get("ds_ingest_twitch_channel")
-            try:
-                self._draft_id = open_set_draft(
-                    self._player_names, ds_base_url, ds_token, ds_platform,
-                    twitch_channel=ds_twitch_channel,
-                )
-            except Exception as e:
-                logger.warning("open_set_draft failed: %s", e)
+        # Push the OCR'd roster onto the ladder draft opened at /custom (or open
+        # one now if none is). Empty OCR is logged, never silently skipped.
+        if self._ds is not None:
+            self._ds.on_match_start(self._player_names)
 
         from game import tts
 

@@ -50,7 +50,8 @@ DarwinAIBot/
 │   ├── profiles.py             # Match card play schedules
 │   ├── match_runner.py         # Full match loop (card timers, zone closes, end detection)
 │   ├── video_recorder.py       # Background match recording (H.264 MP4, cropped, 4fps)
-│   └── ingest.py               # Push results screenshot to darwinstalker.com scrim ladder
+│   ├── ingest.py               # HTTP calls to the darwinstalker.com scrim ladder (open/close draft, screenshot)
+│   └── ds_lifecycle.py         # DraftLifecycle: the ONE place the bot drives the ladder draft (see docs/DS_LIFECYCLE_HANDOFF.md)
 ├── session/
 │   └── state.py                # BotState enum + SessionState machine
 ├── zones/
@@ -419,14 +420,15 @@ Records match footage in a background thread. Started after the match countdown,
 
 **OpenH264 DLL gotcha (Windows) (2026-08-30):** OpenCV's ffmpeg backend doesn't bundle Cisco's `libopenh264` codec — it's dynamically loaded at runtime and must be downloaded separately (H.264 patent-licensing reasons; same category of issue as the `pip-system-certs` SSL gotcha in Ladder Ingestion below). Symptom in logs: `Failed to load OpenH264 library: openh264-1.8.0-win64.dll` / `Incorrect library version loaded` / `Could not open codec libopenh264` right when a match starts (`VideoRecorder.start()`). The exact required filename/version is stated in the error itself — for this OpenCV build (opencv-python 4.13.0) it's `openh264-1.8.0-win64.dll` from Cisco's official binary host, `http://ciscobinary.openh264.org/openh264-1.8.0-win64.dll.bz2` (`.bz2`-compressed; verify the decompressed DLL's Authenticode signature is `Cisco WebEx LLC` before trusting it — the signing cert being expired is normal for a 2018-era release and doesn't invalidate a timestamped signature). **Placement matters and is not where you'd expect:** putting it next to `cv2`'s own `opencv_videoio_ffmpeg*.dll` in `site-packages/cv2/` does **not** work — that folder isn't on the DLL search path FFmpeg uses for this dependency. It has to go in **the same directory as `python.exe`** and/or **the process's current working directory** (the repo root, since that's where `main.py` runs from) — both were populated for redundancy here. Gitignored via `openh264-*.dll` since it's a machine-specific runtime binary, not source, matching the `templates/` and `noble-hopper/` precedent above.
 
-### Ladder Ingestion (`game/ingest.py`)
+### Ladder Ingestion (`game/ingest.py` + `game/ds_lifecycle.py`)
 
-Pushes the raw end-of-match results screenshot to the **`darwinstalker.com`** scrim ladder ingestion API (spec: `SHOW_DIRECTOR_HANDOFF.md`, gitignored — not tracked in this repo, and still documents the old `ds.xdos.ai` base URL — see domain migration note below). Everything sent lands in an **unpublished draft** grouped by (platform, day UTC); a human moderator reviews and publishes later, so this is genuinely fire-and-forget — failures are logged and swallowed, never retried.
+The bot keeps one **draft** (an unpublished set) open on the **`darwinstalker.com`** scrim ladder per lobby and drives it through four calls — open at `/custom`, roster at match start, screenshot after each game, close on every path back to IDLE. The full contract, config, file map, log lines to grep, and what the LIVE tab should show when are in **`docs/DS_LIFECYCLE_HANDOFF.md`** — read that before touching any of this. Summary:
 
-- `post_results_screenshot(screenshot_path, base_url, token, platform)` — `POST /api/ingest/screenshot`, multipart form with the PNG + `platform`. Called from `discord_bot.py`'s `_post_results_to_ingest()` via `run_in_executor` (blocking `requests` call off the event loop).
-- Wired into both match-end paths (`/start` and the auto-start watcher) in `discord_bot.py`, right after `_mirror_results()` and before the local screenshot file is deleted — the file must still exist on disk when this fires.
-- No-ops silently if `ds_ingest_token` is unset in config.
-- Success response: `{"draft_id": ..., "game_index": ..., "ocr_error": ...}` — logged at INFO. `ocr_error: null` means the server's OCR read the scorecard cleanly.
+- `game/ingest.py` — the three HTTP calls (`open_set_draft`, `close_set_draft`, `post_results_screenshot`). Fire-and-forget: log and swallow, never retry, never raise. `open_set_draft` ALWAYS sends when called (an empty roster is a legitimate "lobby forming" open); deciding whether to call is the lifecycle's job.
+- `game/ds_lifecycle.py::DraftLifecycle` — pure-Python state machine holding the draft id: `open_lobby()`, `on_match_start(names)`, `post_results(png, roster)`, `close(reason)`. Takes an injectable `transport` so it is tested headlessly (`tests/test_ds_lifecycle.py`). `DirectorCog._ds` is the single instance; `MatchRunner` gets it via the `draft_lifecycle` constructor arg. **Nothing else may call `game.ingest` directly.**
+- Wiring: `DirectorCog.custom` → `_open_ds_draft()` right after the `IN_CUSTOM` transition; `MatchRunner.run()` → `on_match_start(self._player_names)` after `_init_player_bar()` (empty OCR = WARNING, not a silent skip — that silent skip is why the Twitch embed never lit for a week); `_post_results_to_ingest` → `post_results`; `_reset_session(reason)` → `_close_ds_draft(reason)`.
+- Tests: `pip install -r requirements-dev.txt && pytest tests -q` (headless; `tests/conftest.py` stubs the screen/Windows libs). The env-gated contract test (`tests/test_contract_darwin_stalker.py`) runs the real client against a LOCAL darwin-stalker only — it creates real drafts.
+- Success response of the screenshot call: `{"draft_id": ..., "game_index": ..., "ocr_error": ...}` — logged at INFO. `ocr_error: null` means the server's OCR read the scorecard cleanly.
 
 **Domain migration — `ds.xdos.ai` → `darwinstalker.com`:** the ladder site moved domains; `ds.xdos.ai` now 301-redirects to `darwinstalker.com`. `config.json → ds_ingest_base_url` was updated to `https://darwinstalker.com` directly. This mattered because a 301 redirect downgrades a `POST` to a `GET` when followed (standard client behavior, not a bug) — hitting the old `ds.xdos.ai` URL produced `405 Method Not Allowed` with an empty body, since the redirect target's route only accepts `POST`. If ingest ever starts failing with `HTTP 405` again, check for another redirect first (`requests.post(..., allow_redirects=True)` then inspect `resp.history` for a 301/302) before assuming the API contract changed.
 
@@ -702,7 +704,7 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "ds_ingest_base_url": "https://darwinstalker.com",
     "ds_ingest_token": "",                // Bearer token, issued out of band — leave empty to skip ingest
     "ds_ingest_platform": "pc",           // "pc" | "xbox"
-    "ds_ingest_twitch_channel": "",       // Twitch channel name for the director's stream, forwarded to the darwinstalker ingest API's open-draft call so the ladder can link the draft to the live broadcast — omitted from the request entirely when unset/empty
+    "ds_ingest_twitch_channel": "",       // Twitch channel name for the director's stream. The LIVE tab's Twitch embed ONLY appears when this is non-empty (and the bot restarted after editing) — empty means the open-draft call omits it and the bot logs "opened WITHOUT a twitch_channel" at every /custom
 
     // Scrim signup system
     "scrim_signup_channel_id": "1520517054988419123",

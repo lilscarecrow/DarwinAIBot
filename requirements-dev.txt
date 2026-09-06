@@ -1,0 +1,6 @@
+# Headless test deps (Linux/CI friendly — no game, no Discord connection).
+#   python -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt
+#   pytest tests -q
+pytest>=8.0
+requests>=2.31.0
+requests-mock>=1.12

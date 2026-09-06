@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from game.match_runner import MatchRunner
+from game.ds_lifecycle import DraftLifecycle
 from session.state import SessionState, BotState
 
 # Path to noble-hopper state.json — one level up from bot/, into noble-hopper/
@@ -206,7 +207,7 @@ class _EndConfirmView(discord.ui.View):
             self._cog._active_runner.stop()
         from game.launcher import close_game
         close_game()
-        self._cog._reset_session()
+        self._cog._reset_session("quit")
         self.stop()
         embed = discord.Embed(title="Session Ended", description="Game closed. Bot reset to IDLE.", color=_COLOR_OK)
         await interaction.response.edit_message(embed=embed, view=None)
@@ -347,6 +348,10 @@ class DirectorCog(commands.Cog):
         # Discord IDs (strings) of scrim signup reactors, captured at /custom time
         # so they're available to pass through to the ingest API at match end.
         self._resolved_roster: Optional[list[str]] = None
+        # The darwinstalker ladder draft for the current lobby. Opened at /custom,
+        # roster pushed at match start, screenshot per game, closed on every
+        # path back to IDLE (_reset_session). See docs/DS_LIFECYCLE_HANDOFF.md.
+        self._ds = DraftLifecycle(self.bot.config)
 
     # Screen name → (BotState, label) used by the background screen watcher
     _SCREEN_STATES = {
@@ -399,36 +404,27 @@ class DirectorCog(commands.Cog):
             logger.warning("Could not delete recording %s: %s", path, e)
 
     async def _post_results_to_ingest(
-        self, results_text: str, roster: Optional[list[str]] = None, draft_id: Optional[int] = None,
+        self, results_text: str, roster: Optional[list[str]] = None,
     ):
-        """Best-effort push of the raw results screenshot to the ds.xdos.ai scrim ladder.
+        """Best-effort push of the raw results screenshot to the darwinstalker ladder.
+
+        Delegates to DraftLifecycle.post_results, which targets the draft opened
+        at /custom (so all games of a lobby land in one set). Blocking HTTP, so
+        it runs on the executor.
 
         roster: optional list of Discord ID strings for the players known to be in
         this match (captured from scrim signup reactions at /custom time). Passed
         through so the server can narrow its OCR prompt and fuzzy candidate pool.
-
-        draft_id: optional draft id from a prior open_set_draft() call (captured
-        on the MatchRunner during run()). Passed through so the server targets
-        that existing draft instead of creating a new one.
         """
         if not results_text.endswith(".png"):
             return
-        token = self.bot.config.get("ds_ingest_token")
-        if not token:
-            return
-        base_url = self.bot.config.get("ds_ingest_base_url", "https://darwinstalker.com")
-        platform = self.bot.config.get("ds_ingest_platform", "pc")
-        from game.ingest import post_results_screenshot
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(
-                None,
-                lambda: post_results_screenshot(
-                    results_text, base_url, token, platform, roster=roster, draft_id=draft_id,
-                ),
+                None, lambda: self._ds.post_results(results_text, roster=roster),
             )
         except Exception as e:
-            logger.warning("ds.xdos.ai ingest failed: %s", e)
+            logger.warning("darwinstalker ingest failed: %s", e)
 
     async def _twitch_announce(self, text: str):
         """Best-effort: post to Twitch chat if the Twitch bot is configured/running."""
@@ -597,7 +593,7 @@ class DirectorCog(commands.Cog):
                     logger.info("Screen watcher: IN_MENU idle > 10 min — closing game")
                     from game.launcher import close_game
                     await loop.run_in_executor(None, close_game)
-                    self._reset_session()
+                    self._reset_session("idle timeout")
             except Exception as e:
                 logger.debug("Screen watcher error: %s", e)
 
@@ -609,8 +605,36 @@ class DirectorCog(commands.Cog):
         required = self.bot.config.get("discord_required_role", "")
         return any(r.name == required for r in interaction.user.roles)
 
-    def _reset_session(self):
+    def _close_ds_draft(self, reason: str):
+        """Fire-and-forget close of the ladder draft on the executor.
+
+        _reset_session is sync and called from many async paths; the close is a
+        blocking HTTP call, so it is scheduled rather than awaited — the same
+        pattern as _clear_streaming_presence. Never raises.
+        """
+        if self._ds.draft_id is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            asyncio.ensure_future(loop.run_in_executor(None, lambda: self._ds.close(reason)))
+        except RuntimeError:
+            # No running loop (shutdown path) — close inline, still never raises.
+            self._ds.close(reason)
+
+    async def _open_ds_draft(self):
+        """Open the ladder draft for a freshly created lobby (blocking HTTP → executor)."""
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self._ds.open_lobby)
+        except Exception as e:
+            logger.warning("darwinstalker open_lobby failed: %s", e)
+
+    def _reset_session(self, reason: str = "session reset"):
         """Reset session state and clear any lobby-scoped cached values.
+
+        Also closes the darwinstalker ladder draft (DraftLifecycle.close) with
+        `reason`, so an abandoned lobby is discarded server-side and the Twitch
+        embed drops — same "every path back to IDLE" hook as the stream stop.
 
         Also stops the Twitch stream (if OBS streaming is enabled) — this is the one
         function called on every path back to IDLE (/quit, the 10-min main-menu idle
@@ -619,6 +643,7 @@ class DirectorCog(commands.Cog):
         call at each individual call site. No-ops instantly if obs_stream_enabled is
         false or no stream is currently running.
         """
+        self._close_ds_draft(reason)
         if self._auto_start_task and not self._auto_start_task.done():
             self._auto_start_task.cancel()
             logger.info("Auto-start watcher cancelled by session reset")
@@ -903,6 +928,11 @@ class DirectorCog(commands.Cog):
                 last_action="Custom match created",
                 next_action="Await /start",
             )
+
+            # Open the ladder draft for this lobby now — roster comes later at
+            # match start; this is what puts the Twitch embed on the LIVE tab
+            # while the lobby is still filling.
+            await self._open_ds_draft()
 
             from game import obs_control
             tournament_mode = bool(self.bot.config.get("tournament_mode", False))
@@ -1425,6 +1455,7 @@ class DirectorCog(commands.Cog):
             session=self.bot.session,
             on_action_update=on_action_update,
             profile=self._resolved_profile,
+            draft_lifecycle=self._ds,
         )
         self._resolved_profile = None
         _match_roster = self._resolved_roster
@@ -1454,7 +1485,7 @@ class DirectorCog(commands.Cog):
                     if self._active_runner is not None:
                         self._active_runner.stop()
                     self._active_runner = None
-                    self._reset_session()
+                    self._reset_session("aborted: match safety timeout")
                     await channel.send(embed=self._fail(
                         "Match Safety Timeout",
                         f"Match exceeded the {int(_MATCH_TIMEOUT // 60)}-minute safety limit. "
@@ -1494,7 +1525,7 @@ class DirectorCog(commands.Cog):
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
-            await self._post_results_to_ingest(results_text, roster=_match_roster, draft_id=runner._draft_id)
+            await self._post_results_to_ingest(results_text, roster=_match_roster)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
@@ -1571,6 +1602,7 @@ class DirectorCog(commands.Cog):
                 on_action_update=on_action_update,
                 skip_start=True,
                 profile=self._resolved_profile,
+                draft_lifecycle=self._ds,
             )
             self._resolved_profile = None
             _match_roster = self._resolved_roster
@@ -1588,7 +1620,7 @@ class DirectorCog(commands.Cog):
                     if self._active_runner is not None:
                         self._active_runner.stop()
                     self._active_runner = None
-                    self._reset_session()
+                    self._reset_session("aborted: match safety timeout")
                     await channel.send(embed=self._fail(
                         "Match Safety Timeout",
                         f"Match exceeded the {int(_MATCH_TIMEOUT // 60)}-minute safety limit. "
@@ -1628,7 +1660,7 @@ class DirectorCog(commands.Cog):
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
-            await self._post_results_to_ingest(results_text, roster=_match_roster, draft_id=runner._draft_id)
+            await self._post_results_to_ingest(results_text, roster=_match_roster)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
