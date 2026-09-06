@@ -39,6 +39,9 @@ class DraftLifecycle:
         self._config = config or {}
         self._transport = transport if transport is not None else _default_transport()
         self._draft_id: Optional[int] = None
+        # The lobby's Discord IDs from open_lobby, re-sent at match start so the
+        # server's fuzzy pool for OCR names is this lobby, not the whole season.
+        self._roster: list[str] = []
 
     # ---- config -----------------------------------------------------------
 
@@ -67,26 +70,36 @@ class DraftLifecycle:
 
     # ---- lifecycle ----------------------------------------------------------
 
-    def open_lobby(self, names: Optional[list[str]] = None) -> Optional[int]:
+    def open_lobby(
+        self, names: Optional[list[str]] = None, roster: Optional[list[str]] = None
+    ) -> Optional[int]:
         """Lobby created (/custom succeeded): open the draft now, roster or not.
 
         This is what lights the Twitch embed on the LIVE tab while the lobby is
         still filling. Always replaces any remembered draft id with the one the
         server returns — a new lobby is a new draft.
+
+        roster: the lobby's Discord IDs (signup reactors). The ladder pre-seeds
+        the linked ones by canonical name, so the card fills in before any OCR
+        runs; unlinked ids are skipped server-side.
         """
         if not self.enabled:
             logger.debug("ds ingest disabled (no ds_ingest_token) — not opening a draft")
             return None
+        self._roster = [str(r) for r in (roster or []) if str(r).strip()]
         try:
             new_id = self._transport.open_set_draft(
                 list(names or []),
                 platform=self._platform(),
                 twitch_channel=self._twitch_channel(),
+                roster=list(self._roster),
                 **self._args(),
             )
         except Exception as e:  # transport promised not to raise; belt and braces
             logger.warning("ds open_lobby: transport raised %s", e)
             new_id = None
+        if roster:
+            logger.info("ds open_lobby: sent %d discord ids for roster pre-seed", len(roster))
         if new_id is None:
             logger.warning(
                 "ds open_lobby: could not open a draft (see the open-draft line above); "
@@ -128,6 +141,7 @@ class DraftLifecycle:
                 platform=self._platform(),
                 twitch_channel=self._twitch_channel(),
                 draft_id=self._draft_id,
+                roster=list(self._roster),
                 **self._args(),
             )
         except Exception as e:
@@ -173,6 +187,7 @@ class DraftLifecycle:
             logger.debug("ds close: no draft open — nothing to close")
             return False
         draft_id, self._draft_id = self._draft_id, None
+        self._roster = []
         if not self.enabled:
             logger.debug("ds ingest disabled (no ds_ingest_token) — not closing draft %s", draft_id)
             return False

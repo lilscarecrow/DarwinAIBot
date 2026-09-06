@@ -52,7 +52,8 @@ sends `Authorization: Bearer <ds_ingest_token>`. JSON unless noted.
 ### POST /api/ingest/open-draft
 
 ```json
-{"platform": "pc", "players": ["Alpha", "Bravo"], "twitch_channel": "yourchannel", "draft_id": 245}
+{"platform": "pc", "players": ["Alpha", "Bravo"], "twitch_channel": "yourchannel", "draft_id": 245,
+ "roster": ["123456789012345678", "234567890123456789"]}
 ```
 
 - `players`: 0–20 names, **empty list allowed** (`player_names` is accepted as
@@ -61,7 +62,15 @@ sends `Authorization: Bearer <ds_ingest_token>`. JSON unless noted.
 - `draft_id`: optional; when it names an open draft owned by this token, that
   draft is reused (names added, channel refreshed). Otherwise the server uses
   the token's most recent open draft, or creates a fresh one.
-- `200 {"draft_id": 245, "created": true, "rows": 2}`
+- `roster`: optional, ≤20 Discord IDs — the scrim signup reactors the bot
+  captures at `/custom`. The lobby-time open sends them; the server pre-seeds
+  every id that is linked to a ladder player with that player's canonical
+  name (so the card shows real names before any OCR runs) and skips unlinked
+  ids. The match-start open sends OCR names only; the server matches them
+  against the seeded roster by identity, so a nameplate read of a seeded
+  player never becomes a duplicate row.
+- `200 {"draft_id": 245, "created": true, "rows": 2, "roster_resolved": 2}` —
+  `roster_resolved` = how many Discord IDs became rows.
 - `400` validation (bad platform, a name over 64 chars, channel empty or over
   64 chars), `401` bad token, `422` malformed body.
 

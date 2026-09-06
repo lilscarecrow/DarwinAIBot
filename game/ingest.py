@@ -82,9 +82,15 @@ def open_set_draft(
     platform: str = "pc",
     twitch_channel: Optional[str] = None,
     draft_id: Optional[int] = None,
+    roster: Optional[list[str]] = None,
 ) -> Optional[int]:
     """
     POST to /api/ingest/open-draft: open (or refresh) the draft for this lobby.
+
+    roster: the lobby's Discord IDs (the scrim signup reactors). The server
+    pre-seeds every id that is linked to a player on the ladder with that
+    player's canonical name, and skips unlinked ids. Sent as "roster" only
+    when non-empty, capped at 20.
 
     ALWAYS sends the request when called — an empty roster is a legitimate
     "lobby forming" open, sent as `"players": []`. (Earlier versions skipped the
@@ -112,6 +118,9 @@ def open_set_draft(
         payload["twitch_channel"] = twitch_channel
     if draft_id is not None:
         payload["draft_id"] = draft_id
+    ids = [str(r).strip() for r in (roster or []) if str(r).strip()]
+    if ids:
+        payload["roster"] = ids[:20]
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=_OPEN_DRAFT_TIMEOUT_SECONDS)

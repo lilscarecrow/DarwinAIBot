@@ -9,11 +9,13 @@ from game.ds_lifecycle import DraftLifecycle
 class FakeTransport:
     def __init__(self, open_result=11, close_result=True):
         self.calls = []
+        self.rosters = []
         self.open_result = open_result
         self.close_result = close_result
 
-    def open_set_draft(self, names, base_url, token, platform="pc", twitch_channel=None, draft_id=None):
+    def open_set_draft(self, names, base_url, token, platform="pc", twitch_channel=None, draft_id=None, roster=None):
         self.calls.append(("open", list(names), platform, twitch_channel, draft_id, base_url, token))
+        self.rosters.append(list(roster or []))
         return self.open_result() if callable(self.open_result) else self.open_result
 
     def close_set_draft(self, draft_id, base_url, token, reason=""):
@@ -52,6 +54,26 @@ def test_open_lobby_opens_empty_roster_with_channel():
     assert ds.open_lobby() == 11
     assert ds.draft_id == 11
     assert t.calls == [("open", [], "pc", "scarecrow", None, "https://ds.test", "tok")]
+
+
+def test_open_lobby_forwards_discord_roster():
+    ds, t = make()
+    ds.open_lobby(roster=["111", "222"])
+    assert t.rosters == [["111", "222"]]
+    # Match-start top-up re-sends the lobby's roster so the server fuzzy-matches
+    # OCR names against THIS lobby, not the whole season.
+    ds.on_match_start(["Alpha"])
+    assert t.rosters[-1] == ["111", "222"]
+    # A close forgets it; the next lobby starts clean.
+    ds.close("quit")
+    ds.open_lobby()
+    assert t.rosters[-1] == []
+
+
+def test_open_lobby_without_roster_sends_empty_list():
+    ds, t = make()
+    ds.open_lobby()
+    assert t.rosters == [[]]
 
 
 def test_open_lobby_warns_when_channel_missing(caplog):

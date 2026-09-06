@@ -633,10 +633,15 @@ class DirectorCog(commands.Cog):
             self._ds.close(reason)
 
     async def _open_ds_draft(self):
-        """Open the ladder draft for a freshly created lobby (blocking HTTP → executor)."""
+        """Open the ladder draft for a freshly created lobby (blocking HTTP → executor).
+
+        Passes the scrim signup roster (Discord IDs captured just above in
+        /custom) so the ladder can pre-seed linked players by canonical name.
+        """
         loop = asyncio.get_running_loop()
+        roster = self._resolved_roster
         try:
-            await loop.run_in_executor(None, self._ds.open_lobby)
+            await loop.run_in_executor(None, lambda: self._ds.open_lobby(roster=roster))
         except Exception as e:
             logger.warning("darwinstalker open_lobby failed: %s", e)
 

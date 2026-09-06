@@ -45,6 +45,20 @@ def test_open_forwards_draft_id_and_platform(requests_mock):
     assert body["platform"] == "xbox"
 
 
+def test_open_forwards_roster_ids_capped(requests_mock):
+    m = requests_mock.post(_open_url(), json={"draft_id": 42})
+    ingest.open_set_draft([], BASE, TOKEN, roster=[str(i) for i in range(25)])
+    body = m.last_request.json()
+    assert body["roster"] == [str(i) for i in range(20)]
+
+
+@pytest.mark.parametrize("roster", [None, [], ["  "]])
+def test_open_omits_roster_when_empty(requests_mock, roster):
+    m = requests_mock.post(_open_url(), json={"draft_id": 42})
+    ingest.open_set_draft(["A"], BASE, TOKEN, roster=roster)
+    assert "roster" not in m.last_request.json()
+
+
 def test_open_omits_draft_id_when_none(requests_mock):
     m = requests_mock.post(_open_url(), json={"draft_id": 1})
     ingest.open_set_draft(["A"], BASE, TOKEN)
