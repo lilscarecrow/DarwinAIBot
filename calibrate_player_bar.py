@@ -38,6 +38,9 @@ def main() -> int:
     ap.add_argument("--sweep", action="store_true", help="also try separator thresholds 10-85")
     ap.add_argument("--out", help="annotated image path (default: <frame>.annotated.png)")
     ap.add_argument("--json", action="store_true", help="print the report as JSON instead of text")
+    ap.add_argument("--detector", choices=["v2", "v1", "both"], default="both",
+                    help="v2 = geometry detector (recommended), v1 = separator scan, both (default)")
+    ap.add_argument("--expected", type=int, help="v2: the lobby's player count, if known")
     a = ap.parse_args()
 
     img = cv2.imread(a.frame)
@@ -58,10 +61,24 @@ def main() -> int:
         "player_name_y_in_bar": a.name_y,
         "player_name_h": a.name_h,
     }
-    rep = analyze(img, config, overrides, ocr=not a.no_ocr)
-    rows = sweep(img, rep.config) if a.sweep and rep.bar else None
+    from game.player_bar_calibration import analyze_v2, annotate_v2, format_report_v2
+
+    rep2 = analyze_v2(img, config, expected=a.expected, ocr=not a.no_ocr) if a.detector in ("v2", "both") else None
+    rep = analyze(img, config, overrides, ocr=not a.no_ocr) if a.detector in ("v1", "both") else None
+    rows = sweep(img, rep.config) if (rep is not None and a.sweep and rep.bar) else None
     out = a.out or (str(Path(a.frame).with_suffix("")) + ".annotated.png")
-    cv2.imwrite(out, annotate(img, rep))
+    ann = img
+    if rep is not None:
+        ann = annotate(ann, rep)
+    if rep2 is not None:
+        ann = annotate_v2(ann, rep2)
+    cv2.imwrite(out, ann)
+    if rep2 is not None and not a.json:
+        print(format_report_v2(rep2))
+        print("")
+    if rep is None:
+        print(f"annotated image -> {out}")
+        return 0 if not rep2.problems else 1
     if a.json:
         print(json.dumps({
             "report": {"bar": rep.bar, "separators": rep.separators,
@@ -74,7 +91,7 @@ def main() -> int:
         print(f"annotated image -> {out}")
         print("config.json snippet:")
         print(json.dumps(config_snippet(rep), indent=2))
-    return 0 if not rep.problems else 1
+    return 0 if not rep.problems and not (rep2 is not None and rep2.problems) else 1
 
 
 if __name__ == "__main__":

@@ -367,6 +367,8 @@ def main():
                     cfg = {}
                     if Path("config.json").exists():
                         cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
+                    from game.player_bar_calibration import analyze_v2, format_report_v2
+                    print(format_report_v2(analyze_v2(img, cfg)))
                     rep = analyze(img, cfg)
                     print(format_report(rep, sweep(img, rep.config) if rep.bar else None))
                     ann = OUT_DIR / f"player_bar_{ts}.annotated.png"

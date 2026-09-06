@@ -28,7 +28,38 @@ Since the ladder relay shipped (docs/DS_LIFECYCLE_HANDOFF.md), that warning
 also appears on darwinstalker.com's /admin/observability as `bot.warning`
 after the bot is restarted, so lo can see it without your log.
 
-## 2. The keys
+## 1b. The V2 detector (2026-09-06) — use this
+
+Running V1 on real 1920×1080 frames from the Twitch VOD showed it cannot
+work even with a perfect region: the separator scan found 23-61
+"separators" per frame (the translucent HUD lets the scenery through), and
+the strip is not a fixed box — it is centred on the screen and its width
+follows the player count.
+
+`game/player_cards_v2.py` uses that geometry instead: card centres are
+`960 + (i − (n−1)/2) × 131.6` for a count n, and each candidate is read by
+the one thing every card has — the name band (solid bright colour = alive)
+or the red X over the portrait (= eliminated). The spectated player's card
+is drawn larger with its band lower, so the band is searched over a row
+range. No calibration is needed at 1920×1080. It is exact on all five
+labelled VOD frames in `tests/fixtures/player_bar/` (blood-moon tint, snow,
+the director-panel layout, spectated cards), and `pytest` keeps it that way.
+
+Pick the detector in config.json:
+
+| `player_bar_detector` | what runs |
+|---|---|
+| `"v1"` (default) | today's behaviour, unchanged |
+| `"shadow"` | V1 drives the match; V2 also runs and reports `detector_v2` (count, alive, positions) at match start and `eliminated_v2` on every flip it sees — compare against the game's alive counter and V1 on the ladder's event stream, zero risk |
+| `"v2"` | V2 drives slots, names and alive/dead; V1 is not used |
+
+Recommended path: `"shadow"` for one session, then `"v2"`.
+
+Check any frame yourself: `python calibrate_player_bar.py frame.png`
+prints both detectors (V2 first) and draws V2's cards on the annotated
+image (green = alive, red = dead, orange line = band row).
+
+## 2. The keys (V1 only)
 
 | key | default | meaning |
 |---|---|---|
@@ -93,6 +124,14 @@ No terminal input is needed at F8, so it works while the game has focus.
   slots, i.e. this document's problem.
 
 ## 6. Known limits (worth fixing next)
+
+- V2 assumes 1920×1080 with the strip centred at x=960 and a 131.6px pitch
+  (`player_cards_center_x` / `player_cards_pitch` in config if the game
+  changes). It reads the LOBBY snapshot at match start like V1 does; on a
+  menu screen it can report a phantom 2-card row, which is why it only runs
+  where V1 ran.
+- V2 name OCR crops the band; unverified here (no tesseract on the Linux
+  box). The ladder seeds names from the Discord roster regardless.
 
 - Alive/dead is ONE pixel of the portrait. CLAUDE.md's own "Player-Targeted
   Cards" notes say the reliable signal is the health bar at the bottom of the

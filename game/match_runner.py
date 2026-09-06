@@ -83,6 +83,12 @@ class MatchRunner:
         self._player_names: list[str] = []
         self._player_alive: list[bool] = []
         self._first_blood_logged: bool = False
+        # V2 card detector state (game/player_cards_v2.py). In "v2" mode these
+        # feed _player_slot_xs / _player_alive; in "shadow" mode they run
+        # alongside V1 and only report (detector_v2 / eliminated_v2 events).
+        self._v2_xs: list[int] = []
+        self._v2_alive: list[bool] = []
+        self._v2_names: list[str] = []
         # monotonic clock at match start; every live event carries elapsed_ms from it
         self._match_started_at: Optional[float] = None
         # Latest confirmed director-points reading — see _update_points_reading().
@@ -222,7 +228,7 @@ class MatchRunner:
 
                 # Poll the player bar all match: first blood once, and every
                 # elimination as a live event for the ladder's LIVE card.
-                if self._player_slot_xs:
+                if self._player_slot_xs or self._v2_xs:
                     from game.screen_detection import take_screenshot as _take_ss
                     self._poll_player_bar(_take_ss())
 
@@ -281,6 +287,11 @@ class MatchRunner:
         from game.ocr import ocr_player_names
 
         screenshot = take_screenshot()
+        mode = self._detector_mode()
+        if mode != "v1":
+            self._init_player_bar_v2(screenshot, drive=(mode == "v2"))
+            if mode == "v2":
+                return
         self._player_slot_xs = detect_player_slot_xs(screenshot, self._config)
         if not self._player_slot_xs:
             logger.warning(
@@ -296,21 +307,100 @@ class MatchRunner:
         for i, (name, x) in enumerate(zip(self._player_names, self._player_slot_xs)):
             logger.info("  slot %d  x=%-4d  %s", i + 1, x, name or "(unread)")
 
+    # ------------------------------------------------------------------
+    # V2 card detector (config player_bar_detector: "v1" | "v2" | "shadow")
+    # ------------------------------------------------------------------
+
+    def _detector_mode(self) -> str:
+        mode = str(self._config.get("player_bar_detector", "v1")).strip().lower()
+        return mode if mode in ("v1", "v2", "shadow") else "v1"
+
+    def _init_player_bar_v2(self, screenshot, drive: bool) -> None:
+        """Run the geometry detector on the lobby snapshot. drive=True makes it
+        the source of slots/names/alive for this match; drive=False (shadow)
+        records what it saw for an A/B against V1 without touching the match."""
+        from game import player_cards_v2 as v2
+        expected = None
+        if self._ds is not None:
+            try:
+                expected = self._ds.roster_size or None
+            except Exception:
+                expected = None
+        try:
+            cards = v2.detect_cards(screenshot, self._config, expected=expected)
+        except Exception as e:
+            logger.warning("Player bar v2: detection failed: %s", e)
+            cards = []
+        names: list[str] = []
+        if cards:
+            try:
+                names = v2.ocr_names(screenshot, cards, self._config)
+            except Exception as e:
+                logger.debug("Player bar v2: name OCR failed: %s", e)
+                names = []
+        if len(names) != len(cards):
+            names = ["" for _ in cards]
+        self._v2_xs = [c.x for c in cards]
+        self._v2_alive = [c.alive for c in cards]
+        self._v2_names = names
+        n_alive = sum(1 for c in cards if c.alive)
+        logger.info("Player bar v2 (%s): %d cards, %d alive", "driving" if drive else "shadow", len(cards), n_alive)
+        for c in cards:
+            logger.info("  v2 slot %d  x=%-4d  %s  %s", c.index + 1, c.x, "alive" if c.alive else "DEAD", names[c.index] or "(unread)")
+        self._emit("detector_v2", elapsed_ms=0, drive=drive, n=len(cards), alive=n_alive,
+                   xs=self._v2_xs, names=[nm or None for nm in names])
+        if not drive:
+            return
+        if not cards:
+            logger.warning("Player bar v2: no cards detected — player tracking disabled for this match")
+            return
+        self._player_slot_xs = list(self._v2_xs)
+        self._player_names = list(names)
+        self._player_alive = list(self._v2_alive)
+        logger.info("Player bar snapshot (v2) — %d players:", len(self._player_slot_xs))
+        for i, (name, x) in enumerate(zip(self._player_names, self._player_slot_xs)):
+            logger.info("  slot %d  x=%-4d  %s", i + 1, x, name or "(unread)")
+
+    def _poll_player_bar_v2_shadow(self, screenshot) -> None:
+        """Shadow mode: re-read alive/dead at V2's card columns and emit
+        eliminated_v2 for every flip, so the ladder's event stream shows what
+        V2 would have reported next to what V1 did."""
+        if not self._v2_xs:
+            return
+        from game import player_cards_v2 as v2
+        try:
+            new = v2.cards_alive(screenshot, self._v2_xs, self._config)
+        except Exception as e:
+            logger.debug("Player bar v2 shadow poll failed: %s", e)
+            return
+        alive_after = sum(1 for a in new if a)
+        for i, (was, now) in enumerate(zip(self._v2_alive, new)):
+            if was and not now:
+                name = self._v2_names[i] if i < len(self._v2_names) and self._v2_names[i] else f"slot {i + 1}"
+                self._emit("eliminated_v2", slot=i, player=name, alive=alive_after)
+        self._v2_alive = new
+
     def _poll_player_bar(self, screenshot):
         """
         Check alive/eliminated status for each player slot.
         On the first death (first blood), logs the victim and attempts to OCR
         the kill notification text to identify the killer.
         """
+        mode = self._detector_mode()
+        if mode == "shadow":
+            self._poll_player_bar_v2_shadow(screenshot)
         if not self._player_slot_xs:
             return
 
-        from game.screen_detection import sample_player_alive
-
-        new_alive = [
-            sample_player_alive(screenshot, x, self._config)
-            for x in self._player_slot_xs
-        ]
+        if mode == "v2":
+            from game import player_cards_v2 as v2
+            new_alive = v2.cards_alive(screenshot, self._player_slot_xs, self._config)
+        else:
+            from game.screen_detection import sample_player_alive
+            new_alive = [
+                sample_player_alive(screenshot, x, self._config)
+                for x in self._player_slot_xs
+            ]
 
         prev_dead = sum(1 for a in self._player_alive if not a)
         curr_dead = sum(1 for a in new_alive if not a)

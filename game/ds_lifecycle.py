@@ -76,6 +76,12 @@ class DraftLifecycle:
         return bool(self._config.get("ds_ingest_token"))
 
     @property
+    def roster_size(self) -> int:
+        """Signup reactors known for this lobby (0 when none) — the V2 card
+        detector's expected-count hint."""
+        return len(self._roster)
+
+    @property
     def draft_id(self) -> Optional[int]:
         return self._draft_id
 

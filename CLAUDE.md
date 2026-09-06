@@ -736,7 +736,10 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     // ladder's live feed ALL start here. NOT SET = the bot logs "no slots detected — player
     // tracking disabled" and sends none of it. Calibrate with `python calibrate_player_bar.py
     // <frame.png>` (offline, any machine) or F8 in calibrate.py (live) — docs/PLAYER_BAR_CALIBRATION.md.
-    "player_bar_region": null,           // [x0, y0, x1, y1] of the whole card strip at 1920×1080 — REQUIRED for tracking
+    "player_bar_detector": "v1",         // "v1" = separator scan (needs the keys below), "v2" = geometry detector (game/player_cards_v2.py,
+                                         //   no calibration at 1920×1080, proven on VOD frames), "shadow" = v1 drives, v2 reports
+                                         //   detector_v2 / eliminated_v2 events for an A/B. See docs/PLAYER_BAR_CALIBRATION.md.
+    "player_bar_region": null,           // [x0, y0, x1, y1] of the whole card strip at 1920×1080 — REQUIRED for v1 tracking
     "player_separator_threshold": 25,    // max-channel brightness below which a column counts as a card separator
     "player_portrait_y_in_bar": 35,      // y offset inside the bar where one portrait pixel is sampled for alive/dead
     "player_saturation_threshold": 40,   // HSV saturation above which that pixel means "alive" (eliminated portraits go grey)

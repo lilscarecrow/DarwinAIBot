@@ -144,6 +144,8 @@ draft is open; a queue over 1000 drops the newest.
 | `match_start` | after the lobby nameplates are read    | `elapsed_ms: 0`   | `slots`: name or null per slot          |
 | `first_blood` | first alive→dead flip (once per game)  | `slot`, `player`  | `notification`: OCR'd kill text or null |
 | `eliminated`  | every alive→dead flip, all match       | `slot`, `player`  | `alive`: players still alive after it   |
+| `detector_v2` | at match start when `player_bar_detector` is `shadow` or `v2` | `elapsed_ms: 0` | `drive`, `n`, `alive`, `xs`, `names` — what the V2 card detector saw (docs/PLAYER_BAR_CALIBRATION.md) |
+| `eliminated_v2` | shadow mode only: every flip V2 saw   | `slot`, `player`  | `alive` — compare with `eliminated` (V1) and the HUD counter |
 | `match_end`   | placement badge detected               | `elapsed_ms`      | —                                       |
 | `card_play`   | the director fires a card              | —                 | `card`: card_type, `name`: event name   |
 | `say`         | `/say` megaphone                       | —                 | `text`, `by` (Discord display name)     |
