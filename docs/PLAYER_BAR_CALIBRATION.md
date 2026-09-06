@@ -130,8 +130,16 @@ No terminal input is needed at F8, so it works while the game has focus.
   changes). It reads the LOBBY snapshot at match start like V1 does; on a
   menu screen it can report a phantom 2-card row, which is why it only runs
   where V1 ran.
-- V2 name OCR crops the band; unverified here (no tesseract on the Linux
-  box). The ladder seeds names from the Discord roster regardless.
+- V2 name OCR, measured on the 48 name bands in the fixtures with the SAME
+  Windows tesseract 5.4 binary the bot uses (`C:\Program Files\Tesseract-OCR`):
+  35/48 exact. The misses are the `:]` handle (a symbol, 5 crops), `SlyK`
+  read as `SlvK` (5 crops — the ladder's glyph fold now maps y→v, so it
+  resolves to SlyK), and three one-glyph slips. The preprocessing that won
+  (`ocr_prepare`: per-pixel min channel, inverted, 4x, padded, psm 7) beat
+  V1's grey+Otsu by 5 names; `tests/test_player_cards_v2.py::test_name_ocr_reads_most_bands_exactly`
+  re-measures it wherever a tesseract is reachable (`TESSERACT_CMD=...`).
+  The ladder seeds names from the Discord roster regardless, so OCR only
+  labels elimination lines for unlinked players.
 
 - Alive/dead is ONE pixel of the portrait. CLAUDE.md's own "Player-Targeted
   Cards" notes say the reliable signal is the health bar at the bottom of the

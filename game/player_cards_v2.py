@@ -186,10 +186,26 @@ def name_crop(img: np.ndarray, card: Card, cfg: Optional[dict] = None) -> np.nda
     return img[y0:y0 + 18, max(0, card.x - 50):card.x + 50]
 
 
+def ocr_prepare(crop: np.ndarray, scale: int = 4, pad: int = 20) -> np.ndarray:
+    """Name-band crop → image tesseract reads best (measured on 48 VOD crops
+    with the same Windows tesseract 5.4 the bot uses: 35/48 exact vs 30/48
+    for V1's grey+Otsu, the rest being the unreadable ':]' handle and y↔v
+    slips the ladder's glyph fold absorbs).
+
+    The band is WHITE text on a SATURATED colour (or grey on dark when
+    eliminated). A plain grey conversion throws that contrast away — a blue
+    band and white text have similar luma. The per-pixel MIN channel keeps
+    it: white text stays bright, a coloured band goes dark. Inverted so the
+    text is dark on light (tesseract's preference), left un-thresholded, and
+    padded with a white border so the line is not glued to the edges."""
+    up = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    g = np.min(up, axis=2).astype(np.uint8)
+    return cv2.copyMakeBorder(255 - g, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+
+
 def ocr_names(img: np.ndarray, cards: list[Card], cfg: Optional[dict] = None) -> list[str]:
     """Best-effort names via the same tesseract path V1 uses; [] if OCR is
-    unavailable. Alive bands are white-on-colour, dead ones grey-on-dark, so
-    the crop is thresholded per card (Otsu) after a 4x upscale like V1."""
+    unavailable. See ocr_prepare for the preprocessing."""
     try:
         from game.ocr import _ocr_region_img
     except Exception:
@@ -200,11 +216,8 @@ def ocr_names(img: np.ndarray, cards: list[Card], cfg: Optional[dict] = None) ->
         if crop.size == 0:
             names.append("")
             continue
-        scaled = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         try:
-            names.append(_ocr_region_img(thresh, config="--psm 7").strip())
+            names.append(_ocr_region_img(ocr_prepare(crop), config="--psm 7").strip())
         except Exception:
             names.append("")
     return names

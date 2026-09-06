@@ -73,3 +73,53 @@ def test_config_overrides_and_positions():
     cfg = v2.v2_config({"player_cards_pitch": 100, "player_cards_center_x": 500})
     assert v2.positions(3, cfg) == [400, 500, 600]
     assert v2.positions(2, cfg) == [450, 550]
+
+
+# ── name OCR: runs only where a tesseract binary is reachable ──────────────
+NAMES = {
+    "vod_900.png": ["Nivoko", "SlyK", "Dom!n4toR", "BenHope", ":]", "Philipeace", "Justice", "coco pops", "-LAGADOU", "soid"],
+    "vod_2100.png": ["Nivoko", "SlyK", "Dom!n4toR", "BenHope", ":]", "Philipeace", "Justice", "coco pops", "-LAGADOU", "soid"],
+    "vod_2700.png": ["Nivoko", "SlyK", "Dom!n4toR", "BenHope", ":]", "Philipeace", "Justice", "coco pops", "-LAGADOU", "soid"],
+    "vod_3300.png": ["Nivoko", "SlyK", "Dom!n4toR", "BenHope", ":]", "Philipeace", "Justice", "-LAGADOU", "soid"],
+    "vod_3600.png": ["Nivoko", "SlyK", "Dom!n4toR", "BenHope", ":]", "Philipeace", "Justice", "-LAGADOU", "soid"],
+}
+
+
+def _tesseract_available():
+    try:
+        import pytesseract
+        if isinstance(pytesseract, MagicMock):
+            return False
+        cmd = os.environ.get("TESSERACT_CMD")
+        if cmd:
+            pytesseract.pytesseract.tesseract_cmd = cmd
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+def _norm(s):
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+@pytest.mark.skipif(not _tesseract_available(), reason="no tesseract binary (set TESSERACT_CMD to point at one)")
+def test_name_ocr_reads_most_bands_exactly():
+    """Floor measured with Windows tesseract 5.4 (the bot's binary): 35/48.
+    The unreadable ones are the ':]' handle (a symbol, 5 crops) and single-
+    glyph slips (SlvK) that the ladder's glyph fold resolves. Fail below 30
+    so a preprocessing regression shows up wherever OCR can run."""
+    hit = total = 0
+    misses = []
+    for name, truth in NAMES.items():
+        img = load(name)
+        cards = v2.detect_cards(img)
+        got = v2.ocr_names(img, cards)
+        assert len(got) == len(cards)
+        for c, want in zip(cards, truth):
+            total += 1
+            ok = bool(_norm(want)) and (_norm(got[c.index]) == _norm(want) or _norm(want) in _norm(got[c.index]))
+            hit += ok
+            if not ok:
+                misses.append((name, want, got[c.index]))
+    assert hit >= 30, f"{hit}/{total} exact; misses: {misses}"
