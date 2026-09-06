@@ -52,6 +52,7 @@ VK_F4 = 0x73
 VK_F5 = 0x74
 VK_F6 = 0x75
 VK_F7 = 0x76
+VK_F8 = 0x77
 
 _key_was_down: dict[int, bool] = {}
 
@@ -110,6 +111,8 @@ def _auto_loop():
 
 # ── Calibration session data ──────────────────────────────────────────────────
 _snapshots: list[dict] = []
+# Player-bar keys from the last F8 analysis, merged into the F6 config snippet.
+_player_bar_snippet: dict = {}
 
 
 def _snapshot(img: np.ndarray, tag: str, label: str):
@@ -155,6 +158,9 @@ def _build_config_snippet() -> dict:
         "zone_drop_coordinates":   {str(i): None for i in range(1, 8)},
         "zone_color_thresholds": {"open": None, "closing": None, "closed": None},
     }
+
+    if _player_bar_snippet:
+        snippet.update(_player_bar_snippet)
 
     for s in _snapshots:
         tag, label = s["tag"], s["label"].lower().strip()
@@ -210,6 +216,11 @@ MENU = """
   F6 -> Quit + write calibration_log.json + config snippet
   F7 -> Zone map snapshot (press while holding card — saves
         full screenshot tagged 'zone_map_state' for analysis)
+  F8 -> Player bar check (press IN A MATCH with the card strip
+        visible): saves the frame, runs the bot's own slot /
+        alive / name detection on it with config.json's keys,
+        prints what each stage saw + a config snippet, writes
+        player_bar_*.annotated.png. See docs/PLAYER_BAR_CALIBRATION.md
 ==========================================================
 
 Auto-screenshots every 20 s -> calibration_screenshots/auto_*.png
@@ -337,6 +348,35 @@ def main():
                 _snapshots.append(entry)
                 # Print to console (won't interrupt drag since game window is focused)
                 print(f"\n[F7] Zone map snapshot saved -> {fname}")
+
+            elif _pressed(VK_F8):
+                # Silent capture (no terminal input) so it works mid-match, then
+                # the same analysis calibrate_player_bar.py does offline.
+                img = _take()
+                ts = _stamp()
+                fname = f"player_bar_{ts}.png"
+                _save_img(img, fname)
+                _snapshots.append({
+                    "tag": "player_bar", "label": "player_bar", "file": str(OUT_DIR / fname),
+                    "mouse_x": _mouse()[0], "mouse_y": _mouse()[1],
+                    "pixel_rgb": list(_pixel(img, *_mouse())), "time": ts,
+                })
+                print(f"\n[F8] Player bar frame saved -> {fname}")
+                try:
+                    from game.player_bar_calibration import analyze, annotate, config_snippet, format_report, sweep
+                    cfg = {}
+                    if Path("config.json").exists():
+                        cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
+                    rep = analyze(img, cfg)
+                    print(format_report(rep, sweep(img, rep.config) if rep.bar else None))
+                    ann = OUT_DIR / f"player_bar_{ts}.annotated.png"
+                    cv2.imwrite(str(ann), annotate(img, rep))
+                    print(f"  annotated -> {ann}")
+                    _player_bar_snippet.clear()
+                    _player_bar_snippet.update(config_snippet(rep))
+                    print("  (these keys will be included in the F6 config snippet)")
+                except Exception as e:
+                    print(f"  analysis failed: {e} — run: python calibrate_player_bar.py {OUT_DIR / fname}")
 
             elif _pressed(VK_F6):
                 print("\n[F6] Quitting...")

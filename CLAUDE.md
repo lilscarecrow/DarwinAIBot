@@ -732,6 +732,18 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "screen_poll_interval_seconds": 12,
     "launch_timeout_seconds": 180,
 
+    // Player bar (the in-match HUD card strip). Names, first blood, eliminations and the
+    // ladder's live feed ALL start here. NOT SET = the bot logs "no slots detected — player
+    // tracking disabled" and sends none of it. Calibrate with `python calibrate_player_bar.py
+    // <frame.png>` (offline, any machine) or F8 in calibrate.py (live) — docs/PLAYER_BAR_CALIBRATION.md.
+    "player_bar_region": null,           // [x0, y0, x1, y1] of the whole card strip at 1920×1080 — REQUIRED for tracking
+    "player_separator_threshold": 25,    // max-channel brightness below which a column counts as a card separator
+    "player_portrait_y_in_bar": 35,      // y offset inside the bar where one portrait pixel is sampled for alive/dead
+    "player_saturation_threshold": 40,   // HSV saturation above which that pixel means "alive" (eliminated portraits go grey)
+    "player_name_y_in_bar": 62,          // y offset inside the bar of the nameplate text strip
+    "player_name_h": 14,                 // height of that strip (tesseract OCR crop)
+    "kill_notification_region": null,    // [x, y, w, h] of the kill-feed text, OCR'd once at first blood (optional)
+
     // Video recording
     "recording_enabled": false,          // false = no local recording at all, and therefore no upload attempt either — currently off
     "recording_api_endpoint": "",        // POST endpoint for upload — upload is still a TODO stub; local file is deleted after each match regardless (see Video Recorder section)
@@ -812,6 +824,7 @@ All templates captured at **1920×1080** via pyautogui. Centers listed are for t
 - [x] `director_points_region` calibrated to `[808, 1002, 20, 24]` (2-digit numerator only)
 - [x] `director_points_pips` calibrated in config.json
 - [x] `tts_device` set to `"CABLE Input"` in config.json
+- [ ] `player_bar_region` + the five player-bar keys — never calibrated on any machine as of 2026-09-06 (they were added to the code without a template entry); without `player_bar_region` all player tracking is off. Do it with `calibrate_player_bar.py` / F8 — docs/PLAYER_BAR_CALIBRATION.md
 
 ## Testing Requirements
 

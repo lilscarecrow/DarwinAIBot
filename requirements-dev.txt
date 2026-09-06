@@ -4,3 +4,7 @@
 pytest>=8.0
 requests>=2.31.0
 requests-mock>=1.12
+
+# player-bar analysis tests (tests/test_player_bar_calibration.py) run the real detection
+opencv-python-headless
+numpy
