@@ -86,7 +86,10 @@ sends `Authorization: Bearer <ds_ingest_token>`. JSON unless noted.
 ```
 
 - ≤100 events per call; `draft_id` optional (server falls back to this token's
-  open draft, `404` if none), `game_index` optional 1–4.
+  open draft, `404` if none), `game_index` optional 1–4. The server floors it
+  at the draft's next unrecorded game: a game whose results are already on
+  the draft is over, so events claiming it are counted as the next game's
+  (the response's `game_index` is the one actually used).
 - Each event: `kind` (`[a-z0-9_]{1,40}`), optional `elapsed_ms` (from match
   start), `at` (epoch seconds), `slot` (0-based), `player` (≤64 chars), `data`
   (any JSON ≤2 KB).

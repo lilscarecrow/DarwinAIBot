@@ -51,8 +51,11 @@ class DraftLifecycle:
         # The lobby's Discord IDs from open_lobby, re-sent at match start so the
         # server's fuzzy pool for OCR names is this lobby, not the whole season.
         self._roster: list[str] = []
-        # 1-based game the next events belong to: 1 from open_lobby, +1 after
-        # every results upload, 0 when no lobby is open.
+        # 1-based game the next events belong to: 1 when a draft is first
+        # opened, +1 after every results upload, 0 when no lobby is open.
+        # /custom runs once per GAME and the server keeps every lobby of the
+        # session on the same draft, so open_lobby only restarts the count
+        # when the server hands back a different draft (see open_lobby).
         self._game_index: int = 0
         # Background sender for live events + relayed log lines. Created here,
         # started on first use (only when enabled). Shares an injected transport
@@ -158,7 +161,11 @@ class DraftLifecycle:
 
         This is what lights the Twitch embed on the LIVE tab while the lobby is
         still filling. Always replaces any remembered draft id with the one the
-        server returns — a new lobby is a new draft.
+        server returns. The server answers with this token's open draft when
+        it has one — a set is one draft, its games are its lobbies — so the
+        game counter restarts at 1 only when the id actually changes. (Until
+        2026-09-07 every /custom reset it to 1, and the ladder showed a whole
+        set as "Game 1 in progress" with three games' events folded together.)
 
         roster: the lobby's Discord IDs (signup reactors). The ladder pre-seeds
         the linked ones by canonical name, so the card fills in before any OCR
@@ -193,8 +200,9 @@ class DraftLifecycle:
                 "the results screenshot will create one later but the Twitch embed stays dark"
             )
             return None
+        if new_id != self._draft_id:
+            self._game_index = 1
         self._draft_id = new_id
-        self._game_index = 1
         self._relay_started()
         if not self._twitch_channel():
             logger.warning(

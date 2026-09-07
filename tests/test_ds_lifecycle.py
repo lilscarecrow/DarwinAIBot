@@ -247,6 +247,28 @@ def test_tournament_slug_forwarded_only_when_given():
 
 # ---- game index + live events + log relay ---------------------------------------
 
+def test_reopening_the_same_draft_keeps_the_game_index():
+    # /custom runs once per game; the server answers with the session's open
+    # draft. The counter must carry on, or every game streams as game 1.
+    ds, t = make()
+    ds.open_lobby()
+    ds.post_results("/tmp/g1.png")
+    assert ds.game_index == 2
+    ds.open_lobby()                      # lobby for game 2 → same draft 11
+    assert ds.game_index == 2
+    ds.event("match_start", elapsed_ms=0)
+    ds.relay.flush(2.0)
+    ev_calls = [c for c in t.calls if c[0] == "events"]
+    assert ev_calls and ev_calls[-1][2] == 2
+    ds.post_results("/tmp/g2.png")
+    ds.open_lobby()
+    assert ds.game_index == 3
+    # A different draft (previous one closed server-side) is a new set: back to 1.
+    t.open_result = 12
+    ds.open_lobby()
+    assert ds.draft_id == 12 and ds.game_index == 1
+
+
 def test_game_index_tracks_lobby_results_close():
     ds, t = make()
     assert ds.game_index == 0
