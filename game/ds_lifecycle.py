@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 from game.ds_relay import DsRelay
+from game.name_snap import NameSnapper
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,33 @@ def _default_transport():
     )
 
 
+def _normalize_roster(roster) -> list:
+    """Roster members as sent on the wire: `"id"` or `{"id", "names"}`.
+    Accepts ids, dicts, or objects with .id/.name/.global_name/.nick."""
+    out = []
+    for r in roster or []:
+        if isinstance(r, dict):
+            rid = str(r.get("id") or "").strip()
+            names = [str(n).strip() for n in ([r.get("name")] + list(r.get("names") or [])) if n and str(n).strip()]
+        elif hasattr(r, "id"):
+            rid = str(getattr(r, "id") or "").strip()
+            names = [str(n).strip() for n in (getattr(r, "nick", None), getattr(r, "global_name", None), getattr(r, "name", None)) if n and str(n).strip()]
+        else:
+            rid, names = str(r).strip(), []
+        if not rid:
+            continue
+        dedup = []
+        for n in names:
+            if n not in dedup:
+                dedup.append(n)
+        out.append({"id": rid, "names": dedup} if dedup else rid)
+    return out
+
+
+def _roster_ids(roster) -> list[str]:
+    return [e["id"] if isinstance(e, dict) else str(e) for e in _normalize_roster(roster)]
+
+
 class DraftLifecycle:
     def __init__(self, config: dict, transport=None):
         self._config = config or {}
@@ -50,7 +78,15 @@ class DraftLifecycle:
         self._draft_id: Optional[int] = None
         # The lobby's Discord IDs from open_lobby, re-sent at match start so the
         # server's fuzzy pool for OCR names is this lobby, not the whole season.
-        self._roster: list[str] = []
+        self._roster: list = []
+        # What the ladder told us about this lobby on the last open-draft
+        # reply: each known member with every name they may appear as
+        # (`lobby`), the flat OCR snap set (`expected_names`), and the ids
+        # nobody is linked to (`unlinked`, with the Discord names we sent).
+        self._lobby: list[dict] = []
+        self._expected_names: list[str] = []
+        self._unlinked: list[dict] = []
+        self._snapper = NameSnapper(None)
         # 1-based game the next events belong to: 1 when a draft is first
         # opened, +1 after every results upload, 0 when no lobby is open.
         # /custom runs once per GAME and the server keeps every lobby of the
@@ -87,6 +123,49 @@ class DraftLifecycle:
     @property
     def draft_id(self) -> Optional[int]:
         return self._draft_id
+
+    @property
+    def lobby(self) -> list[dict]:
+        return list(self._lobby)
+
+    @property
+    def expected_names(self) -> list[str]:
+        return list(self._expected_names)
+
+    @property
+    def unlinked(self) -> list[dict]:
+        """Roster members the ladder has no link for: [{discord_id, names}]."""
+        return list(self._unlinked)
+
+    def snap_names(self, reads: list[str]) -> list[str]:
+        """Player-bar OCR reads → canonical ladder names where one player
+        matches unambiguously (game/name_snap.py); everything else verbatim."""
+        try:
+            return self._snapper.snap_all(list(reads))
+        except Exception as e:
+            logger.debug("name snap failed: %s", e)
+            return list(reads)
+
+    def _take_reply(self, result) -> Optional[int]:
+        """open_set_draft's result → draft id; remember the lobby view if the
+        reply carried one. Accepts a bare id (older transports, tests)."""
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            draft_id = result.get("draft_id")
+            if draft_id is None:
+                return None
+            if "lobby" in result or "unlinked" in result:
+                self._lobby = [m for m in (result.get("lobby") or []) if isinstance(m, dict)]
+                self._expected_names = [str(n) for n in (result.get("expected_names") or [])]
+                self._unlinked = [u for u in (result.get("unlinked") or []) if isinstance(u, dict)]
+                self._snapper = NameSnapper(self._lobby)
+                logger.info(
+                    "ds lobby: %d known player(s), %d expected name(s), %d unlinked",
+                    len(self._lobby), len(self._expected_names), len(self._unlinked),
+                )
+            return int(draft_id)
+        return int(result)
 
     @property
     def game_index(self) -> int:
@@ -176,19 +255,19 @@ class DraftLifecycle:
         if not self.enabled:
             logger.debug("ds ingest disabled (no ds_ingest_token) — not opening a draft")
             return None
-        self._roster = [str(r) for r in (roster or []) if str(r).strip()]
+        self._roster = _normalize_roster(roster)
         kwargs = {}
         if tournament_slug:
             kwargs["tournament_slug"] = str(tournament_slug).strip()
         try:
-            new_id = self._transport.open_set_draft(
+            new_id = self._take_reply(self._transport.open_set_draft(
                 list(names or []),
                 platform=self._platform(),
                 twitch_channel=self._twitch_channel(),
                 roster=list(self._roster),
                 **kwargs,
                 **self._args(),
-            )
+            ))
         except Exception as e:  # transport promised not to raise; belt and braces
             logger.warning("ds open_lobby: transport raised %s", e)
             new_id = None
@@ -233,14 +312,14 @@ class DraftLifecycle:
             )
             return self._draft_id
         try:
-            new_id = self._transport.open_set_draft(
+            new_id = self._take_reply(self._transport.open_set_draft(
                 clean,
                 platform=self._platform(),
                 twitch_channel=self._twitch_channel(),
                 draft_id=self._draft_id,
                 roster=list(self._roster),
                 **self._args(),
-            )
+            ))
         except Exception as e:
             logger.warning("ds on_match_start: transport raised %s", e)
             new_id = None
@@ -266,7 +345,7 @@ class DraftLifecycle:
             self._transport.post_results_screenshot(
                 png_path,
                 platform=self._platform(),
-                roster=roster,
+                roster=_roster_ids(roster) if roster else roster,
                 draft_id=self._draft_id,
                 **self._args(),
             )
@@ -293,6 +372,8 @@ class DraftLifecycle:
         self._relay.flush(2.0)
         draft_id, self._draft_id = self._draft_id, None
         self._roster = []
+        self._lobby, self._expected_names, self._unlinked = [], [], []
+        self._snapper = NameSnapper(None)
         self._game_index = 0
         if not self.enabled:
             logger.debug("ds ingest disabled (no ds_ingest_token) — not closing draft %s", draft_id)

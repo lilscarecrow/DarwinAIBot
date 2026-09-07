@@ -638,6 +638,23 @@ class DirectorCog(commands.Cog):
             # No running loop (shutdown path) — close inline, still never raises.
             self._ds.close(reason)
 
+    def _unlinked_nudge(self) -> Optional[str]:
+        """One line naming the roster members the ladder cannot place, with
+        where to fix it — the only thing that grows Steam↔Discord coverage is
+        the player claiming their handle. None when everyone is known."""
+        try:
+            unlinked = self._ds.unlinked
+        except Exception:
+            return None
+        if not unlinked:
+            return None
+        mentions = " ".join(f"<@{u.get('discord_id')}>" for u in unlinked[:10] if u.get("discord_id"))
+        site = (self.bot.config.get("ds_ingest_base_url") or "https://darwinstalker.com").rstrip("/")
+        return (
+            f"{mentions}\nSign in with Steam at {site} and claim your handle "
+            f"(or link Discord on your profile) so your results land on your profile."
+        )
+
     async def _open_ds_draft(self):
         """Open the ladder draft for a freshly created lobby (blocking HTTP → executor).
 
@@ -923,7 +940,22 @@ class DirectorCog(commands.Cog):
                 if signup_message is not None:
                     reactors = await scrim_cog._reactors(signup_message)
                     if reactors:
-                        self._resolved_roster = [str(u.id) for u in reactors[:10]]
+                        # Ids plus what Discord calls each member (server nick,
+                        # display name, username): the ladder links an unlinked
+                        # id whose name matches one of the lobby's players.
+                        self._resolved_roster = [
+                            {
+                                "id": str(u.id),
+                                "names": [
+                                    n for n in (
+                                        getattr(u, "nick", None),
+                                        getattr(u, "global_name", None),
+                                        getattr(u, "name", None),
+                                    ) if n
+                                ],
+                            }
+                            for u in reactors[:10]
+                        ]
         except Exception as e:
             logger.warning("Could not capture scrim roster for ingest: %s", e)
 
@@ -990,6 +1022,9 @@ class DirectorCog(commands.Cog):
             embed.add_field(name="Region", value=region.name, inline=True)
             embed.add_field(name="Profile", value=_profile_label, inline=True)
             embed.add_field(name="Lobby Code", value=f"```{lobby_code}```", inline=False)
+            nudge = self._unlinked_nudge()
+            if nudge:
+                embed.add_field(name="Not on the ladder yet", value=nudge, inline=False)
             if obs_control.is_enabled():
                 embed.add_field(name="Twitch Stream", value=stream_status_text, inline=False)
             await interaction.followup.send(embed=embed)

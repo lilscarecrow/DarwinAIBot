@@ -247,6 +247,42 @@ def test_tournament_slug_forwarded_only_when_given():
 
 # ---- game index + live events + log relay ---------------------------------------
 
+def test_open_reply_dict_feeds_lobby_snapping_and_unlinked():
+    reply = {
+        "draft_id": 11, "created": True, "rows": 2, "roster_resolved": 1,
+        "lobby": [{"discord_id": "d1", "player": "Caution", "persona": "Robocop", "names": ["Caution", "Robocop"]}],
+        "expected_names": ["Caution", "Robocop"],
+        "unlinked": [{"discord_id": "d2", "names": ["zombie"]}],
+    }
+    ds, t = make(open_result=reply)
+    assert ds.open_lobby(roster=["d1", {"id": "d2", "names": ["zombie"]}]) == 11
+    assert ds.draft_id == 11
+    assert ds.expected_names == ["Caution", "Robocop"]
+    assert ds.unlinked == [{"discord_id": "d2", "names": ["zombie"]}]
+    assert ds.snap_names(["Rob0cop", "‘saibu"]) == ["Caution", "‘saibu"]
+    # The roster went out with names, the screenshot goes out with ids only.
+    assert t.rosters[-1] == ["d1", {"id": "d2", "names": ["zombie"]}]
+    ds.post_results("/tmp/g1.png", roster=ds._roster)
+    shot = [c for c in t.calls if c[0] == "shot"][-1]
+    assert shot[3] == ["d1", "d2"]
+    ds.close("quit")
+    assert ds.unlinked == [] and ds.snap_names(["Rob0cop"]) == ["Rob0cop"]
+
+
+def test_roster_accepts_member_objects():
+    class M:
+        def __init__(self, id, name, global_name=None, nick=None):
+            self.id, self.name, self.global_name, self.nick = id, name, global_name, nick
+    ds, t = make()
+    ds.open_lobby(roster=[M(1, "luczer_", "SlyK"), M(2, "plain"), "3"])
+    assert t.rosters[-1] == [
+        {"id": "1", "names": ["SlyK", "luczer_"]},
+        {"id": "2", "names": ["plain"]},
+        "3",
+    ]
+    assert ds.roster_size == 3
+
+
 def test_reopening_the_same_draft_keeps_the_game_index():
     # /custom runs once per game; the server answers with the session's open
     # draft. The counter must carry on, or every game streams as game 1.

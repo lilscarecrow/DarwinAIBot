@@ -17,7 +17,7 @@ def _open_url():
 def test_open_sends_canonical_players_key(requests_mock):
     m = requests_mock.post(_open_url(), json={"draft_id": 7, "created": True, "rows": 2})
     got = ingest.open_set_draft(["Alpha", " Bravo ", ""], BASE, TOKEN, twitch_channel="chan")
-    assert got == 7
+    assert got == {"draft_id": 7, "created": True, "rows": 2}, "the whole reply comes back (lobby view rides on it)"
     body = m.last_request.json()
     assert body == {"platform": "pc", "players": ["Alpha", "Bravo"], "twitch_channel": "chan"}
     assert m.last_request.headers["Authorization"] == f"Bearer {TOKEN}"
@@ -25,9 +25,24 @@ def test_open_sends_canonical_players_key(requests_mock):
 
 def test_open_with_empty_roster_still_posts(requests_mock):
     m = requests_mock.post(_open_url(), json={"draft_id": 9, "created": True, "rows": 0})
-    assert ingest.open_set_draft([], BASE, TOKEN) == 9
+    assert ingest.open_set_draft([], BASE, TOKEN)["draft_id"] == 9
     assert m.called
     assert m.last_request.json()["players"] == []
+
+
+def test_open_sends_named_roster_entries_and_screenshot_sends_ids(requests_mock, tmp_path):
+    m = requests_mock.post(_open_url(), json={"draft_id": 3, "created": True, "rows": 0, "lobby": [], "unlinked": []})
+    roster = ["11", {"id": "22", "names": ["SlyK", "luczer_"]}, {"id": " ", "names": ["x"]}, {"id": "33", "name": "nick", "names": ["nick", "user"]}]
+    ingest.open_set_draft([], BASE, TOKEN, roster=roster)
+    assert m.last_request.json()["roster"] == ["11", {"id": "22", "names": ["SlyK", "luczer_"]}, {"id": "33", "names": ["nick", "user"]}]
+    # A reply without draft_id is a failure, not a draft.
+    requests_mock.post(_open_url(), json={"error": "nope"})
+    assert ingest.open_set_draft([], BASE, TOKEN) is None
+    # The screenshot endpoint takes ids only, whatever shape the roster has.
+    png = tmp_path / "r.png"; png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    ms = requests_mock.post(f"{BASE}/api/ingest/screenshot", json={"draft_id": 3, "game_index": 1})
+    ingest.post_results_screenshot(str(png), BASE, TOKEN, roster=roster, draft_id=3)
+    assert b'name="roster"' in ms.last_request.body and b'["11", "22", "33"]' in ms.last_request.body
 
 
 @pytest.mark.parametrize("channel", [None, ""])

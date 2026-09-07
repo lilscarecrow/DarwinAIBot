@@ -300,7 +300,9 @@ class MatchRunner:
             )
             return
 
-        self._player_names = ocr_player_names(screenshot, self._player_slot_xs, self._config)
+        self._player_names = self._snap_names(
+            ocr_player_names(screenshot, self._player_slot_xs, self._config)
+        )
         self._player_alive = [True] * len(self._player_slot_xs)
 
         logger.info("Player bar snapshot — %d players:", len(self._player_slot_xs))
@@ -310,6 +312,22 @@ class MatchRunner:
     # ------------------------------------------------------------------
     # V2 card detector (config player_bar_detector: "v1" | "v2" | "shadow")
     # ------------------------------------------------------------------
+
+    def _snap_names(self, names: list[str]) -> list[str]:
+        """Nameplate OCR → the ladder's canonical names for this lobby, where
+        one player matches unambiguously (DraftLifecycle.snap_names, fed by the
+        open-draft reply). Verbatim when no lobby is known."""
+        if self._ds is None or not names:
+            return list(names)
+        try:
+            snapped = self._ds.snap_names(list(names))
+        except Exception as e:
+            logger.debug("name snap unavailable: %s", e)
+            return list(names)
+        for before, after in zip(names, snapped):
+            if before != after:
+                logger.info("  nameplate %r snapped to ladder name %r", before, after)
+        return snapped
 
     def _detector_mode(self) -> str:
         mode = str(self._config.get("player_bar_detector", "v1")).strip().lower()
@@ -342,6 +360,7 @@ class MatchRunner:
             names = ["" for _ in cards]
         self._v2_xs = [c.x for c in cards]
         self._v2_alive = [c.alive for c in cards]
+        names = self._snap_names(names)
         self._v2_names = names
         n_alive = sum(1 for c in cards if c.alive)
         logger.info("Player bar v2 (%s): %d cards, %d alive", "driving" if drive else "shadow", len(cards), n_alive)

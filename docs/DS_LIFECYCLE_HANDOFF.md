@@ -77,6 +77,28 @@ sends `Authorization: Bearer <ds_ingest_token>`. JSON unless noted.
 - `200 {"draft_id": 245, "created": true, "rows": 2, "roster_resolved": 2}` —
   `roster_resolved` = how many Discord IDs became rows.
 
+### The open-draft reply is the lobby briefing (2026-09-07)
+
+`roster` entries may now be `{"id": "...", "names": ["nick", "display name",
+"username"]}` — `bot/discord_bot.py` builds them from the signup reactors —
+and the server links an unlinked account inline when one of its names matches
+exactly one of the lobby's players. The reply carries:
+
+- `lobby`: each known member, `{discord_id, player, player_id, persona, names}`
+  — `names` is everything that player may appear as (canonical, aliases, and
+  their Steam persona refreshed at open time = the nameplate).
+- `expected_names`: the flat snap set.
+- `unlinked`: `{discord_id, names}` for members the ladder cannot place.
+
+`DraftLifecycle` keeps these (`lobby`, `expected_names`, `unlinked`) and
+exposes `snap_names(reads)` — `game/name_snap.py` folds the player-bar OCR the
+way the ladder does and replaces a read with the canonical name when exactly
+one player matches (a stream tag glued to a handle, "F0 ayitbunny", is handled;
+anything ambiguous stays verbatim). `MatchRunner` snaps at both player-bar
+inits (V1 and V2), so `match_start.slots`, eliminations and the match-start
+roster push all carry ladder names. `/custom` adds a "Not on the ladder yet"
+field mentioning the unlinked members with the claim instructions.
+
 ### POST /api/ingest/events (live match events)
 
 ```json

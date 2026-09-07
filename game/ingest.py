@@ -58,7 +58,7 @@ def post_results_screenshot(
     headers = {"Authorization": f"Bearer {token}"}
     data = {"platform": platform}
     if roster:
-        data["roster"] = json.dumps(roster)
+        data["roster"] = json.dumps(roster_ids(roster))   # the screenshot endpoint takes ids only
     if draft_id is not None:
         data["draft_id"] = draft_id
 
@@ -80,6 +80,33 @@ def post_results_screenshot(
         return
 
 
+def roster_entries(roster: Optional[list]) -> list:
+    """Normalize a roster for the wire: ids stay strings, `{"id", "names"}`
+    dicts keep their (non-empty, deduplicated) names. Blank ids are dropped."""
+    out = []
+    for r in roster or []:
+        if isinstance(r, dict):
+            rid = str(r.get("id") or "").strip()
+            if not rid:
+                continue
+            names = []
+            for n in [r.get("name")] + list(r.get("names") or []):
+                n = str(n).strip() if n else ""
+                if n and n not in names:
+                    names.append(n)
+            out.append({"id": rid, "names": names} if names else rid)
+        else:
+            rid = str(r).strip()
+            if rid:
+                out.append(rid)
+    return out
+
+
+def roster_ids(roster: Optional[list]) -> list[str]:
+    """Just the ids of a roster in either shape."""
+    return [e["id"] if isinstance(e, dict) else e for e in roster_entries(roster)]
+
+
 def open_set_draft(
     player_names: list[str],
     base_url: str,
@@ -87,21 +114,28 @@ def open_set_draft(
     platform: str = "pc",
     twitch_channel: Optional[str] = None,
     draft_id: Optional[int] = None,
-    roster: Optional[list[str]] = None,
+    roster: Optional[list] = None,
     tournament_slug: Optional[str] = None,
-) -> Optional[int]:
+) -> Optional[dict]:
     """
     POST to /api/ingest/open-draft: open (or refresh) the draft for this lobby.
+
+    Returns the server's reply as a dict on success (`draft_id`, `created`,
+    `rows`, `roster_resolved`, and since 2026-09-07 `lobby` — each known
+    member with every name they may appear as — `expected_names` and
+    `unlinked`), None on any failure. Fire-and-forget: never raises.
 
     tournament_slug: the ladder tournament this lobby belongs to (config
     ds_ingest_tournament_slug, only while tournament_mode is on). Sent only
     when truthy; the server answers 400 "unknown tournament" for a slug it
     does not know, which lands in the log like any other open failure.
 
-    roster: the lobby's Discord IDs (the scrim signup reactors). The server
-    pre-seeds every id that is linked to a player on the ladder with that
-    player's canonical name, and skips unlinked ids. Sent as "roster" only
-    when non-empty, capped at 20.
+    roster: the lobby's Discord members (the scrim signup reactors), each a
+    bare id string or `{"id": ..., "names": [nick, display name, username]}`.
+    The server pre-seeds every id that is linked to a player on the ladder
+    with that player's canonical name, links an unlinked id inline when one
+    of its names matches exactly one of the draft's players, and lists the
+    rest under `unlinked`. Sent as "roster" only when non-empty, capped at 20.
 
     ALWAYS sends the request when called — an empty roster is a legitimate
     "lobby forming" open, sent as `"players": []`. (Earlier versions skipped the
@@ -117,8 +151,6 @@ def open_set_draft(
         another. Omitted when None; the server then reuses this token's most
         recent open draft or creates a fresh one.
 
-    Returns the draft_id from the response on success, None on any failure.
-    Fire-and-forget: never raises.
     """
     names = [n.strip() for n in player_names if n and n.strip()]
 
@@ -129,9 +161,9 @@ def open_set_draft(
         payload["twitch_channel"] = twitch_channel
     if draft_id is not None:
         payload["draft_id"] = draft_id
-    ids = [str(r).strip() for r in (roster or []) if str(r).strip()]
-    if ids:
-        payload["roster"] = ids[:20]
+    entries = roster_entries(roster)
+    if entries:
+        payload["roster"] = entries[:20]
     if tournament_slug:
         payload["tournament_slug"] = str(tournament_slug).strip()
 
@@ -139,12 +171,15 @@ def open_set_draft(
         resp = requests.post(url, headers=headers, json=payload, timeout=_OPEN_DRAFT_TIMEOUT_SECONDS)
         if resp.status_code == 200:
             body = resp.json()
-            new_id = body.get("draft_id")
+            if not isinstance(body, dict) or body.get("draft_id") is None:
+                logger.warning("darwinstalker open-draft: reply without draft_id: %s", str(body)[:200])
+                return None
             logger.info(
-                "darwinstalker open-draft ok: draft_id=%s created=%s rows=%s twitch_channel=%s",
-                new_id, body.get("created"), body.get("rows"), twitch_channel or "(none)",
+                "darwinstalker open-draft ok: draft_id=%s created=%s rows=%s known=%s unlinked=%s twitch_channel=%s",
+                body.get("draft_id"), body.get("created"), body.get("rows"),
+                len(body.get("lobby") or []), len(body.get("unlinked") or []), twitch_channel or "(none)",
             )
-            return new_id
+            return body
         logger.warning(
             "darwinstalker open-draft failed: HTTP %d — %s", resp.status_code, resp.text[:300]
         )
