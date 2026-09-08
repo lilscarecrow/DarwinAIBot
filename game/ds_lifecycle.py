@@ -138,6 +138,26 @@ class DraftLifecycle:
         """Roster members the ladder has no link for: [{discord_id, names}]."""
         return list(self._unlinked)
 
+    def claim_nudge(self) -> Optional[dict]:
+        """What to tell the roster members the ladder cannot place, or None
+        when everyone is known: `mentions` (space-joined <@id> pings, ≤10)
+        and `text` (where to claim). The only thing that grows Steam↔Discord
+        coverage is the player claiming their handle, so this has to land
+        where the PLAYERS read — the lobby-code ping — not only in the
+        director's channel.
+        """
+        ids = [str(u.get("discord_id")) for u in self._unlinked[:10] if u.get("discord_id")]
+        if not ids:
+            return None
+        site = (self._config.get("ds_ingest_base_url") or "https://darwinstalker.com").rstrip("/")
+        return {
+            "mentions": " ".join(f"<@{i}>" for i in ids),
+            "text": (
+                f"Sign in with Steam at {site} and claim your handle "
+                "(or link Discord on your profile) so your results land on your profile."
+            ),
+        }
+
     def snap_names(self, reads: list[str]) -> list[str]:
         """Player-bar OCR reads → canonical ladder names where one player
         matches unambiguously (game/name_snap.py); everything else verbatim."""

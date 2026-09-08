@@ -96,8 +96,11 @@ way the ladder does and replaces a read with the canonical name when exactly
 one player matches (a stream tag glued to a handle, "F0 ayitbunny", is handled;
 anything ambiguous stays verbatim). `MatchRunner` snaps at both player-bar
 inits (V1 and V2), so `match_start.slots`, eliminations and the match-start
-roster push all carry ladder names. `/custom` adds a "Not on the ladder yet"
-field mentioning the unlinked members with the claim instructions.
+roster push all carry ladder names. `DraftLifecycle.claim_nudge()` turns
+`unlinked` into `{mentions, text}`; `/custom` adds a "Not on the ladder yet"
+field with it to the "Custom Match Ready" embed, which is posted to the
+lobby-ping channel (that is what the players read), with the unlinked members
+also pinged in the message content — mentions inside an embed never notify.
 
 ### POST /api/ingest/events (live match events)
 

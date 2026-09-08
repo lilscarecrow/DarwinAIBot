@@ -638,22 +638,13 @@ class DirectorCog(commands.Cog):
             # No running loop (shutdown path) — close inline, still never raises.
             self._ds.close(reason)
 
-    def _unlinked_nudge(self) -> Optional[str]:
-        """One line naming the roster members the ladder cannot place, with
-        where to fix it — the only thing that grows Steam↔Discord coverage is
-        the player claiming their handle. None when everyone is known."""
+    def _unlinked_nudge(self) -> Optional[dict]:
+        """`{mentions, text}` for the roster members the ladder cannot place,
+        with where to fix it. None when everyone is known."""
         try:
-            unlinked = self._ds.unlinked
+            return self._ds.claim_nudge()
         except Exception:
             return None
-        if not unlinked:
-            return None
-        mentions = " ".join(f"<@{u.get('discord_id')}>" for u in unlinked[:10] if u.get("discord_id"))
-        site = (self.bot.config.get("ds_ingest_base_url") or "https://darwinstalker.com").rstrip("/")
-        return (
-            f"{mentions}\nSign in with Steam at {site} and claim your handle "
-            f"(or link Discord on your profile) so your results land on your profile."
-        )
 
     async def _open_ds_draft(self):
         """Open the ladder draft for a freshly created lobby (blocking HTTP → executor).
@@ -1026,9 +1017,18 @@ class DirectorCog(commands.Cog):
             embed.add_field(name="Region", value=region.name, inline=True)
             embed.add_field(name="Profile", value=_profile_label, inline=True)
             embed.add_field(name="Lobby Code", value=f"```{lobby_code}```", inline=False)
+            # Mentions inside an embed never notify anyone, so the unlinked
+            # members are pinged in the message content too — this post is the
+            # one place the players read, and claiming is on them.
+            ping_content = f"<@&{_LOBBY_PING_ROLE_ID}>"
             nudge = self._unlinked_nudge()
             if nudge:
-                embed.add_field(name="Not on the ladder yet", value=nudge, inline=False)
+                embed.add_field(
+                    name="Not on the ladder yet",
+                    value=f"{nudge['mentions']}\n{nudge['text']}",
+                    inline=False,
+                )
+                ping_content += "\n" + nudge["mentions"]
             if obs_control.is_enabled():
                 embed.add_field(name="Twitch Stream", value=stream_status_text, inline=False)
 
@@ -1040,7 +1040,7 @@ class DirectorCog(commands.Cog):
                     logger.warning("Could not reach lobby ping channel %d: %s", _LOBBY_PING_CHANNEL_ID, e)
                     ping_ch = None
             if ping_ch is not None:
-                await ping_ch.send(content=f"<@&{_LOBBY_PING_ROLE_ID}>", embed=embed)
+                await ping_ch.send(content=ping_content, embed=embed)
 
             await interaction.followup.send(embed=self._ok(
                 "Custom Match Ready",

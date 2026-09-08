@@ -430,3 +430,30 @@ def test_events_without_open_draft_are_dropped_not_sent():
     ds.relay.flush()
     assert [c for c in t.calls if c[0] == "events"] == []
     assert ds.relay.dropped_events == 1
+
+
+def test_claim_nudge_names_unlinked_with_claim_site():
+    reply = {
+        "draft_id": 12, "created": True,
+        "unlinked": [{"discord_id": "d2", "names": ["zombie"]}, {"names": ["no-id"]}, {"discord_id": "d3"}],
+    }
+    ds, t = make(open_result=reply)
+    ds.open_lobby(roster=["d1", "d2", "d3"])
+    nudge = ds.claim_nudge()
+    assert nudge["mentions"] == "<@d2> <@d3>"
+    assert nudge["text"].startswith("Sign in with Steam at https://ds.test and claim your handle")
+    ds.close("quit")
+    assert ds.claim_nudge() is None
+
+
+def test_claim_nudge_uses_configured_site_and_none_when_all_linked():
+    ds, t = make(open_result={"draft_id": 13, "created": True, "unlinked": [{"discord_id": "d9"}]})
+    ds._config["ds_ingest_base_url"] = "http://localhost:3999/"
+    ds.open_lobby(roster=["d9"])
+    assert "at http://localhost:3999 and" in ds.claim_nudge()["text"]
+    ds, t = make({"ds_ingest_token": "tok"}, open_result={"draft_id": 15, "created": True, "unlinked": [{"discord_id": "d9"}]})
+    ds.open_lobby(roster=["d9"])
+    assert "at https://darwinstalker.com and" in ds.claim_nudge()["text"]
+    ds, t = make(open_result={"draft_id": 14, "created": True, "unlinked": []})
+    ds.open_lobby(roster=["d1"])
+    assert ds.claim_nudge() is None
