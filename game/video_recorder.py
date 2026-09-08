@@ -13,13 +13,15 @@ _FOURCC = cv2.VideoWriter_fourcc(*"avc1")
 _FRAME_INTERVAL = 1.0 / _FPS
 _OUTPUT_DIR = Path("screenshots/recordings")
 
+# Crop region [x, y, w, h] at 1920×1080 — tight center band on the kill feed area.
+# Moved out of config.json (2026-09-07), same rationale as the other 1920×1080
+# calibration constants in game/match_runner.py.
+_CROP_REGION = (755, 175, 410, 200)
+
 
 class VideoRecorder:
     """
-    Records a cropped region of match footage in a background thread.
-
-    Crop region is read from config key recording_crop_region: [x, y, w, h].
-    If not set, the full frame is recorded.
+    Records a cropped region (_CROP_REGION) of match footage in a background thread.
 
     Usage:
         recorder = VideoRecorder(config)
@@ -33,11 +35,9 @@ class VideoRecorder:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._output_path: str | None = None
-        self._crop: tuple[int, int, int, int] | None = None
+        self._crop: tuple[int, int, int, int] = _CROP_REGION
 
     def _apply_crop(self, frame):
-        if self._crop is None:
-            return frame
         x, y, w, h = self._crop
         return frame[y:y + h, x:x + w]
 
@@ -47,9 +47,6 @@ class VideoRecorder:
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self._output_path = str(_OUTPUT_DIR / f"match_{ts}.mp4")
         self._stop.clear()
-
-        crop_cfg = self._config.get("recording_crop_region")
-        self._crop = tuple(crop_cfg) if crop_cfg else None
 
         # Grab one frame to determine output dimensions after crop
         first = self._apply_crop(take_screenshot())
@@ -61,8 +58,7 @@ class VideoRecorder:
             self._writer = None
             return
 
-        crop_info = f"crop={self._crop}" if self._crop else "full frame"
-        logger.info("VideoRecorder: started → %s (%dx%d @ %.1ffps, %s)", self._output_path, w, h, _FPS, crop_info)
+        logger.info("VideoRecorder: started → %s (%dx%d @ %.1ffps, crop=%s)", self._output_path, w, h, _FPS, self._crop)
         self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="VideoRecorder")
         self._thread.start()
 

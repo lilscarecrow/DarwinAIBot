@@ -17,6 +17,69 @@ _ZONE_TARGETED_CARDS = frozenset({"lava_zone", "nuclear_blast", "open_zone", "sp
 _PLAYER_TARGETED_CARDS = frozenset({"expose", "favorite_player", "give_leather", "give_wood",
                                      "man_hunt", "speed_boost", "warm_up"})
 
+# Card tray layout, calibrated at 1920×1080 (the only resolution this bot supports —
+# see "Future Enhancements: Multi-resolution support" in CLAUDE.md). Moved out of
+# config.json (2026-09-07): these have proven stable across the UE5 update and every
+# session since, and — unlike the pixel-region calibration data that's genuinely
+# machine/version-specific — there is nothing here that would ever differ between
+# two people running this bot at the one supported resolution.
+_CARD_TRAY_CENTER_X = 966
+_CARD_TRAY_CARD_Y = 943
+_CARD_TRAY_CARD_WIDTH = 76
+
+# Fixed drop target per "plain" card type (not zone-targeted, not player-targeted,
+# not zone_close) — every one of these currently drops dead center of the screen.
+# Kept as a per-card-type dict rather than one shared constant so a future card
+# that needs a different target is just as easy to add here as it was in config.
+_CARD_DROP_TARGETS: dict[str, tuple[int, int]] = {
+    "electromania": (960, 540),
+    "beach_party": (960, 540),
+    "blood_moon": (960, 540),
+    "anti_grav_storm": (960, 540),
+    "telepathy": (960, 540),
+}
+
+# Zone-close static drop target — the game auto-picks the zone from here. Live path,
+# calibrated at 1920×1080. Moved out of config.json (2026-09-07), same rationale as
+# the card tray layout above.
+_ZONE_CLOSE_DROP_TARGET = (1750, 1000)
+
+# Director-points OCR crop — 2-digit numerator only (not the "/10"). Calibrated at
+# 1920×1080. Moved out of config.json (2026-09-07).
+_DIRECTOR_POINTS_REGION = (808, 1002, 20, 24)
+
+# Director-points pip pixel-sampling calibration — dormant while director_points_use_pips
+# (still a real config toggle) is false, kept for if pip reading is ever revisited.
+# Moved out of config.json (2026-09-07).
+_DIRECTOR_POINTS_PIPS = {"x_start": 862, "y": 1012, "spacing": 26, "count": 10}
+
+# Zone map sample points and per-zone drop coordinates for the legacy per-zone
+# selection path (_attempt_zone_close_legacy() / _attempt_zone_close_bypass() /
+# _update_zone_states_from_screenshot()) — dormant, kept for reference/rollback, see
+# those methods' docstrings. Moved out of config.json (2026-09-07): recalibrating this
+# legacy path now means editing these dicts directly rather than running
+# calibrate.py/calibrate_zone_colors.py, which still target config.json and are no
+# longer wired to this data — acceptable since this path hasn't been needed since the
+# static drop-area replaced it (2026-08-30).
+_ZONE_MAP_SAMPLE_POINTS: dict[int, list[tuple[int, int]]] = {
+    1: [(824, 231), (714, 341), (934, 341), (824, 451)],
+    2: [(1081, 221), (971, 331), (1191, 331), (1081, 441)],
+    3: [(716, 430), (606, 540), (826, 540), (716, 650)],
+    4: [(959, 430), (849, 540), (1069, 540), (959, 650)],
+    5: [(1178, 430), (1068, 540), (1288, 540), (1178, 650)],
+    6: [(841, 622), (731, 732), (951, 732), (841, 842)],
+    7: [(1084, 622), (974, 732), (1194, 732), (1084, 842)],
+}
+_ZONE_DROP_COORDINATES: dict[int, tuple[int, int]] = {
+    1: (824, 341),
+    2: (1081, 331),
+    3: (716, 540),
+    4: (959, 540),
+    5: (1178, 540),
+    6: (841, 732),
+    7: (1084, 732),
+}
+
 
 @dataclass
 class CardEvent:
@@ -240,13 +303,12 @@ class MatchRunner:
                 # needs to check affordability. Same ratchet-up guard as everywhere else
                 # (see _update_points_reading) — a bad read here is disregarded, not
                 # trusted, so this can only ever raise confidence, never lower it.
-                if self._config.get("director_points_pips") or self._config.get("director_points_region"):
-                    now_ts = time.monotonic()
-                    if now_ts - self._last_points_sample_time >= poll_interval:
-                        from game.screen_detection import take_screenshot as _take_ss2
-                        sample = self._read_points(_take_ss2())
-                        self._update_points_reading(sample, "background poll")
-                        self._last_points_sample_time = now_ts
+                now_ts = time.monotonic()
+                if now_ts - self._last_points_sample_time >= poll_interval:
+                    from game.screen_detection import take_screenshot as _take_ss2
+                    sample = self._read_points(_take_ss2())
+                    self._update_points_reading(sample, "background poll")
+                    self._last_points_sample_time = now_ts
 
                 # Sleep until the next card trigger, but no longer than poll_interval
                 now = time.monotonic()
@@ -497,9 +559,7 @@ class MatchRunner:
             else:
                 assigned.add(deck_pos)
 
-            card_cfg = self._config.get("cards", {}).get(card_type, {})
-            raw_target = card_cfg.get("drop_target")
-            drop_target = tuple(raw_target) if raw_target else None
+            drop_target = _CARD_DROP_TARGETS.get(card_type)
 
             from game.deck_utils import CARD_POINT_COSTS
             events.append(CardEvent(
@@ -538,15 +598,13 @@ class MatchRunner:
         pip_count = None
         ocr_count = None
 
-        pips_cfg = self._config.get("director_points_pips") if self._config.get("director_points_use_pips", True) else None
+        pips_cfg = _DIRECTOR_POINTS_PIPS if self._config.get("director_points_use_pips", True) else None
         if pips_cfg:
             raw = count_director_point_pips(screenshot, pips_cfg)
             if raw is not None:
                 pip_count = max(0, raw - 1)
 
-        region = self._config.get("director_points_region")
-        if region:
-            ocr_count = read_director_points(screenshot, tuple(region))
+        ocr_count = read_director_points(screenshot, _DIRECTOR_POINTS_REGION)
 
         if pip_count is not None:
             if ocr_count is not None:
@@ -591,7 +649,7 @@ class MatchRunner:
 
     def _wait_for_points(self, needed: int, card_name: str,
                          broadcast_open: bool = False, card_label: str = "") -> bool:
-        """Block until the director has enough points. No-op if neither pip nor OCR config is set.
+        """Block until the director has enough points.
 
         Never fails open on a bad read — "ready" is only ever declared off
         self._last_confirmed_points (see _update_points_reading), which is fed both by
@@ -606,8 +664,6 @@ class MatchRunner:
         Returns True if the broadcast was closed (caller should try to reopen when ready).
         """
         if needed == 0:
-            return False
-        if not self._config.get("director_points_pips") and not self._config.get("director_points_region"):
             return False
         from game.screen_detection import take_screenshot
         closed_broadcast = False
@@ -662,22 +718,17 @@ class MatchRunner:
             logger.warning("Card event '%s' has no deck position assigned — skipping", event.name)
         elif event.card_type in _ZONE_TARGETED_CARDS:
             import random
-            zone_drop_coords = self._config.get("zone_drop_coordinates", {})
-            available = {k: v for k, v in zone_drop_coords.items() if v}
-            if not available:
-                logger.warning("Card event '%s': no zone_drop_coordinates calibrated — skipping", event.name)
-            else:
-                zone_id = random.choice(list(available.keys()))
-                target = tuple(available[zone_id])
-                logger.info("Zone-targeted card '%s' → zone %s at %s", event.name, zone_id, target)
-                broadcast_open = tts.try_open_broadcast()
-                if event.points_cost is not None:
-                    if self._wait_for_points(event.points_cost, event.name,
-                                             broadcast_open=broadcast_open, card_label=card_label):
-                        broadcast_open = tts.try_open_broadcast()
-                if not self._stop.is_set():
-                    tts.speak_cable(f"Deploying {card_label}")
-                    self._play_tray_card(event, target, card_label, next_event, broadcast_open)
+            zone_id = random.choice(list(_ZONE_DROP_COORDINATES.keys()))
+            target = _ZONE_DROP_COORDINATES[zone_id]
+            logger.info("Zone-targeted card '%s' → zone %s at %s", event.name, zone_id, target)
+            broadcast_open = tts.try_open_broadcast()
+            if event.points_cost is not None:
+                if self._wait_for_points(event.points_cost, event.name,
+                                         broadcast_open=broadcast_open, card_label=card_label):
+                    broadcast_open = tts.try_open_broadcast()
+            if not self._stop.is_set():
+                tts.speak_cable(f"Deploying {card_label}")
+                self._play_tray_card(event, target, card_label, next_event, broadcast_open)
         elif event.card_type in _PLAYER_TARGETED_CARDS:
             player_coords = self._config.get("player_target_coordinates") or []
             if not player_coords:
@@ -747,39 +798,29 @@ class MatchRunner:
         else:
             from game.card_actions import shift_down, shift_up
             from game.screen_detection import take_screenshot, save_error_screenshot
-            tray_configured = all([
-                self._config.get("card_tray_center_x"),
-                self._config.get("card_tray_card_width"),
-                self._config.get("card_tray_card_y"),
-            ])
-            if tray_configured:
-                # Hold shift once for the entire attempt block:
-                # before-screenshot → play → after-screenshot → [retry plays] → release.
-                shift_down()
-                time.sleep(0.25)
-                before = take_screenshot()
-                for attempt in range(1, 3):
-                    if attempt > 1:
-                        tts.speak_cable("Retrying")
-                    play_card(slot_coordinate=slot_coord, target_coordinate=target,
-                              card_name=event.name, keep_shift=True)
-                    time.sleep(0.4)
-                    after = take_screenshot()
-                    if self._verify_card_removed(slot_coord, before, after):
-                        self._deck_played.add(event.deck_position)
-                        played = True
-                        break
-                    logger.warning("Card '%s' not verified in tray (attempt %d/2)", event.name, attempt)
-                    if self._stop.is_set():
-                        break
-                if not played and not self._stop.is_set():
-                    logger.error("Card '%s' failed to play after 2 attempts", event.name)
-                    save_error_screenshot(f"card_play_failed_{event.name.replace(' ', '_').replace(':', '_')}")
-                shift_up()
-            else:
-                if play_card(slot_coordinate=slot_coord, target_coordinate=target, card_name=event.name):
+            # Hold shift once for the entire attempt block:
+            # before-screenshot → play → after-screenshot → [retry plays] → release.
+            shift_down()
+            time.sleep(0.25)
+            before = take_screenshot()
+            for attempt in range(1, 3):
+                if attempt > 1:
+                    tts.speak_cable("Retrying")
+                play_card(slot_coordinate=slot_coord, target_coordinate=target,
+                          card_name=event.name, keep_shift=True)
+                time.sleep(0.4)
+                after = take_screenshot()
+                if self._verify_card_removed(slot_coord, before, after):
                     self._deck_played.add(event.deck_position)
                     played = True
+                    break
+                logger.warning("Card '%s' not verified in tray (attempt %d/2)", event.name, attempt)
+                if self._stop.is_set():
+                    break
+            if not played and not self._stop.is_set():
+                logger.error("Card '%s' failed to play after 2 attempts", event.name)
+                save_error_screenshot(f"card_play_failed_{event.name.replace(' ', '_').replace(':', '_')}")
+            shift_up()
 
         if not self._stop.is_set():
             # A real points decrease is likely now (a play attempt was just made,
@@ -884,10 +925,7 @@ class MatchRunner:
             logger.info("Zone close: no ZoneClose cards remaining")
             return False
 
-        target = self._config.get("zone_close_auto_drop_target")
-        if not target:
-            logger.warning("Zone close: zone_close_auto_drop_target not calibrated — skipping")
-            return False
+        target = _ZONE_CLOSE_DROP_TARGET
 
         tts.speak_cable("Deploying Zone Close")
         slot_coord = self._deck_pos_to_screen(deck_pos)
@@ -961,14 +999,14 @@ class MatchRunner:
 
         zones_to_try = list(valid_closeable_zones(self._zone_states))
         random.shuffle(zones_to_try)
-        zone_drop_coords = self._config.get("zone_drop_coordinates", {})
+        zone_drop_coords = _ZONE_DROP_COORDINATES
 
         if not self._verify_plays:
             # verify_card_plays: false — single attempt, no pixel-delta check, no
             # retry across zones. Picks one valid zone (still via the per-zone
             # zone_drop_coordinates) and trusts the drag worked.
             for zone_id in zones_to_try:
-                raw_target = zone_drop_coords.get(str(zone_id))
+                raw_target = zone_drop_coords.get(zone_id)
                 if not raw_target:
                     continue
                 complete_drag(target_coordinate=tuple(raw_target), card_name=f"close_zone_{zone_id}")
@@ -983,17 +1021,17 @@ class MatchRunner:
             tts.speak_cable("Sorry, failed to close a zone")
             return False
 
-        center_x = self._config.get("card_tray_center_x")
-        card_width = self._config.get("card_tray_card_width")
-        card_y = self._config.get("card_tray_card_y")
-        tray_configured = all([center_x, card_width, card_y])
+        center_x = _CARD_TRAY_CENTER_X
+        card_width = _CARD_TRAY_CARD_WIDTH
+        card_y = _CARD_TRAY_CARD_Y
+        tray_configured = True  # tray layout is now a hardcoded constant, always available
 
         for i, zone_id in enumerate(zones_to_try):
             if self._stop.is_set():
                 _pag.mouseUp()
                 break
 
-            raw_target = zone_drop_coords.get(str(zone_id))
+            raw_target = zone_drop_coords.get(zone_id)
             if not raw_target:
                 logger.warning("Zone %d skipped — drop coordinate not calibrated", zone_id)
                 continue  # card still grabbed; drag to next valid zone
@@ -1059,8 +1097,7 @@ class MatchRunner:
         if zone_id is None:
             return False
 
-        zone_drop_coords = self._config.get("zone_drop_coordinates", {})
-        raw_target = zone_drop_coords.get(str(zone_id))
+        raw_target = _ZONE_DROP_COORDINATES.get(zone_id)
         if not raw_target:
             logger.warning("[BYPASS] Zone %d close skipped — drop coordinate not calibrated", zone_id)
             return False
@@ -1080,16 +1117,15 @@ class MatchRunner:
     def _update_zone_states_from_screenshot(self, screenshot):
         """Vote across multiple sample points per zone tile to determine each zone's state."""
         thresholds = self._config.get("zone_color_thresholds", {})
-        map_points = self._config.get("zone_map_sample_points", {})
+        map_points = _ZONE_MAP_SAMPLE_POINTS
 
-        if not map_points or not all(thresholds.get(k) for k in ("open", "closed", "closing")):
-            logger.debug("Zone map detection skipped — zone_map_sample_points or thresholds not calibrated")
+        if not all(thresholds.get(k) for k in ("open", "closed", "closing")):
+            logger.debug("Zone map detection skipped — zone_color_thresholds not calibrated")
             return
 
-        for zone_id_str, points in map_points.items():
+        for zone_id, points in map_points.items():
             if not points:
                 continue
-            zone_id = int(zone_id_str)
             if self._zone_states.get(zone_id) == ZoneState.CLOSED:
                 continue
             state = self._vote_zone_state(screenshot, points, thresholds)
@@ -1120,12 +1156,7 @@ class MatchRunner:
         Before: the specific card should be visible at that position.
         After play: the slot is empty or re-centered to a different card — clear delta.
         After failed play: same card returns — delta near zero.
-        Returns True (unverifiable) if tray config is missing.
         """
-        if not self._config.get("card_tray_card_y"):
-            logger.debug("Card tray config missing — skipping play verification")
-            return True
-
         x_check, y_check = slot_coord
         bgr_before = before_screenshot[y_check, x_check]
         bgr_after = after_screenshot[y_check, x_check]
@@ -1151,9 +1182,9 @@ class MatchRunner:
         remaining = [i for i in range(len(self._deck_layout)) if i not in self._deck_played]
         visual_index = remaining.index(deck_pos)
         n = len(remaining)
-        center_x = self._config.get("card_tray_center_x", 966)
-        card_width = self._config.get("card_tray_card_width", 76)
-        card_y = self._config.get("card_tray_card_y", 943)
+        center_x = _CARD_TRAY_CENTER_X
+        card_width = _CARD_TRAY_CARD_WIDTH
+        card_y = _CARD_TRAY_CARD_Y
         first_x = center_x - (n - 1) / 2 * card_width
         x = round(first_x + visual_index * card_width)
         return (x, card_y)

@@ -78,11 +78,14 @@ def save_debug_image(screenshot: np.ndarray, sample_points_map: dict, stamp: str
 
 def main():
     config = json.loads(CONFIG_PATH.read_text())
-    sample_points_cfg = config.get("zone_map_sample_points", {})
+    # zone_map_sample_points moved out of config.json (2026-09-07) to a hardcoded
+    # constant — see game/match_runner.py's _ZONE_MAP_SAMPLE_POINTS. Read it from
+    # there instead of a config key that no longer exists.
+    from game.match_runner import _ZONE_MAP_SAMPLE_POINTS
+    sample_points_cfg = {str(k): v for k, v in _ZONE_MAP_SAMPLE_POINTS.items()}
 
     if not sample_points_cfg or all(v is None for v in sample_points_cfg.values()):
-        print("ERROR: zone_map_sample_points not configured in config.json.")
-        print("Run the bot calibration first to set zone coordinates.")
+        print("ERROR: _ZONE_MAP_SAMPLE_POINTS is empty in game/match_runner.py.")
         return
 
     print(__doc__)
@@ -166,9 +169,12 @@ def main():
 
     update = input("\nUpdate config.json now? [y/N]: ").strip().lower()
     if update == "y":
+        # setdefault rather than assuming the key already exists as a dict — it may
+        # have been removed from config.json entirely if never calibrated.
+        thresholds_cfg = config.setdefault("zone_color_thresholds", {"open": None, "closing": None, "closed": None})
         for state, val in thresholds.items():
             if val is not None:
-                config["zone_color_thresholds"][state] = val
+                thresholds_cfg[state] = val
         CONFIG_PATH.write_text(json.dumps(config, indent=4))
         print("config.json updated.")
     else:

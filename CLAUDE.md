@@ -321,7 +321,7 @@ The connectivity logic (`can_close_zone`, `open_zones_stay_connected`, BFS) has 
 
 Zone strategy is pluggable via `config.json → zone_selection_strategy` but the live path currently ignores the strategy and uses random shuffle directly. Adding a new strategy: create a file in `zones/strategies/`, subclass `BaseZoneStrategy`, add to `STRATEGIES` dict in `strategy_factory.py`.
 
-**Superseded by the static drop-area approach (2026-08-30):** a new in-game drop area resolves zone_close to a random valid zone on the game's own side, so none of the machinery on this page runs in a live match anymore — `MatchRunner._attempt_zone_close()` now just drags the card to one static point (`zone_close_auto_drop_target` in config) and marks it played, no zone-map read, no `ZoneState` tracking, no strategy selection, and (per an explicit choice) no tray-pixel verification either — regardless of `verify_card_plays`, since the drop area makes "did it pick a valid zone" the game's problem, not the bot's. Everything described in this section — `zones/`, `_zone_states`, `valid_closeable_zones`, `zone_selection_strategy`, `zone_map_sample_points`, `zone_color_thresholds` — is left in the codebase **disconnected, not deleted** (same treatment as `/deck`, see below), preserved as `MatchRunner._attempt_zone_close_legacy()` / `_attempt_zone_close_bypass()` / `_update_zone_states_from_screenshot()` / `_vote_zone_state()`, in case the new drop area needs to be rolled back. `zone_close_auto_drop_target` is a single `[x, y]` coordinate — calibrated to `[1750, 1000]` (2026-08-30), inside the "SPECTATORS — LET THEM DECIDE" cyan corner triangle at 1920×1080. That triangle's top edge is diagonal and its label text/robot icon break up the color in places (e.g. white text glyphs, the mech icon in the upper-left of the shape) — `y ≥ 975` is solid cyan across the full `x` range in that corner with no such gaps, which is why the calibrated point sits there rather than nearer the diagonal edge.
+**Superseded by the static drop-area approach (2026-08-30):** a new in-game drop area resolves zone_close to a random valid zone on the game's own side, so none of the machinery on this page runs in a live match anymore — `MatchRunner._attempt_zone_close()` now just drags the card to one static point (`_ZONE_CLOSE_DROP_TARGET`, a hardcoded constant — moved out of config.json 2026-09-07) and marks it played, no zone-map read, no `ZoneState` tracking, no strategy selection, and (per an explicit choice) no tray-pixel verification either — regardless of `verify_card_plays`, since the drop area makes "did it pick a valid zone" the game's problem, not the bot's. Everything described in this section — `zones/`, `_zone_states`, `valid_closeable_zones`, `zone_selection_strategy`, `_ZONE_MAP_SAMPLE_POINTS`, `zone_color_thresholds` — is left in the codebase **disconnected, not deleted** (same treatment as `/deck`, see below), preserved as `MatchRunner._attempt_zone_close_legacy()` / `_attempt_zone_close_bypass()` / `_update_zone_states_from_screenshot()` / `_vote_zone_state()`, in case the new drop area needs to be rolled back. `_ZONE_CLOSE_DROP_TARGET` is a single `(x, y)` coordinate — calibrated to `(1750, 1000)` (2026-08-30), inside the "SPECTATORS — LET THEM DECIDE" cyan corner triangle at 1920×1080. That triangle's top edge is diagonal and its label text/robot icon break up the color in places (e.g. white text glyphs, the mech icon in the upper-left of the shape) — `y ≥ 975` is solid cyan across the full `x` range in that corner with no such gaps, which is why the calibrated point sits there rather than nearer the diagonal edge.
 
 **No "Closing a zone" TTS line (2026-09-06):** `_attempt_zone_close()` no longer speaks a post-drag confirmation. Since this drag is never verified (see above — no tray-pixel check regardless of `verify_card_plays`), that line always spoke as if the zone close had been confirmed even though nothing was actually checked, the same "implicit success" mismatch `verify_card_plays: false` created for tray cards. "Deploying Zone Close" (spoken before the drag) still announces the attempt; nothing announces the outcome now.
 
@@ -415,7 +415,7 @@ Split the card drag into three steps so zone state can be read from the map betw
 The big zone map only appears when a zone_close card is grabbed (shift+click+hold). Zone states cannot be read with a shift-only peek. The flow in `_attempt_zone_close()`:
 1. Wait for enough director points
 2. `shift_down()` → before-screenshot (tray visible) → `grab_card(shift_already_held=True)` → `time.sleep(0.35)` → screenshot
-3. `_update_zone_states_from_screenshot()` — votes across 4 `zone_map_sample_points` per tile; majority wins
+3. `_update_zone_states_from_screenshot()` — votes across 4 `_ZONE_MAP_SAMPLE_POINTS` per tile; majority wins
 4. `valid_closeable_zones()` → pick zone (live path uses random shuffle across valid zones, not the configured strategy — intentional for now)
 5. `complete_drag(keep_shift=True)` to target zone → after-screenshot → verify slot pixel changed → `shift_up()`, or `mouseUp()+shift_up()` if nothing closeable
 In bypass mode, uses cached `_zone_states` (all OPEN initially) and calls `play_card(bypass_mode=True)`.
@@ -446,7 +446,7 @@ Records match footage in a background thread. Started after the match countdown,
 
 - **Format:** H.264 MP4 (`avc1`) — all three FOURCC options tested True on this machine ⚠️ **`cv2.VideoWriter.isOpened() == True` is not a reliable success signal for `avc1`** — see the OpenH264 gotcha below, where it stayed `True` while silently writing a ~1KB broken file with the real codec missing. If recordings are ever coming back empty/corrupt, check for the OpenH264 load error in console output before assuming it's a crash/try-finally issue.
 - **FPS:** 4 (1 frame every 0.25 seconds)
-- **Crop:** configured via `recording_crop_region: [x, y, w, h]` — currently `[755, 175, 410, 200]` (tight center band focused on the kill feed area)
+- **Crop:** `_CROP_REGION` constant in `game/video_recorder.py`, `[755, 175, 410, 200]` (tight center band focused on the kill feed area) — moved out of config.json (2026-09-07)
 - **Output:** `screenshots/recordings/match_{timestamp}.mp4` — ~60-65 MB for a 20-min match at these settings (roughly 8x the file size of the old 0.5fps setting)
 - **Upload:** `_upload_recording(path)` fires as a detached async task after the match. The actual upload is still a stub (TODO — wire up when `recording_api_endpoint` is set in config). **The local recording file is deleted unconditionally at the end of `_upload_recording()` regardless of whether an upload happened** — this was an explicit choice to reclaim disk space now, accepting that until the upload is actually implemented, recordings aren't preserved anywhere once deleted.
 
@@ -695,40 +695,30 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "tts_voice": "en-US-AriaNeural",  // edge-tts voice name
     "card_play_lead_time_seconds": 2,    // Fire card events this many seconds early to account for drag time
 
-    // Card tray layout (calibrate with shift held in-game)
-    "card_tray_center_x": 966,           // X center of the tray when all cards visible
-    "card_tray_card_y": 943,             // Y coordinate of card center row
-    "card_tray_card_width": 76,          // Pixel spacing between card centers
-
-    "cards": {
-        "electromania": {
-            "drop_target": null          // [x, y] to drag to — calibrate in-game
-        },
-        "beach_party": {
-            "drop_target": null
-        },
-        "blood_moon": {
-            "drop_target": null
-        }
-    },
-    "zone_close_auto_drop_target": [1750, 1000], // [x, y] single static drop point — game auto-picks the zone. Live path, calibrated at 1920×1080.
-    "zone_map_sample_points": {          // dormant (_attempt_zone_close_legacy only) — 3-5 [x,y] points per zone tile on the big map
-        "1": null, "2": null, "3": null, "4": null, "5": null, "6": null, "7": null
-    },
-    "zone_drop_coordinates": {           // dormant (_attempt_zone_close_legacy only) — [x, y] drag target per zone
-        "1": null, ..., "7": null
-    },
-    "zone_color_thresholds": {           // dormant (_attempt_zone_close_legacy only) — RGB tuples for open/closing/closed
-        "open": null,
-        "closing": null,
-        "closed": null
-    },
-    "results_ocr_regions": null,         // Per-column (x,y,w,h) lists — calibrate (optional; bot now sends screenshot)
-    "director_points_region": [808, 1002, 20, 24],  // OCR crop: 2-digit numerator only (not "/10"). Calibrated at 1920×1080.
+    // A batch of 1920×1080-calibrated coordinates used to live here and were moved to
+    // hardcoded constants in game/match_runner.py (2026-09-07): card tray layout
+    // (card_tray_center_x/card_tray_card_y/card_tray_card_width), cards.*.drop_target
+    // (_CARD_DROP_TARGETS), zone_close_auto_drop_target (_ZONE_CLOSE_DROP_TARGET,
+    // [1750, 1000]), zone_map_sample_points and zone_drop_coordinates (_ZONE_MAP_SAMPLE_POINTS
+    // / _ZONE_DROP_COORDINATES, both dormant — _attempt_zone_close_legacy() only),
+    // director_points_region (_DIRECTOR_POINTS_REGION, [808, 1002, 20, 24]) and
+    // director_points_pips (_DIRECTOR_POINTS_PIPS, dormant while director_points_use_pips
+    // is false). Unlike the pixel-region calibration data still below, none of these vary
+    // per deployment (this bot only supports 1920×1080) and all have proven stable, so
+    // there was nothing left for config.json to buy by keeping them editable —
+    // recalibrating any of them now means editing the constant in code directly.
+    // director_points_use_pips itself stays here — it's a genuine toggle, not calibration data.
     "director_points_use_pips": false,   // false = OCR-only (pip pixel sampling was overcounting, see Director points reading section); kept, not deleted
-    "director_points_pips": {            // Pixel sampling for filled pip count — dormant while director_points_use_pips is false, calibration kept for later
-        "x_start": 862, "y": 1012, "spacing": 26, "count": 10
-    },
+
+    // player_target_coordinates and zone_color_thresholds are omitted entirely rather
+    // than kept as null placeholders (2026-09-07) — both are read via `.get(key, default)`
+    // with a fallback that already matches "uncalibrated" (`[]` / `{}`), so an absent key
+    // behaves identically to an explicit null and there was nothing config.json gained by
+    // keeping them. Still genuinely uncalibrated, still gate real (if currently inert)
+    // features — set them again if either is ever calibrated:
+    //   "player_target_coordinates": [[x, y], ...]   — picks one at random per play
+    //   "zone_color_thresholds": {"open": [r,g,b], "closing": [r,g,b], "closed": [r,g,b]}
+
     "screen_poll_interval_seconds": 12,
     "launch_timeout_seconds": 180,
 
@@ -747,10 +737,13 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "player_name_h": 14,                 // height of that strip (tesseract OCR crop)
     "kill_notification_region": null,    // [x, y, w, h] of the kill-feed text, OCR'd once at first blood (optional)
 
-    // Video recording
+    // Video recording. Crop region [755, 175, 410, 200] moved to a hardcoded constant
+    // (_CROP_REGION in game/video_recorder.py, 2026-09-07) — same rationale as the
+    // match_runner.py constants above.
     "recording_enabled": false,          // false = no local recording at all, and therefore no upload attempt either — currently off
-    "recording_api_endpoint": "",        // POST endpoint for upload — upload is still a TODO stub; local file is deleted after each match regardless (see Video Recorder section)
-    "recording_crop_region": [755, 175, 410, 200],   // [x, y, w, h] crop at 1920×1080 — tight center band on kill feed
+    // recording_api_endpoint omitted (2026-09-07) — read via `.get("recording_api_endpoint", "")`,
+    // so an absent key behaves the same as the empty string it held before. Upload is still a
+    // TODO stub regardless (see Video Recorder section); set this key again once it's implemented.
 
     // Ladder ingestion (darwinstalker.com, formerly ds.xdos.ai) — see game/ingest.py
     "ds_ingest_base_url": "https://darwinstalker.com",
@@ -818,14 +811,14 @@ All templates captured at **1920×1080** via pyautogui. Centers listed are for t
 - [x] `discord_bot_token` + role created in server
 - [x] `templates/play_button.png` captured
 - [x] All custom lobby flow templates captured (see table above)
-- [ ] `card_slots` coordinates for Electromania and Beach Party slots
-- [ ] `cards.electromania.slot` / `drop_target` and `cards.beach_party.slot` / `drop_target`
-- [x] `zone_close_auto_drop_target` — calibrated to `[1750, 1000]` (2026-08-30), inside the "SPECTATORS — LET THEM DECIDE" corner triangle
-- [ ] ~~`zone_close_card_slot`~~ / ~~`zone_sample_coordinates`~~ / ~~`zone_drop_coordinates`~~ (all 7 zones) / ~~`zone_color_thresholds`~~ — dormant, only needed if `_attempt_zone_close_legacy()` is ever restored
-- [ ] `results_ocr_regions` (x,y,w,h per column per row) — not needed if sending screenshot to Discord
+- [x] Card tray layout and per-card drop targets — hardcoded constants in `game/match_runner.py` (`_CARD_TRAY_CENTER_X`/`_CARD_TRAY_CARD_Y`/`_CARD_TRAY_CARD_WIDTH`, `_CARD_DROP_TARGETS`), not config, see Config Reference above
+- [x] `_ZONE_CLOSE_DROP_TARGET` — hardcoded constant, calibrated to `(1750, 1000)` (2026-08-30), inside the "SPECTATORS — LET THEM DECIDE" corner triangle
+- [x] `_ZONE_MAP_SAMPLE_POINTS` / `_ZONE_DROP_COORDINATES` (all 7 zones) — hardcoded constants in `game/match_runner.py`, dormant (only needed if `_attempt_zone_close_legacy()` is ever restored)
+- [ ] ~~`zone_close_card_slot`~~ / `zone_color_thresholds` — never calibrated; only needed if `_attempt_zone_close_legacy()` is ever restored. `zone_color_thresholds` (and `player_target_coordinates`, `recording_api_endpoint`) are omitted from config.json entirely rather than kept as null placeholders (2026-09-07) — see Config Reference above for how to set any of them again
+- [x] ~~`zone_sample_coordinates`~~ / ~~`results_ocr_regions`~~ — deleted from config.json (2026-09-07): both dead, read by zero lines of code
 - [x] `templates/placement_badge.png` captured (MAIN MENU button, 98×30px — self-match 1.0, in-game HUD 0.50)
-- [x] `director_points_region` calibrated to `[808, 1002, 20, 24]` (2-digit numerator only)
-- [x] `director_points_pips` calibrated in config.json
+- [x] `_DIRECTOR_POINTS_REGION` — hardcoded constant, calibrated to `(808, 1002, 20, 24)` (2-digit numerator only)
+- [x] `_DIRECTOR_POINTS_PIPS` — hardcoded constant in `game/match_runner.py`, dormant while `director_points_use_pips` (config) is `false`
 - [x] `tts_device` set to `"CABLE Input"` in config.json
 - [ ] `player_bar_region` + the five player-bar keys — never calibrated on any machine as of 2026-09-06 (they were added to the code without a template entry); without `player_bar_region` all player tracking is off. Do it with `calibrate_player_bar.py` / F8 — docs/PLAYER_BAR_CALIBRATION.md
 
@@ -843,7 +836,7 @@ Custom matches in Darwin Project require **Director + minimum 2 players** to sta
 ## Pending Implementation (TODOs)
 
 - `bot/discord_bot.py` — `_do_launch()`: replace template path placeholder with real captured template
-- In-game calibration: card slot coordinates, zone pixel coordinates, zone color thresholds, OCR regions (requires live Director match with 2+ players)
+- In-game calibration: zone pixel coordinates, zone color thresholds, OCR regions (requires live Director match with 2+ players) — card slot coordinates are done, see Calibration Checklist above
 
 ## Player-Targeted Cards
 

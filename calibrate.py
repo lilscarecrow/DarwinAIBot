@@ -7,25 +7,31 @@ It uses Win32 GetAsyncKeyState so hotkeys fire even when the game window has foc
 HOTKEYS
 -------
 F2  — Snapshot: saves full screenshot + logs mouse (x,y) + pixel RGB to calibration_log.json
-F3  — Zone pixel: same as F2 but tags the entry as a zone_sample prompt
+      (tag as zone_color or generic — see TAG_CHOICES)
+F3  — Zone colour shortcut: same as F2's zone_color tag, one prompt instead of two
 F4  — Template crop: saves a 200x80 px region centred on mouse as a template PNG
 F5  — Results screen: save screenshot tagged as 'results_screen' (use at match end)
 F6  — Quit and print a config.json snippet from everything collected
+F7  — Zone map snapshot (silent, for reference while holding a card)
+F8  — Player bar check (see MENU below)
 
 Auto-save: every 20 seconds a screenshot is taken silently (files named auto_*.png)
+
+Card tray layout, per-card drop targets, and zone drop coordinates are no longer
+calibrated here — they're hardcoded constants in game/match_runner.py (see CLAUDE.md's
+Config Reference and Calibration Checklist), proven stable at 1920×1080. This tool now
+only calibrates zone_color_thresholds (still genuinely uncalibrated) and the player-bar
+keys (via F8).
 
 WORKFLOW
 --------
 1. Start the match via Discord /start.
 2. Run: python calibrate.py
-3. When the card tray is visible:
-     - Hover over each card and press F2. Name each in the terminal prompt.
-4. When the zone map is visible (first zone close ~30s in):
-     - Hover over each zone's hex center on the map and press F2.
-     - Hover over an open zone hex colour and press F3 (zone_sample).
+3. When the zone map is visible (first zone close ~30s in):
+     - Hover over an open zone hex colour and press F3 (or F2 → zone_color).
      - Same for a closing and a closed zone as they change.
-5. At match end, press F5 on the results screen.
-6. Press F6 to quit and see the config snippet.
+4. At match end, press F5 on the results screen.
+5. Press F6 to quit and see the config snippet.
 
 All screenshots go to: calibration_screenshots/
 Log file: calibration_log.json
@@ -145,17 +151,18 @@ def _crop_template(img: np.ndarray, cx: int, cy: int, w: int = 200, h: int = 80)
 # ── Config builder ────────────────────────────────────────────────────────────
 
 def _build_config_snippet() -> dict:
-    """Assemble a partial config.json from collected snapshots — paste into your config."""
+    """Assemble a partial config.json from collected snapshots — paste into your config.
+
+    card_slots/cards/zone_close_card_slot/zone_sample_coordinates/zone_drop_coordinates
+    were removed from here (2026-09-07): the first three were never real config keys the
+    bot actually read (card tray layout and per-card drop targets are hardcoded constants
+    in game/match_runner.py — see _CARD_TRAY_CENTER_X/_CARD_DROP_TARGETS), and the other
+    two were moved to hardcoded constants (_ZONE_DROP_COORDINATES) or deleted outright
+    (zone_sample_coordinates was never read by any code, calibrated or not). Only
+    zone_color_thresholds remains a real, still-editable config key.
+    """
     snippet: dict = {
         "_note": "Partial calibration output — merge into config.json manually",
-        "card_slots": {},
-        "cards": {
-            "electromania": {"play_time_seconds": 120, "slot": None, "drop_target": None},
-            "beach_party":  {"play_time_seconds": 240, "slot": None, "drop_target": None},
-        },
-        "zone_close_card_slot": None,
-        "zone_sample_coordinates": {str(i): None for i in range(1, 8)},
-        "zone_drop_coordinates":   {str(i): None for i in range(1, 8)},
         "zone_color_thresholds": {"open": None, "closing": None, "closed": None},
     }
 
@@ -164,38 +171,9 @@ def _build_config_snippet() -> dict:
 
     for s in _snapshots:
         tag, label = s["tag"], s["label"].lower().strip()
-        x, y, rgb = s["mouse_x"], s["mouse_y"], s["pixel_rgb"]
+        rgb = s["pixel_rgb"]
 
-        if tag == "card_slot":
-            snippet["card_slots"][label] = [x, y]
-            if "electro" in label:
-                snippet["cards"]["electromania"]["slot"] = label
-            elif "beach" in label:
-                snippet["cards"]["beach_party"]["slot"] = label
-            elif "zone" in label or "close" in label:
-                snippet["zone_close_card_slot"] = [x, y]
-
-        elif tag == "card_drop":
-            if "electro" in label:
-                snippet["cards"]["electromania"]["drop_target"] = [x, y]
-            elif "beach" in label:
-                snippet["cards"]["beach_party"]["drop_target"] = [x, y]
-
-        elif tag == "zone_drop":
-            try:
-                zid = int(label.replace("zone", "").strip())
-                snippet["zone_drop_coordinates"][str(zid)] = [x, y]
-            except ValueError:
-                pass
-
-        elif tag == "zone_sample":
-            try:
-                zid = int(label.replace("zone", "").strip())
-                snippet["zone_sample_coordinates"][str(zid)] = [x, y]
-            except ValueError:
-                pass
-
-        elif tag == "zone_color":
+        if tag == "zone_color":
             state = label  # 'open', 'closing', or 'closed'
             if state in ("open", "closing", "closed"):
                 snippet["zone_color_thresholds"][state] = rgb
@@ -210,7 +188,7 @@ MENU = """
           DarwinDirector Calibration Helper
 ==========================================================
   F2 -> Snapshot (generic -- you'll name it)
-  F3 -> Zone colour sample (zone_color or zone_sample)
+  F3 -> Zone colour sample (feeds zone_color_thresholds)
   F4 -> Save 200x80 template crop around mouse
   F5 -> Results screen snapshot (full, tagged)
   F6 -> Quit + write calibration_log.json + config snippet
@@ -229,23 +207,15 @@ Waiting for hotkeys... (game window can be focused)
 
 TAG_CHOICES = """
 Tag this snapshot:
-  1  card_slot       (a card in the Director tray)
-  2  card_drop       (drag target for a card — e.g. middle of map)
-  3  zone_drop       (where to drag Close Zone card for a specific zone)
-  4  zone_sample     (pixel to sample to detect zone state)
-  5  zone_color      (the colour of a zone in a specific state)
-  6  generic         (just a labelled screenshot for reference)
-Choice [1-6]: """
+  1  zone_color      (the colour of a zone in a specific state)
+  2  generic         (just a labelled screenshot for reference)
+Choice [1-2]: """
 
 
 def _ask_tag() -> tuple[str, str]:
     tag_map = {
-        "1": "card_slot",
-        "2": "card_drop",
-        "3": "zone_drop",
-        "4": "zone_sample",
-        "5": "zone_color",
-        "6": "generic",
+        "1": "zone_color",
+        "2": "generic",
     }
     while True:
         choice = input(TAG_CHOICES).strip()
@@ -255,10 +225,6 @@ def _ask_tag() -> tuple[str, str]:
         print("  Invalid choice, try again.")
 
     label_hint = {
-        "card_slot":  "e.g. 'electromania', 'beach_party', 'close_zone'",
-        "card_drop":  "e.g. 'electromania' or 'beach_party'",
-        "zone_drop":  "zone number, e.g. '1' through '7'",
-        "zone_sample": "zone number, e.g. '1' through '7'",
         "zone_color": "'open', 'closing', or 'closed'",
         "generic":    "any description",
     }
@@ -283,16 +249,12 @@ def main():
                 _snapshot(img, tag, label)
 
             elif _pressed(VK_F3):
-                # Quick zone colour/sample shortcut
-                print("\n[F3] Zone sample — hover mouse on zone hex:")
+                # Quick zone colour shortcut — feeds zone_color_thresholds, the one
+                # remaining real config key this tool calibrates.
+                print("\n[F3] Zone colour sample — hover mouse on zone hex:")
                 img = _take()
-                choice = input("  (s)ample coordinate or (c)olour? [s/c]: ").strip().lower()
-                tag = "zone_sample" if choice == "s" else "zone_color"
-                if tag == "zone_color":
-                    label = input("  State — 'open', 'closing', or 'closed': ").strip()
-                else:
-                    label = input("  Zone number (1-7): ").strip()
-                _snapshot(img, tag, label)
+                label = input("  State — 'open', 'closing', or 'closed': ").strip()
+                _snapshot(img, "zone_color", label)
 
             elif _pressed(VK_F4):
                 print("\n[F4] Template crop — hover mouse on centre of element:")
