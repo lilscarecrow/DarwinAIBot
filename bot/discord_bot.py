@@ -1017,6 +1017,10 @@ class DirectorCog(commands.Cog):
                 "https://ko-fi.com/lilscarecrow"
             )
 
+            # The full details embed goes to the lobby-ping channel (with the role
+            # ping) instead of back to the command sender — that's where players
+            # actually watch for it. The command sender gets a short launch-style
+            # confirmation below, telling them to run /start next.
             _profile_label = "Randomizer" if _active_key == "randomizer" else self._resolved_profile["display_name"]
             embed = self._ok("Custom Match Ready", "Private lobby created. Share the code with your players.")
             embed.add_field(name="Region", value=region.name, inline=True)
@@ -1027,7 +1031,21 @@ class DirectorCog(commands.Cog):
                 embed.add_field(name="Not on the ladder yet", value=nudge, inline=False)
             if obs_control.is_enabled():
                 embed.add_field(name="Twitch Stream", value=stream_status_text, inline=False)
-            await interaction.followup.send(embed=embed)
+
+            ping_ch = self.bot.get_channel(_LOBBY_PING_CHANNEL_ID)
+            if ping_ch is None:
+                try:
+                    ping_ch = await self.bot.fetch_channel(_LOBBY_PING_CHANNEL_ID)
+                except Exception as e:
+                    logger.warning("Could not reach lobby ping channel %d: %s", _LOBBY_PING_CHANNEL_ID, e)
+                    ping_ch = None
+            if ping_ch is not None:
+                await ping_ch.send(content=f"<@&{_LOBBY_PING_ROLE_ID}>", embed=embed)
+
+            await interaction.followup.send(embed=self._ok(
+                "Custom Match Ready",
+                "Private lobby created. Run `/start` to begin the match.",
+            ))
 
             # Anti-cheat: cover the minimap as soon as the lobby exists, not just once
             # the match itself starts — the minimap is potentially visible from here on,
@@ -1039,16 +1057,6 @@ class DirectorCog(commands.Cog):
                     None, obs_control.set_source_visible,
                     self.bot.config.get("obs_minimap_cover_source", "Map Cover"), True,
                 )
-
-            ping_ch = self.bot.get_channel(_LOBBY_PING_CHANNEL_ID)
-            if ping_ch is None:
-                try:
-                    ping_ch = await self.bot.fetch_channel(_LOBBY_PING_CHANNEL_ID)
-                except Exception as e:
-                    logger.warning("Could not reach lobby ping channel %d: %s", _LOBBY_PING_CHANNEL_ID, e)
-                    ping_ch = None
-            if ping_ch is not None:
-                await ping_ch.send(f"<@&{_LOBBY_PING_ROLE_ID}> {lobby_code}")
 
             # Start a background watcher that fires the match runner if the lobby
             # auto-starts before /start is called.
