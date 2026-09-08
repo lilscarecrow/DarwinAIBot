@@ -1,7 +1,9 @@
 import asyncio
 import functools
 import logging
+import re
 import time
+from typing import Optional
 
 from twitchio import eventsub
 from twitchio.authentication import UserTokenPayload
@@ -10,6 +12,25 @@ from twitchio.ext import commands
 logger = logging.getLogger(__name__)
 
 _VALID_POV_KEYS = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
+
+# Channel-points redemption text box has no command parsing — viewers used to
+# typing chat commands often enter "!pov 5" or "pov 5" out of habit instead of
+# the bare "5" the reward actually asks for. Strips an optional leading "!"
+# and "pov" (any case, with/without a following space) before checking the
+# remainder against _VALID_POV_KEYS, so "5", "!pov 5", "pov 5", and "POV5" all
+# resolve the same way. Only used for the channel-points redemption path
+# (event_custom_redemption_add) — !pov in chat is already parsed into
+# command + argument by twitchio itself and never sees this.
+_POV_PREFIX_RE = re.compile(r"^!?\s*pov\s*", re.IGNORECASE)
+
+
+def _extract_pov_key(text: Optional[str]) -> Optional[str]:
+    """Free-form redemption text -> a valid POV key, or None if it doesn't
+    resolve to one after stripping an optional "!pov"/"pov" prefix."""
+    if not text:
+        return None
+    cleaned = _POV_PREFIX_RE.sub("", text.strip(), count=1).strip()
+    return cleaned if cleaned in _VALID_POV_KEYS else None
 
 # How long _resubscribe_missing() waits after a reconnect before checking which
 # subscriptions are enabled — gives TwitchIO's own internal resubscribe-on-reconnect
@@ -21,7 +42,7 @@ _RESUBSCRIBE_GRACE_SECONDS = 8
 # (see event_custom_redemption_add). Does not apply to /pov or !pov — both are
 # already mod/admin-gated with no cooldown, and mods/the broadcaster bypass this
 # cooldown too when they redeem the channel-points reward themselves.
-_POV_REDEMPTION_COOLDOWN_SECONDS = 60
+_POV_REDEMPTION_COOLDOWN_SECONDS = 30
 
 # All scopes this bot ever requests, kept as one list so a single re-authorization
 # grants everything at once instead of the user having to figure out which scope
@@ -333,7 +354,12 @@ class DarwinTwitchBot(commands.Bot):
         'Change POV'); any other custom reward on the channel is left completely
         alone. That reward must be created manually in the Twitch Creator
         Dashboard with "require viewer to enter text" enabled, so payload.user_input
-        carries the player number — same 1-9/0 choices as /pov and !pov.
+        carries the player number — same 1-9/0 choices as /pov and !pov. Parsed
+        via _extract_pov_key() rather than an exact match: viewers used to
+        typing chat commands often type "!pov 5" or "pov 5" into the redemption
+        box instead of the bare "5" it asks for, so those (and case variants)
+        are accepted too. Anything that still doesn't resolve to a valid key
+        is refunded, never fulfilled.
 
         A regular viewer redeeming this is rate-limited to one POV change per
         _POV_REDEMPTION_COOLDOWN_SECONDS globally (not per-viewer) — this is enforced
@@ -364,8 +390,8 @@ class DarwinTwitchBot(commands.Bot):
                 logger.warning("Twitch bot: could not refund cooldown-blocked POV redemption: %s", e)
             return
 
-        key = payload.user_input.strip()
-        if not self.session.is_command_valid("pov") or key not in _VALID_POV_KEYS:
+        key = _extract_pov_key(payload.user_input)
+        if not self.session.is_command_valid("pov") or key is None:
             try:
                 await payload.refund(token_for=self._owner_id)
             except Exception as e:
