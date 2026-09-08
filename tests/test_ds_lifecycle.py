@@ -1,5 +1,7 @@
 """DraftLifecycle with a fake transport: the open/roster/results/close state machine."""
 import logging
+import threading
+import time
 
 import pytest
 
@@ -110,6 +112,47 @@ def test_match_start_reuses_lobby_draft():
     ds.open_lobby()
     assert ds.on_match_start(["Alpha", "", " Bravo"]) == 11
     assert t.calls[-1] == ("open", ["Alpha", "Bravo"], "pc", "scarecrow", 11, "https://ds.test", "tok")
+
+
+class BlockingTransport(FakeTransport):
+    """A transport whose open_set_draft blocks on a gate — lets a test prove a
+    caller returned before the network call finished, not just that it
+    eventually finished (a fast fake transport races that check away)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.gate = threading.Event()
+
+    def open_set_draft(self, *a, **kw):
+        self.gate.wait(2)
+        return super().open_set_draft(*a, **kw)
+
+
+def test_match_start_async_does_not_block_the_caller():
+    t = BlockingTransport()
+    ds = DraftLifecycle(CFG, transport=t)
+    t.gate.set()          # let the synchronous open_lobby() through immediately
+    ds.open_lobby()
+    t.gate.clear()         # now block the next open_set_draft call — the async one
+    start = time.monotonic()
+    ds.on_match_start_async(["Alpha"])
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.5, "on_match_start_async must return immediately, not block on the network call"
+    assert len(t.calls) == 1, "the async call must not have reached the transport yet"
+    t.gate.set()
+    for _ in range(100):
+        if len(t.calls) > 1:
+            break
+        time.sleep(0.02)
+    assert t.calls[-1] == ("open", ["Alpha"], "pc", "scarecrow", 11, "https://ds.test", "tok")
+
+
+def test_match_start_async_noop_when_disabled():
+    ds, t = make({"ds_ingest_twitch_channel": "x"})
+    before = set(threading.enumerate())
+    ds.on_match_start_async(["Alpha"])
+    assert set(threading.enumerate()) == before, "must not spawn a thread when ingest is disabled"
+    assert t.calls == []
 
 
 def test_match_start_with_no_names_keeps_draft_and_warns(caplog):

@@ -195,8 +195,11 @@ class MatchRunner:
 
         # Push the OCR'd roster onto the ladder draft opened at /custom (or open
         # one now if none is). Empty OCR is logged, never silently skipped.
+        # Fire-and-forget (see on_match_start_async's docstring) — this used to
+        # be a plain awaited call and its network round-trip delayed the B-press
+        # below on every match (found live 2026-09-07).
         if self._ds is not None:
-            self._ds.on_match_start(self._player_names)
+            self._ds.on_match_start_async(self._player_names)
             self._ds.event("match_start", elapsed_ms=0, slots=[n or None for n in self._player_names])
 
         from game import tts

@@ -16,6 +16,7 @@ the ladder is best-effort and must never stop a match.
 Contract and verification steps: docs/DS_LIFECYCLE_HANDOFF.md.
 """
 import logging
+import threading
 import time
 from types import SimpleNamespace
 from typing import Optional
@@ -332,6 +333,29 @@ class DraftLifecycle:
             logger.info("ds on_match_start: server moved us from draft %s to %s", self._draft_id, new_id)
         self._draft_id = new_id
         return new_id
+
+    def on_match_start_async(self, names: list[str]) -> None:
+        """Fire-and-forget wrapper around on_match_start() for the match-start
+        call site (game/match_runner.py), which runs on the match thread right
+        before the B-press — the one place this roster push must never be
+        allowed to block. Found live (2026-09-07): the plain, awaited call
+        added a real network round-trip (up to _OPEN_DRAFT_TIMEOUT_SECONDS)
+        between the match countdown and the actual game start, on every match.
+
+        Same fire-and-forget convention as announce()/ds_ingest/OBS elsewhere
+        in this codebase, just on a daemon thread instead of asyncio.ensure_future
+        since MatchRunner isn't on the event loop. No return value — nothing at
+        the call site used the draft id anyway (event() reads self._draft_id
+        fresh via a closure at flush time, so a brief staleness window while
+        this thread is still in flight is harmless)."""
+        if not self.enabled:
+            return
+        threading.Thread(
+            target=self.on_match_start,
+            args=(names,),
+            daemon=True,
+            name="DsOnMatchStart",
+        ).start()
 
     def post_results(self, png_path: str, roster: Optional[list[str]] = None) -> None:
         """Match over: upload the results screenshot into the open draft."""
