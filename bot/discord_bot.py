@@ -2384,7 +2384,16 @@ class ScrimCog(commands.Cog):
     role_group = app_commands.Group(name="role", description="Manage scrim player roles")
 
     @role_group.command(name="add", description="Give the scrim player role(s) to all signed-up players")
-    async def role_add(self, interaction: discord.Interaction):
+    @app_commands.describe(
+        region="Which region gets first-lobby priority, signup order preserved within the filter. "
+               "Default: Mix (no region filter, current behavior)."
+    )
+    @app_commands.choices(region=[
+        app_commands.Choice(name="Mix — current signup order, no region filter", value="MIX"),
+        app_commands.Choice(name="NA", value="NA"),
+        app_commands.Choice(name="EU", value="EU"),
+    ])
+    async def role_add(self, interaction: discord.Interaction, region: Optional[app_commands.Choice[str]] = None):
         if not self._has_scrim_admin(interaction):
             await interaction.response.send_message(
                 "You don't have permission to use this command.", ephemeral=True
@@ -2392,6 +2401,7 @@ class ScrimCog(commands.Cog):
             return
 
         await interaction.response.defer()
+        region_value = region.value if region else "MIX"
 
         player_role_name = self._cfg("scrim_player_role", "")
         if not player_role_name:
@@ -2422,12 +2432,36 @@ class ScrimCog(commands.Cog):
             await interaction.followup.send("Nobody has signed up yet.")
             return
 
+        # Region filter (2026-09-07): MIX takes the first 10 reactors in actual signup
+        # order exactly as before. NA/EU instead take the first 10 reactors THAT HOLD
+        # that region role, still in signup order — a region-mismatched player never
+        # jumps the queue, they're just skipped for lobby-1 purposes. Only lobby 1 is
+        # filtered; lobby 2 (and any overflow beyond it) still draws from whoever is
+        # left, in original signup order, regardless of region — the same as MIX.
+        region_role_name = None
+        if region_value != "MIX":
+            region_role_name = self._cfg(f"region_role_{region_value.lower()}", region_value)
+            region_role = discord.utils.get(guild.roles, name=region_role_name) if region_role_name else None
+            if region_role is None:
+                await interaction.followup.send(
+                    f"Role **{region_role_name}** not found in this server — cannot filter by {region_value}."
+                )
+                return
+            first_pool = [u for u in reactors if region_role in u.roles]
+            if not first_pool:
+                await interaction.followup.send(f"No signed-up players hold the **{region_role_name}** role.")
+                return
+        else:
+            first_pool = reactors
+
         # First 10 reactors in actual signup order (tracked live in _signup_order —
-        # see _ordered_reactors()) get the primary lobby role; the next 10 (11-20)
-        # get the second lobby role.
-        first_lobby = reactors[:10]
-        second_lobby = reactors[10:20] if player_role_2 else []
-        overflow_unassigned = len(reactors) > 10 and player_role_2 is None
+        # see _ordered_reactors()) get the primary lobby role; the next 10 (11-20 of
+        # whoever's left, not just the raw list) get the second lobby role.
+        first_lobby = first_pool[:10]
+        first_lobby_ids = {u.id for u in first_lobby}
+        remaining = [u for u in reactors if u.id not in first_lobby_ids]
+        second_lobby = remaining[:10] if player_role_2 else []
+        overflow_count = len(remaining) - len(second_lobby)
 
         async def _assign(users: list, role: discord.Role) -> tuple[list[discord.Member], list[str]]:
             assigned, skipped = [], []
@@ -2450,8 +2484,15 @@ class ScrimCog(commands.Cog):
                     assigned.append(member)  # already has it, count as success
             return assigned, skipped
 
+        lines = []
+        if region_value != "MIX":
+            lines.append(
+                f"Region filter: **{region_value}** — {len(first_pool)} of {len(reactors)} "
+                f"signup(s) hold the **{region_role_name}** role."
+            )
+
         assigned, skipped = await _assign(first_lobby, player_role)
-        lines = [f"Assigned **{player_role_name}** to {len(assigned)} player(s)."]
+        lines.append(f"Assigned **{player_role_name}** to {len(assigned)} player(s).")
         if assigned:
             lines.append(", ".join(m.display_name for m in assigned))
         if skipped:
@@ -2468,14 +2509,14 @@ class ScrimCog(commands.Cog):
                 lines.append(f"Could not assign to: {', '.join(skipped_2)}")
             all_assigned += assigned_2
 
-        if overflow_unassigned:
-            extra = len(reactors) - 10
-            lines.append(
-                f"{extra} additional signup(s) beyond the first 10 were not assigned — "
-                f"set `scrim_player_role_2` in config.json to enable a second lobby."
-            )
-        elif len(reactors) > 20:
-            lines.append(f"{len(reactors) - 20} additional signup(s) beyond 20 were not assigned.")
+        if overflow_count > 0:
+            if player_role_2 is None:
+                lines.append(
+                    f"{overflow_count} additional signup(s) beyond the first 10 were not assigned — "
+                    f"set `scrim_player_role_2` in config.json to enable a second lobby."
+                )
+            else:
+                lines.append(f"{overflow_count} additional signup(s) beyond 20 were not assigned.")
 
         region_table = self._build_region_table(all_assigned)
         if region_table:
