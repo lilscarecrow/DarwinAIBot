@@ -128,7 +128,7 @@ def read_director_points(screenshot: np.ndarray, region: tuple[int, int, int, in
             return int(digits)
     except ValueError:
         pass
-    logger.warning("Could not parse director points from OCR text: %r", text)
+    logger.debug("Could not parse director points from OCR text: %r", text)
     return None
 
 
