@@ -162,3 +162,91 @@ No terminal input is needed at F8, so it works while the game has focus.
 - `tests/test_player_bar_calibration.py` — synthetic-frame tests of the
   pipeline (run with `pytest -q`; needs opencv + numpy, which
   requirements-dev.txt now lists).
+
+## 8. Slot-number badge (2026-09-09) — confirmed, both open questions answered
+
+Each card's small top-right number badge **is** the same digit `/pov`'s
+hotkey (1-9, 0) switches camera to for that player, and it **is stable for
+the whole match** — confirmed directly (scarecrow, 2026-09-09), no live test
+needed. When a player is eliminated, their card stays in the same slot with
+the same badge; only a visual X overlay is added — nothing about their
+position or number changes. So the badge is a genuine, match-long identity
+key, immune to the pivot that raw card position isn't.
+
+**What does move:** confirmed — the whole card block's *vertical* position on
+screen is fixed regardless of player count, but its *horizontal* layout
+(center-x block width, so each card's x) depends on how many players are in
+the lobby, "just like the deck slots" pivoting with fewer cards. This is
+exactly V2's existing model (`positions(n)` around a fixed `player_cards_center_x`
+with a fixed `player_cards_pitch`) — no redesign needed there, it already
+matches how the game actually lays the strip out. Because eliminated players'
+cards never move or disappear, this positioning only needs to be resolved
+once, at match start, for the whole match — not re-detected every poll.
+
+**Practical upshot:** a `{slot_number: canonical_name}` map built once at
+match start (see below) stays valid for the rest of the match. Elimination
+tracking can key off that slot number rather than raw position, and doesn't
+need to worry about the strip ever reshuffling mid-match.
+
+**Badge OCR was tried and abandoned — the slot number doesn't need OCR at
+all (2026-09-09).** The digit is small enough at native 1920×1080 that an
+extensive preprocessing sweep against a real 6-card lobby screenshot — Otsu,
+several fixed thresholds, inverted grayscale, the min-channel trick that
+works well for names, five PSM modes, several crop tightnesses — topped out
+around 2-4 of 6 correct, with several cards read as the wrong digit rather
+than failing cleanly. What replaced it: `game/player_cards_v2.py::slot_number_for_index(index)`
+— a card's left-to-right `index` maps straight to its `/pov` hotkey as
+`"1".."9","0"`, no screen reading involved. This works because both
+2026-09-09 confirmations above hold: the badges in that same screenshot read
+`1,2,3,4,5,6` in exact left-to-right order matching `detect_cards()`'s index,
+and `/pov`'s own key mapping already treats `"0"` as the 10th slot — so the
+sequence is always `1..9,0`. `badge_crop()`/`ocr_badge_number()` are kept in
+the module as a secondary cross-check in the diagnostic log (see below) —
+useful to glance at, never to be trusted as the source of truth.
+
+**What's built so far, still not wired into real match logic** — nothing
+here feeds `_player_slot_xs`/`_player_alive`/`_player_names` or any of the
+V1/V2 state the match actually uses:
+`MatchRunner._log_slot_map_snapshot()` (called right at the B press, or at
+the top of the auto-start branch when `_skip_start` is set — i.e. as close
+to match start as the existing flow allows) runs V2's `detect_cards()` +
+`ocr_names()`, derives each card's slot via `slot_number_for_index()`, logs
+one line per card (`slot / index / x / name / alive`, plus the untrusted
+`badge_ocr` reading for comparison), and — as of 2026-09-09 — also pushes a
+`slot_map` live event via `self._emit(...)` (`n`, `slots`, `names`, `xs`,
+`badge_ocr`), so the same data shows up on darwinstalker.com next to
+`match_start`/`eliminated` rather than only in the local log file (the
+ordinary `logger.info(...)` line stays local either way — `DsLogHandler`
+only forwards INFO from `game.ds_lifecycle`/`game.ingest`, see
+docs/DS_LIFECYCLE_HANDOFF.md §3a). Wrapped in try/except, never raises. The
+one thing this doesn't cover yet is confirming name OCR accuracy — the part
+still genuinely reliant on OCR — against a real match's logs.
+
+**Runs on a background thread, not inline (2026-09-09 fix, found live):**
+`_log_slot_map_snapshot()` does up to two tesseract calls per card (name +
+badge OCR), which was blocking the match thread synchronously right at match
+start and delaying the B-press/card-timer sequence by several seconds on a
+real lobby — the same class of bug as the `on_match_start` delay fixed
+2026-09-07, just introduced fresh by this feature. `_fire_slot_map_snapshot()`
+(what `run()` actually calls at both call sites now) spawns a daemon thread
+and returns immediately instead. One residual gap, low-stakes given this is
+still diagnostic-only: `SessionState._pov_locked` (see `/pov`'s CLAUDE.md
+entry) is released a fixed ~10-12s after match start regardless of whether
+the background snapshot has finished by then, so on a slow read there's a
+small window where a POV switch could still corrupt it — not closed, since
+the worst case is a bad diagnostic read, not a match-logic bug.
+
+**"Fully captured" flag (2026-09-09):** `captured = bool(cards) and all(bool(nm) for nm in names)`
+— every card `detect_cards()` found this match got *some* name (ladder-linked
+or raw OCR, either counts, per the unlinked note above), an N/N read with no
+partial misses. Self-referential to what was actually detected on screen,
+not cross-checked against `roster_size` (that's only a Discord-signup
+estimate of who's supposed to be here, not proof of who actually is).
+Written to `MatchRunner._lobby_captured`/`_slot_map` from the snapshot's own
+background thread (plain attribute assignment, no lock, same as this
+class's other cross-thread flags) and exposed via `is_lobby_captured()` /
+`slot_map()` (`{"/pov" digit: name}`, only non-empty once captured) — the
+gate any future feature needing a trustworthy full slot map should check,
+rather than assuming a name exists for every slot. Also rides on the
+`slot_map` event as `captured` (bool). Not wired into anything yet — this is
+the flag itself, not a consumer of it.

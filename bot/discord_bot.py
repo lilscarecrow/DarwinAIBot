@@ -1924,6 +1924,11 @@ class DirectorCog(commands.Cog):
             return
         if not await self._state_check(interaction, "pov"):
             return
+        if self.bot.session.is_pov_locked():
+            await interaction.response.send_message(
+                "POV isn't available yet — the match is still starting up.", ephemeral=True
+            )
+            return
 
         key = str(player.value)
         import functools

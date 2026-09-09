@@ -391,7 +391,7 @@ class DarwinTwitchBot(commands.Bot):
             return
 
         key = _extract_pov_key(payload.user_input)
-        if not self.session.is_command_valid("pov") or key is None:
+        if not self.session.is_command_valid("pov") or self.session.is_pov_locked() or key is None:
             try:
                 await payload.refund(token_for=self._owner_id)
             except Exception as e:
@@ -428,6 +428,9 @@ class PovComponent(commands.Component):
         session = self.bot.session
         if not session.is_command_valid("pov"):
             await ctx.reply(f"Can't switch POV right now (state: {session.state.name}).")
+            return
+        if session.is_pov_locked():
+            await ctx.reply("POV isn't available yet — the match is still starting up.")
             return
 
         key = player.strip()

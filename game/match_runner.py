@@ -116,6 +116,16 @@ class MatchRunner:
         # that talks to the darwinstalker ladder. None = ingest not wired.
         self._ds = draft_lifecycle
         self._session = session
+        # Locked here, at construction, so it's engaged from the moment a match
+        # is about to run regardless of which call site created this runner
+        # (/start, the auto-start watcher) — unlocked in run() right after the
+        # forced default-POV-1 press. See SessionState._pov_locked's docstring
+        # for why: a manual POV switch during this narrow startup window would
+        # enlarge a different card's band and corrupt the slot-map OCR
+        # snapshot taken in that same window. If this runner never reaches
+        # that press (aborted early), _reset_session()'s session.reset() is
+        # the safety net that clears it so POV can never stay stuck locked.
+        self._session.lock_pov()
         self._on_action_update = on_action_update
         self._stop = threading.Event()
         self._skip_start = skip_start
@@ -152,6 +162,15 @@ class MatchRunner:
         self._v2_xs: list[int] = []
         self._v2_alive: list[bool] = []
         self._v2_names: list[str] = []
+        # Set by _log_slot_map_snapshot() (2026-09-09) once every card it detected got
+        # a usable (non-empty) name — "10/10", "9/9", never a partial read. Written from
+        # that method's background thread (see _fire_slot_map_snapshot()); simple
+        # attribute assignment, no lock, same as this class's other cross-thread flags.
+        # Future features that need a trustworthy full slot->name map should gate on
+        # is_lobby_captured() rather than assuming _slot_map is populated — it stays {}
+        # whenever the capture was partial, so there's nothing to accidentally trust.
+        self._lobby_captured: bool = False
+        self._slot_map: dict[str, str] = {}  # {"/pov" digit: name}, only meaningful once captured
         # monotonic clock at match start; every live event carries elapsed_ms from it
         self._match_started_at: Optional[float] = None
         # Latest confirmed director-points reading — see _update_points_reading().
@@ -207,6 +226,7 @@ class MatchRunner:
         if self._skip_start:
             # Game auto-started — B press is skipped but the 5s in-game countdown still runs
             self._update("Waiting for match countdown", "Starting card timers")
+            self._fire_slot_map_snapshot()
             tts.speak("Match is starting. Good luck.", broadcast=False)
             if self._stop.wait(5):
                 return "Match aborted during countdown."
@@ -214,6 +234,7 @@ class MatchRunner:
             # Press B to start the match
             self._update("Pressing B to start", "Waiting for countdown")
             self._press("b")
+            self._fire_slot_map_snapshot()
             # Announce immediately after B press — players are still in the lobby
             tts.speak("Match is starting. Good luck.", broadcast=False)
 
@@ -250,6 +271,11 @@ class MatchRunner:
             # to run /pov or !pov first. Same key as /pov's "1" choice.
             self._press("1")
             self._announce_card_lineup(profile_announce)
+        # POV is safe to use manually from here on — see SessionState._pov_locked's
+        # docstring. Unlocked unconditionally (even if the wait above was interrupted
+        # and the press skipped) since the match is either underway or about to be
+        # torn down either way; _reset_session() covers the teardown case regardless.
+        self._session.unlock_pov()
         poll_interval = self._config.get("screen_poll_interval_seconds", 12)
 
         # recording_enabled: false skips creating/starting the recorder entirely — no
@@ -397,6 +423,153 @@ class MatchRunner:
     def _detector_mode(self) -> str:
         mode = str(self._config.get("player_bar_detector", "v1")).strip().lower()
         return mode if mode in ("v1", "v2", "shadow") else "v1"
+
+    def _fire_slot_map_snapshot(self) -> None:
+        """Fire-and-forget wrapper (2026-09-09 fix, found live) — the actual
+        snapshot does up to two tesseract calls per card (name + badge OCR),
+        which was blocking the match thread synchronously right at match
+        start and delaying the B-press/card-timer sequence by several
+        seconds on a real lobby, exactly the "on_match_start" delay found
+        and fixed 2026-09-07. Diagnostic work with no downstream consumer in
+        run() must never sit inline in the match's own critical path — same
+        rule as that fix, generalized: spawn a daemon thread and return
+        immediately instead."""
+        threading.Thread(
+            target=self._log_slot_map_snapshot, daemon=True, name="SlotMapSnapshot",
+        ).start()
+
+    def _log_slot_map_snapshot(self) -> None:
+        """Diagnostic only (2026-09-09) — reads each card's slot-number badge
+        alongside its name at match start, logs the resulting slot→name map,
+        and pushes it to the ladder as a "slot_map" live event (visible on
+        darwinstalker.com next to match_start/eliminated — the ordinary log
+        line stays local; DsLogHandler only forwards INFO from
+        game.ds_lifecycle/game.ingest, see docs/DS_LIFECYCLE_HANDOFF.md).
+        The badge is confirmed (2026-09-09, docs/PLAYER_BAR_CALIBRATION.md
+        §8) to equal the /pov hotkey and to stay fixed to the same player for
+        the whole match — an elimination only adds an X overlay, it never
+        moves or renumbers a card — so this map, once built, should hold for
+        the rest of the match. Still not wired into real match logic beyond
+        the event push until real OCR output (not just the crop, which is now
+        measured) has been checked against an actual match's logs. Nothing
+        here feeds _player_slot_xs/_player_alive/_player_names or anything
+        else the match actually uses, and it never raises, so a bad read here
+        can never affect match start.
+
+        Unlinked players (no ladder identity — see NameSnapper's docstring)
+        can't be corrected against anything, so their slot just keeps
+        whatever nameplate OCR read, verbatim — that was already snap_all()'s
+        fallback. What's new here is making that explicit: `linked` marks
+        which slots actually resolved to one of the ladder's known lobby
+        players (self._ds.lobby) versus which are raw OCR standing in for an
+        unlinked one, and the not-linked count is checked against
+        self._ds.unlinked's known size as a sanity signal — a mismatch means
+        either OCR missed a linked player too, or the roster has drifted
+        since /custom captured it, not that the unlinked count is wrong.
+        """
+        try:
+            from game.screen_detection import take_screenshot
+            from game import player_cards_v2 as v2
+
+            screenshot = take_screenshot()
+            expected = None
+            if self._ds is not None:
+                try:
+                    expected = self._ds.roster_size or None
+                except Exception:
+                    expected = None
+            cards = v2.detect_cards(screenshot, self._config, expected=expected)
+            if not cards:
+                logger.info("Slot map snapshot: no cards detected")
+                return
+            names = v2.ocr_names(screenshot, cards, self._config)
+            if len(names) != len(cards):
+                names = ["" for _ in cards]
+            names = self._snap_names(names)
+
+            known_players: set[str] = set()
+            unlinked_count: Optional[int] = None
+            if self._ds is not None:
+                try:
+                    known_players = {str(m.get("player") or "").strip() for m in self._ds.lobby if m.get("player")}
+                except Exception:
+                    known_players = set()
+                try:
+                    unlinked_count = len(self._ds.unlinked)
+                except Exception:
+                    unlinked_count = None
+
+            logger.info("Slot map snapshot — %d cards detected:", len(cards))
+            slots: list[str] = []
+            badge_ocrs: list[Optional[int]] = []
+            linked_flags: list[bool] = []
+            for c, name in zip(cards, names):
+                # slot = card.index -> /pov digit, confirmed 2026-09-09, no OCR
+                # needed (see slot_number_for_index()'s docstring). badge_ocr is
+                # logged only as a secondary cross-check, not trusted — that OCR
+                # proved unreliable at native resolution.
+                slot = v2.slot_number_for_index(c.index)
+                badge_ocr, raw_badge = v2.ocr_badge_number(screenshot, c, self._config)
+                linked = bool(name) and name in known_players
+                slots.append(slot)
+                badge_ocrs.append(badge_ocr)
+                linked_flags.append(linked)
+                source = "ladder" if linked else ("ocr" if name else "unread")
+                logger.info(
+                    "  slot=%s  card index=%d  x=%-4d  name=%s  (%s)  alive=%s  (badge_ocr=%s raw %r)",
+                    slot, c.index, c.x, name or "(unread)", source, c.alive,
+                    badge_ocr if badge_ocr is not None else "?", raw_badge,
+                )
+
+            not_linked = sum(1 for f in linked_flags if not f)
+            if unlinked_count is not None and not_linked != unlinked_count:
+                logger.info(
+                    "Slot map snapshot: %d slot(s) not matched to a known ladder player, "
+                    "expected %d unlinked roster member(s) — mismatch (an OCR miss on a "
+                    "linked player, or the roster has drifted since /custom captured it)",
+                    not_linked, unlinked_count,
+                )
+
+            # "Fully captured": every card detect_cards() found has SOME name (ladder
+            # or raw OCR, either counts — see the unlinked note above) — a straight
+            # N/N, not a partial read. Self-referential to what was actually detected
+            # on screen this time, not cross-checked against roster_size, since that's
+            # only a Discord-signup estimate of who's supposed to be here, not proof of
+            # who actually is. Written here, on this method's own background thread
+            # (see _fire_slot_map_snapshot()); a plain bool + dict assignment, no lock
+            # needed, same as this class's other cross-thread flags.
+            captured = bool(cards) and all(bool(nm) for nm in names)
+            self._lobby_captured = captured
+            self._slot_map = dict(zip(slots, names)) if captured else {}
+            if captured:
+                logger.info("Slot map snapshot: lobby fully captured (%d/%d)", len(cards), len(cards))
+            else:
+                unread = sum(1 for nm in names if not nm)
+                logger.info(
+                    "Slot map snapshot: lobby NOT fully captured (%d/%d unread)",
+                    unread, len(cards),
+                )
+
+            self._emit(
+                "slot_map", n=len(cards), slots=slots,
+                names=[nm or None for nm in names],
+                xs=[c.x for c in cards], badge_ocr=badge_ocrs,
+                linked=linked_flags, captured=captured,
+            )
+        except Exception as e:
+            logger.warning("Slot map snapshot failed: %s", e)
+
+    def is_lobby_captured(self) -> bool:
+        """True once _log_slot_map_snapshot() resolved a usable name for every
+        card it detected this match — see that method's docstring. Gate any
+        future feature that needs a trustworthy full slot->name map on this
+        rather than assuming slot_map() is populated; it returns {} whenever
+        the capture was partial or hasn't run yet."""
+        return self._lobby_captured
+
+    def slot_map(self) -> dict[str, str]:
+        """{"/pov" digit: name}, populated only once is_lobby_captured() is True."""
+        return dict(self._slot_map)
 
     def _init_player_bar_v2(self, screenshot, drive: bool) -> None:
         """Run the geometry detector on the lobby snapshot. drive=True makes it

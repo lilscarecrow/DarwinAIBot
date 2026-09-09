@@ -102,6 +102,47 @@ field with it to the "Custom Match Ready" embed, which is posted to the
 lobby-ping channel (that is what the players read), with the unlinked members
 also pinged in the message content — mentions inside an embed never notify.
 
+**`snap_all()`'s fuzzy second pass (2026-09-09):** the exact-fold match above
+still runs first and is unchanged (`NameSnapper.snap()` stays exact-or-nothing
+— single-read callers get the conservative behavior). `snap_all()` (the
+whole-bar caller `MatchRunner` actually uses) now falls through to a fuzzy
+pass over whatever's left unclaimed, added because longer names sometimes
+scroll or get clipped by the card's fixed-width nameplate — a genuine
+truncation of the true name, not OCR noise, that an exact-fold check was
+always going to miss. `_similarity()` scores two folded strings by the higher
+of plain sequence similarity and substring containment in either direction,
+so a read that's a contiguous chunk of the true (longer) name still scores
+well. Resolution runs in rounds — each round claims only the single
+highest-confidence read/player pair among those left, skipping any read whose
+top two candidate players are too close to call (`_AMBIGUITY_MARGIN`) or
+whose best score is below the floor (`_MIN_FUZZY_CONFIDENCE = 0.6`) — so
+claiming one player can un-stick a rival candidate for another read next
+round, and a read with no real signal is left verbatim rather than guessed.
+Covered in `tests/test_name_snap.py` (a one-typo miss `snap()` alone refuses
+but `snap_all()` relaxes, a scrolled/cut-off name, an unrecognizable read
+staying verbatim, the existing shared-fold ambiguity case surviving the fuzzy
+pass too, and confidence-ordering across two competing reads).
+
+**Unlinked players have no ladder identity to correct against, by design.**
+`NameSnapper` is built only from `lobby` (`self._snapper = NameSnapper(self._lobby)`
+in `_take_reply()`) — `unlinked` never feeds it, so a read for an unlinked
+player's slot has no candidate to exact-, substring-, or fuzzy-match against
+and always passes through `snap_all()` unchanged. That's the "just OCR what
+we can" behavior for those slots; there's no automatic way to do better,
+since an unlinked member's Discord name (in `unlinked[].names`) and their
+in-game display name live in unrelated namespaces — cross-referencing them
+would be a guess, not a match, so the code doesn't try. `_log_slot_map_snapshot()`
+(2026-09-09) makes this explicit rather than silent: each slot's `linked` flag
+says whether its name actually resolved to one of `self._ds.lobby`'s known
+players, and the count of `not linked` slots is checked against
+`len(self._ds.unlinked)` as a sanity signal — logged only when they disagree,
+which points at an OCR miss on a linked player (not just an expected unlinked
+one) or a roster that's drifted since `/custom` captured it, rather than
+implying the unlinked count itself is wrong. The actual fix for an unlinked
+player is out-of-band and not per-match: they claim their Steam handle via
+`claim_nudge()`'s prompt, and the *next* open-draft reply then includes them
+in `lobby` with real aliases to match against.
+
 ### POST /api/ingest/events (live match events)
 
 ```json
@@ -174,6 +215,7 @@ draft is open; a queue over 1000 drops the newest.
 | `eliminated`  | every alive→dead flip, all match       | `slot`, `player`  | `alive`: players still alive after it   |
 | `detector_v2` | at match start when `player_bar_detector` is `shadow` or `v2` | `elapsed_ms: 0` | `drive`, `n`, `alive`, `xs`, `names` — what the V2 card detector saw (docs/PLAYER_BAR_CALIBRATION.md) |
 | `eliminated_v2` | shadow mode only: every flip V2 saw   | `slot`, `player`  | `alive` — compare with `eliminated` (V1) and the HUD counter |
+| `slot_map`    | right at match start (B press / auto-start), always, regardless of `player_bar_detector` | `elapsed_ms: 0` | `n`, `slots` (each card's `/pov` digit, derived from position — no OCR, see docs/PLAYER_BAR_CALIBRATION.md §8), `names`, `xs`, `badge_ocr` (untrusted cross-check), `linked` (per-slot bool: name resolved to a known ladder lobby player vs. is raw OCR standing in for an unlinked one), `captured` (bool: every one of the `n` cards got a usable name, an N/N read — see `MatchRunner.is_lobby_captured()`) — `MatchRunner._log_slot_map_snapshot()`, still diagnostic-only as of 2026-09-09 |
 | `match_end`   | placement badge detected               | `elapsed_ms`      | —                                       |
 | `card_play`   | the director fires a card              | —                 | `card`: card_type, `name`: event name   |
 | `say`         | `/say` megaphone                       | —                 | `text`, `by` (Discord display name)     |

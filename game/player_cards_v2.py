@@ -47,6 +47,17 @@ V2_DEFAULTS: dict = {
     "player_cards_dead_red": 0.08,      # fraction of strong-red pixels in the box above which = dead
     "player_cards_min": 2,
     "player_cards_max": 10,
+    # The small slot-number badge in each card's top-right corner, thought to
+    # be the same digit the /pov hotkey (1-9, 0) switches camera to for that
+    # player. Measured 2026-09-09 against a real 1920x1080 lobby screenshot
+    # (6-card lobby, badges 1-6) — pixel-mapped per card and cross-checked on
+    # two different cards (x=631 and x=1289) to confirm the offset from card
+    # center is constant; visually confirmed clean on all 6 badges in that
+    # frame. Still UNCONFIRMED: whether the badge is stable per player for
+    # the whole match or just reflects current display position (see
+    # ocr_badge_number()'s docstring and docs/PLAYER_BAR_CALIBRATION.md §8).
+    "player_cards_badge_rows": [54, 67],
+    "player_cards_badge_dx": [39, 60],
 }
 
 
@@ -67,6 +78,23 @@ class Card:
     band_v: int
     band_s: int
     red_x: float       # strong-red fraction of the portrait box (the eliminated X)
+
+
+def slot_number_for_index(index: int) -> str:
+    """A card's left-to-right index -> its /pov hotkey digit, as a string.
+
+    Confirmed 2026-09-09 against a real 6-card lobby screenshot: badges read
+    1,2,3,4,5,6 in exact left-to-right order matching detect_cards()' index,
+    and /pov's own key mapping already treats "0" as the 10th slot — so the
+    sequence is always 1..9,0, never OCR'd. This replaced ocr_badge_number()
+    as the actual source of truth after that OCR proved unreliable at native
+    resolution (an extensive preprocessing sweep — Otsu, several fixed
+    thresholds, inverted grayscale, the min-channel trick that works for
+    names, five PSM modes, several crop tightnesses — topped out around 2-4
+    of 6 correct on that same frame). ocr_badge_number() is kept only as a
+    secondary cross-check in the diagnostic log, not as anything trusted.
+    """
+    return "0" if index == 9 else str(index + 1)
 
 
 def positions(n: int, cfg: dict) -> list[int]:
@@ -221,3 +249,43 @@ def ocr_names(img: np.ndarray, cards: list[Card], cfg: Optional[dict] = None) ->
         except Exception:
             names.append("")
     return names
+
+
+def badge_crop(img: np.ndarray, card: Card, cfg: Optional[dict] = None) -> np.ndarray:
+    """The small top-right slot-number badge on a card. player_cards_badge_rows/_dx
+    were measured 2026-09-09 against a real 1920x1080 lobby screenshot — see
+    their comment in V2_DEFAULTS for how, and what's still unconfirmed."""
+    cfg = v2_config(cfg)
+    r0, r1 = (int(v) for v in cfg["player_cards_badge_rows"])
+    d0, d1 = (int(v) for v in cfg["player_cards_badge_dx"])
+    return img[r0:r1, card.x + d0:card.x + d1]
+
+
+def ocr_badge_number(img: np.ndarray, card: Card, cfg: Optional[dict] = None) -> tuple[Optional[int], str]:
+    """OCR the card's slot-number badge — the same digit /pov's hotkey (1-9,
+    0) switches camera to for this player, confirmed 2026-09-09 to be a
+    stable per-player identifier for the whole match: an eliminated player's
+    card keeps its slot and badge, just gaining an X overlay, and only the
+    strip's overall width (not any individual card's identity) changes with
+    player count. See docs/PLAYER_BAR_CALIBRATION.md §8.
+
+    Returns (parsed digit or None, raw OCR text) — the raw text is kept even
+    on a parse miss so a live log can show what the crop actually saw, for
+    tuning player_cards_badge_rows/_dx against real matches. Never raises.
+    """
+    try:
+        from game.ocr import _ocr_region_img
+    except Exception:
+        return None, ""
+    crop = badge_crop(img, card, cfg)
+    if crop.size == 0:
+        return None, ""
+    try:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        scaled = cv2.resize(gray, None, fx=6, fy=6, interpolation=cv2.INTER_CUBIC)
+        _, thresh = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        text = _ocr_region_img(thresh, config="--psm 10 -c tessedit_char_whitelist=0123456789").strip()
+    except Exception:
+        return None, ""
+    digits = "".join(filter(str.isdigit, text))
+    return (int(digits) if digits else None), text

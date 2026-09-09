@@ -32,6 +32,16 @@ class SessionState:
         self._next_action: str = "None"
         self._match_start_time: float | None = None
         self._state_entered_at: float = time.monotonic()
+        # True from the moment a MatchRunner is constructed until its forced
+        # default-POV-1 press completes (see MatchRunner.__init__/run()) —
+        # narrower than is_command_valid("pov")'s state check, which stays
+        # True for the whole match. Exists so a manual /pov, !pov, or the
+        # channel-points redemption can't enlarge a different card's band
+        # mid-startup and corrupt the slot-map OCR snapshot taken in that
+        # same window (found live 2026-09-09). _reset_session()'s universal
+        # reset-to-IDLE path also clears it, so an aborted match can never
+        # leave POV stuck locked for the rest of the session.
+        self._pov_locked: bool = False
 
     @property
     def state(self) -> BotState:
@@ -72,6 +82,15 @@ class SessionState:
     def is_command_valid(self, command: str) -> bool:
         return command in VALID_COMMANDS.get(self._state, [])
 
+    def lock_pov(self) -> None:
+        self._pov_locked = True
+
+    def unlock_pov(self) -> None:
+        self._pov_locked = False
+
+    def is_pov_locked(self) -> bool:
+        return self._pov_locked
+
     def invalid_command_message(self, command: str) -> str:
         valid_in = [s.name for s, cmds in VALID_COMMANDS.items() if command in cmds]
         return (
@@ -85,6 +104,7 @@ class SessionState:
         self._next_action = "None"
         self._match_start_time = None
         self._state_entered_at = time.monotonic()
+        self._pov_locked = False
         logger.info("Session state reset to IDLE")
 
     def status_message(self) -> str:
