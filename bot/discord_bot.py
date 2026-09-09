@@ -2051,6 +2051,8 @@ class ScrimCog(commands.Cog):
     Config keys:
       scrim_signup_channel_id  — channel where the signup message lives
       scrim_signup_message_id  — persisted ID of the tracked message
+      scrim_region_message_id  — persisted ID of the live region-breakdown message posted
+                                  right below it (see _ensure_region_message/_update_region_message)
       scrim_player_role        — role name given to the first 10 signed-up players
       scrim_player_role_2      — optional role name given to the next 10 (11-20) — second lobby
       scrim_admin_role         — role name pinged when the queue is full
@@ -2078,6 +2080,12 @@ class ScrimCog(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         await self._ensure_signup_message()
+        await self._ensure_region_message()
+        # Refresh its content on every startup too — reactions can happen while
+        # the bot is offline, and this catches up on those the moment it's back.
+        signup_message = await self._get_signup_message()
+        if signup_message is not None:
+            await self._update_region_message(signup_message.guild, await self._reactors(signup_message))
         await self._resume_reset_timer_if_needed()
 
     async def _resume_reset_timer_if_needed(self):
@@ -2141,7 +2149,114 @@ class ScrimCog(commands.Cog):
             return
         logger.info("ScrimCog: posted new signup message %d in channel %s", msg.id, ch_id)
 
-        self._save_message_id(msg.id)
+        self._save_message_id("scrim_signup_message_id", msg.id)
+
+    async def _ensure_region_message(self):
+        """Post (or verify) the live region-breakdown message right below the
+        signup message. No-op if scrim_signup_channel_id isn't configured, or if
+        neither region_role_na nor region_role_eu exists in the guild — same
+        "nothing to show" case _region_table_lines() already covers."""
+        ch_id = self._cfg("scrim_signup_channel_id")
+        if not ch_id:
+            return
+
+        ch = self.bot.get_channel(int(ch_id))
+        if ch is None:
+            try:
+                ch = await asyncio.wait_for(
+                    self.bot.fetch_channel(int(ch_id)), timeout=_DISCORD_API_TIMEOUT_SECONDS
+                )
+            except Exception as e:
+                logger.warning("ScrimCog: could not fetch signup channel for region message: %s", e)
+                return
+
+        existing_id = self._region_message_id()
+        if existing_id:
+            try:
+                await asyncio.wait_for(ch.fetch_message(existing_id), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+                return  # still exists — on_raw_reaction_add/remove keep its content fresh
+            except discord.NotFound:
+                logger.warning("ScrimCog: region message %d was deleted — posting a new one", existing_id)
+            except Exception as e:
+                logger.warning("ScrimCog: could not verify region message: %s", e)
+                return
+
+        signup_message = await self._get_signup_message()
+        members = await self._reactors(signup_message) if signup_message else []
+        embed = self._region_breakdown_embed(ch.guild, members)
+        if embed is None:
+            return  # neither region role exists in this guild yet
+
+        try:
+            msg = await asyncio.wait_for(ch.send(embed=embed), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+        except Exception as e:
+            logger.warning("ScrimCog: could not post region breakdown message: %s", e)
+            return
+        logger.info("ScrimCog: posted new region breakdown message %d in channel %s", msg.id, ch_id)
+
+        self._save_message_id("scrim_region_message_id", msg.id)
+
+    async def _update_region_message(self, guild: discord.Guild, members: list[discord.Member]) -> None:
+        """Refresh the live region-breakdown message's content — called after every
+        signup reaction add/remove so it always reflects who's actually signed up,
+        not just whoever /role add last assigned."""
+        embed = self._region_breakdown_embed(guild, members)
+        if embed is None:
+            return  # neither region role exists in this guild — nothing to show
+
+        msg_id = self._region_message_id()
+        if not msg_id:
+            # Never created (region roles may not have existed at startup) — try now.
+            await self._ensure_region_message()
+            return
+
+        ch_id = self._cfg("scrim_signup_channel_id")
+        ch = self.bot.get_channel(int(ch_id)) if ch_id else None
+        if ch is None:
+            return
+
+        try:
+            msg = await asyncio.wait_for(ch.fetch_message(msg_id), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+            await asyncio.wait_for(msg.edit(embed=embed), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+        except discord.NotFound:
+            logger.warning("ScrimCog: region message %d missing — reposting", msg_id)
+            await self._ensure_region_message()
+        except Exception as e:
+            logger.warning("ScrimCog: could not update region breakdown message: %s", e)
+
+    def _region_table_lines(self, guild: discord.Guild, members: list[discord.Member]) -> Optional[list[str]]:
+        """Rows for the region breakdown table (Player / NA / EU columns), or None
+        if neither region_role_na nor region_role_eu exists in this guild — there's
+        nothing meaningful to show in that case regardless of who's signed up.
+        Role names come from region_role_na/region_role_eu (config, default 'NA'/'EU')."""
+        na_role_name = self._cfg("region_role_na", "NA")
+        eu_role_name = self._cfg("region_role_eu", "EU")
+        na_role = discord.utils.get(guild.roles, name=na_role_name) if na_role_name else None
+        eu_role = discord.utils.get(guild.roles, name=eu_role_name) if eu_role_name else None
+        if na_role is None and eu_role is None:
+            return None
+
+        name_width = max([len("Player")] + [len(m.display_name) for m in members])
+        header = f"{'Player'.ljust(name_width)}  NA  EU"
+        rows = [header, "-" * len(header)]
+        for m in members:
+            has_na = "X" if na_role and na_role in m.roles else "-"
+            has_eu = "X" if eu_role and eu_role in m.roles else "-"
+            rows.append(f"{m.display_name.ljust(name_width)}  {has_na.center(2)}  {has_eu.center(2)}")
+        return rows
+
+    def _region_breakdown_embed(self, guild: discord.Guild, members: list[discord.Member]) -> Optional[discord.Embed]:
+        """The live region-breakdown message's content — a monospace Player/NA/EU
+        table covering every current signup reactor. None if _region_table_lines()
+        has nothing to show (region roles not configured/found in this guild)."""
+        rows = self._region_table_lines(guild, members)
+        if rows is None:
+            return None
+        return discord.Embed(
+            title="Region Breakdown",
+            description="```\n" + "\n".join(rows) + "\n```",
+            color=_COLOR_NEUTRAL,
+        )
 
     def _start_reset_timer(self):
         """(Re)start the 1-hour countdown to the next reaction cleanup, if one isn't already running."""
@@ -2204,19 +2319,21 @@ class ScrimCog(commands.Cog):
         except Exception as e:
             logger.warning("ScrimCog reaction reset: could not post notify message: %s", e)
 
-    def _save_message_id(self, message_id: int):
-        self.bot.config["scrim_signup_message_id"] = message_id
+    def _save_message_id(self, key: str, message_id: int):
+        """Persist a tracked message id (scrim_signup_message_id or
+        scrim_region_message_id) to config.json so it survives a restart."""
+        self.bot.config[key] = message_id
         import json as _json
         try:
             from pathlib import Path as _Path
             cfg_path = _Path("config.json")
             with cfg_path.open("r", encoding="utf-8") as f:
                 raw = _json.load(f)
-            raw["scrim_signup_message_id"] = message_id
+            raw[key] = message_id
             with cfg_path.open("w", encoding="utf-8") as f:
                 _json.dump(raw, f, indent=4)
         except Exception as e:
-            logger.warning("ScrimCog: could not persist scrim_signup_message_id: %s", e)
+            logger.warning("ScrimCog: could not persist %s: %s", key, e)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -2227,6 +2344,10 @@ class ScrimCog(commands.Cog):
 
     def _signup_message_id(self) -> int | None:
         v = self._cfg("scrim_signup_message_id")
+        return int(v) if v else None
+
+    def _region_message_id(self) -> int | None:
+        v = self._cfg("scrim_region_message_id")
         return int(v) if v else None
 
     def _emoji(self) -> str:
@@ -2253,7 +2374,12 @@ class ScrimCog(commands.Cog):
         return False
 
     async def _get_signup_message(self) -> discord.Message | None:
-        msg_id = self._signup_message_id()
+        return await self._get_tracked_message(self._signup_message_id())
+
+    async def _get_region_message(self) -> discord.Message | None:
+        return await self._get_tracked_message(self._region_message_id())
+
+    async def _get_tracked_message(self, msg_id: int | None) -> discord.Message | None:
         ch_id = self._cfg("scrim_signup_channel_id")
         if not msg_id or not ch_id:
             return None
@@ -2311,6 +2437,10 @@ class ScrimCog(commands.Cog):
         No raw reaction-remove events fire for a deleted message, so — same as the
         bulk-clear approach before it — _signup_order and the reset timer are reset
         manually here rather than relying on on_raw_reaction_remove's usual bookkeeping.
+
+        The live region-breakdown message below the signup message is deleted and
+        reposted right alongside it — it has no reactions of its own to reset, but
+        it's tracking the same now-gone signup message, so it goes with it.
         """
         message = await self._get_signup_message()
         if message is not None:
@@ -2318,9 +2448,18 @@ class ScrimCog(commands.Cog):
                 await asyncio.wait_for(message.delete(), timeout=_DISCORD_API_TIMEOUT_SECONDS)
             except Exception as e:
                 logger.warning("Could not delete signup message for repost: %s", e)
+
+        region_message = await self._get_region_message()
+        if region_message is not None:
+            try:
+                await asyncio.wait_for(region_message.delete(), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+            except Exception as e:
+                logger.warning("Could not delete region breakdown message for repost: %s", e)
+
         self._signup_order.clear()
         self._cancel_reset_timer()
         await self._ensure_signup_message()
+        await self._ensure_region_message()
 
     async def _reactors(self, message: discord.Message) -> list[discord.Member]:
         """Return all non-bot members who reacted with the signup emoji (excludes this bot's own seed reaction)."""
@@ -2368,6 +2507,7 @@ class ScrimCog(commands.Cog):
             return
         reactors = await self._reactors(message)
         count = len(reactors)
+        await self._update_region_message(message.guild, reactors)
         logger.info(
             "Scrim signup: %s (id=%d) reacted — queue now %d/%d",
             payload.member.display_name if payload.member else payload.user_id,
@@ -2422,6 +2562,7 @@ class ScrimCog(commands.Cog):
         if message is None:
             return
         reactors = await self._reactors(message)
+        await self._update_region_message(message.guild, reactors)
         if not reactors:
             self._cancel_reset_timer()
 
@@ -2546,8 +2687,6 @@ class ScrimCog(commands.Cog):
         if skipped:
             lines.append(f"Could not assign to: {', '.join(skipped)}")
 
-        all_assigned = list(assigned)
-
         if second_lobby:
             assigned_2, skipped_2 = await _assign(second_lobby, player_role_2)
             lines.append(f"Assigned **{player_role_2_name}** to {len(assigned_2)} player(s).")
@@ -2555,7 +2694,6 @@ class ScrimCog(commands.Cog):
                 lines.append(", ".join(m.display_name for m in assigned_2))
             if skipped_2:
                 lines.append(f"Could not assign to: {', '.join(skipped_2)}")
-            all_assigned += assigned_2
 
         if overflow_count > 0:
             if player_role_2 is None:
@@ -2566,35 +2704,7 @@ class ScrimCog(commands.Cog):
             else:
                 lines.append(f"{overflow_count} additional signup(s) beyond 20 were not assigned.")
 
-        region_table = self._build_region_table(all_assigned)
-        if region_table:
-            lines.append(region_table)
-
         await interaction.followup.send("\n".join(lines))
-
-    def _build_region_table(self, members: list[discord.Member]) -> str:
-        """Monospace table of assigned players and whether each holds the NA/EU region
-        role, so an admin can see at a glance which server region the lobby should use.
-        Role names come from region_role_na/region_role_eu (config, default 'NA'/'EU').
-        Returns '' if there's nothing to show (no members, or neither role exists)."""
-        if not members:
-            return ""
-        guild = members[0].guild
-        na_role_name = self._cfg("region_role_na", "NA")
-        eu_role_name = self._cfg("region_role_eu", "EU")
-        na_role = discord.utils.get(guild.roles, name=na_role_name) if na_role_name else None
-        eu_role = discord.utils.get(guild.roles, name=eu_role_name) if eu_role_name else None
-        if na_role is None and eu_role is None:
-            return ""
-
-        name_width = max(len("Player"), max(len(m.display_name) for m in members))
-        header = f"{'Player'.ljust(name_width)}  NA  EU"
-        rows = [header, "-" * len(header)]
-        for m in members:
-            has_na = "X" if na_role and na_role in m.roles else "-"
-            has_eu = "X" if eu_role and eu_role in m.roles else "-"
-            rows.append(f"{m.display_name.ljust(name_width)}  {has_na.center(2)}  {has_eu.center(2)}")
-        return "**Region Breakdown:**\n```\n" + "\n".join(rows) + "\n```"
 
     @role_group.command(name="remove", description="Remove one lobby's scrim player role and its reactions")
     @app_commands.describe(lobby="Which lobby to clear — 1 (scrim_player_role) or 2 (scrim_player_role_2)")

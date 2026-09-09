@@ -223,7 +223,7 @@ Manages a static signup message in the configured channel. On every `on_ready`, 
 **Commands (scrim admin role required, i.e. `discord_required_role` — see merge note above):**
 | Command | Description |
 |---|---|
-| `/role add [region]` | Gives `scrim_player_role` to the first 10 reactors (by actual signup order — see above) and, if `scrim_player_role_2` is configured, `scrim_player_role_2` to the next 10 — see "Two-lobby overflow" and "Region filter" below. Appends a region breakdown table — see below. Response is public (not ephemeral). |
+| `/role add [region]` | Gives `scrim_player_role` to the first 10 reactors (by actual signup order — see above) and, if `scrim_player_role_2` is configured, `scrim_player_role_2` to the next 10 — see "Two-lobby overflow" and "Region filter" below. The region breakdown is a standing message below the signup message, not part of this response — see below. Response is public (not ephemeral). |
 | `/role remove <lobby>` | **Required `lobby` choice, `1` or `2`.** Removes only that lobby's role (`scrim_player_role` for `1`, `scrim_player_role_2` for `2`) from everyone who currently has it, then deletes and reposts the signup message — see below, this resets **both** lobbies' reactions, not just the targeted one. Response is public (not ephemeral). |
 
 Both commands' permission-denial message ("You don't have permission...") remains ephemeral — only the successful-result messages were made public.
@@ -239,7 +239,9 @@ No raw reaction events fire for a deleted message, so `_signup_order` and the re
 
 **Discord API calls in the signup-message lifecycle are timeout-wrapped (2026-09-04 fix):** found live — a `/role remove` deleted the old message fine, but the immediately-following `ch.send(embed=embed)` inside `_ensure_signup_message()` hung on a stalled/dead connection for **7+ minutes**, with no exception and no timeout, leaving the Discord interaction stuck "thinking" the whole time (confirmed via `darwin_bot.log`: the delete's `NotFound` warning logged instantly, then total silence until the bot's gateway session was invalidated/reconnected — the request itself finally completed right around when that happened). None of `fetch_channel`/`fetch_message`/`send`/`add_reaction`/`delete` had a timeout, so any one of them stalling indefinitely could reproduce this. `_get_signup_message()`, `_ensure_signup_message()`, and `_delete_and_repost_signup_message()` now wrap every Discord API await in `asyncio.wait_for(..., timeout=_DISCORD_API_TIMEOUT_SECONDS)` (15s) — a stall now fails fast with a logged warning (and, for the "post new message" step, a clean early return) instead of hanging the command indefinitely. Same philosophy as the game-automation timeouts (`_LAUNCH_TIMEOUT`, `_CUSTOM_TIMEOUT`, `_MATCH_TIMEOUT`) applied to Discord's own API for the first time in this codebase.
 
-**`/role add` region breakdown table (2026-09-04):** `_build_region_table()` appends a monospace table (Player / NA / EU columns, `X`/`-` per cell) to `/role add`'s response, listing every player just assigned across both lobbies, so the admin can see at a glance which server region has more players before running `/custom`. Role names come from `region_role_na`/`region_role_eu` (config, default `"NA"`/`"EU"`) — looked up fresh each call via `discord.utils.get(guild.roles, ...)`, not cached, so a role rename takes effect immediately with no restart. Returns `""` (table omitted entirely) if there are no assigned members or neither role exists in the guild. `_assign()`'s internal helper now collects `discord.Member` objects instead of just display-name strings so this table can check `.roles` — the existing "Assigned to N player(s)" summary lines derive their names from the same member list, no behavior change there.
+**Live region-breakdown message below the signup message, not a `/role add` reply (2026-09-04, moved to a standing message 2026-09-09):** originally `_build_region_table()` appended a monospace table (Player / NA / EU columns, `X`/`-` per cell) to `/role add`'s response, covering only whoever that invocation had just assigned. It's now a standing message of its own — `_ensure_region_message()` posts it directly below the signup message (same channel, `scrim_signup_channel_id`) the first time both exist, and it tracks **every current signup reactor**, not just role-add's picks, so it reflects reality even before `/role add` has ever run. `_region_table_lines(guild, members)` builds the same Player/NA/EU rows as before (role names from `region_role_na`/`region_role_eu`, config default `"NA"`/`"EU"`, looked up fresh via `discord.utils.get(guild.roles, ...)` — a role rename takes effect immediately) and returns `None` if neither role exists in the guild, in which case no region message is created/updated at all — same "nothing to show" case the old table returned `""` for. `_region_breakdown_embed()` wraps those rows in a small embed (`_COLOR_NEUTRAL`); `/role add`'s response no longer includes any region info of its own.
+
+**Auto-updates on every signup add/remove:** `on_raw_reaction_add`/`on_raw_reaction_remove` both call `_update_region_message(guild, reactors)` right after recomputing `_reactors(message)` — it edits the tracked message in place (`msg.edit(embed=...)`, not delete+repost, since this message carries no reactions of its own to worry about stale-caching) so the table always reflects who's actually signed up as of the last reaction event. If the tracked message doesn't exist yet (region roles weren't in the guild at startup) `_update_region_message` calls `_ensure_region_message()` instead, so the message self-heals into existence the moment both region roles exist and someone next reacts/unreacts — no restart needed. `on_ready()` also force-refreshes it once at startup (reactions can happen while the bot is offline) and `_delete_and_repost_signup_message()` (the `/role remove` reset path) deletes and reposts it alongside the signup message it tracks, exactly like the signup message itself — same reasoning: a brand-new message can't carry stale content, and there's no per-reaction loop to race since this message has no reactions to clear. Persisted as `scrim_region_message_id` (config, auto-persisted like `scrim_signup_message_id` — `_save_message_id(key, id)` is now the shared, key-parameterized helper both message ids go through).
 
 **Two-lobby overflow (2026-08-30):** `scrim_player_role_2` is optional. `/role add` always takes `reactors[:10]` for the primary role; only when `scrim_player_role_2` is configured does it also take `reactors[10:20]` for the second role. If more than 10 reacted and `scrim_player_role_2` is unset, the overflow beyond 10 is left unassigned and the response says so (same behavior as before this feature existed — nothing changes unless you set the key). `_match_in_progress()` (used to gate the 1-hour reset countdown) checks both roles, so an active second lobby also blocks the reset from firing. Note: the scrim-roster capture passed to the ladder ingest API (`DirectorCog._resolved_roster`, see Ladder Ingestion section) still caps at `reactors[:10]` (plain, not ordered) and was not changed — it doesn't currently account for a second lobby's players.
 
@@ -248,12 +250,13 @@ No raw reaction events fire for a deleted message, so `_signup_order` and the re
 |---|---|
 | `scrim_signup_channel_id` | `1520517054988419123` |
 | `scrim_signup_message_id` | Auto-persisted — do not edit manually |
+| `scrim_region_message_id` | Auto-persisted — do not edit manually. The live region-breakdown message below the signup message, see above |
 | `scrim_player_role` | `PC Scrim Player` |
 | `scrim_player_role_2` | `PC Scrim Player 2` — optional; second-lobby role for signups 11-20, see "Two-lobby overflow" above |
 | `scrim_admin_role` | `PC Scrim Admin` (same value as `discord_required_role`) |
 | `scrim_min_players` | `8` |
 | `scrim_reaction_emoji` | `✅` |
-| `region_role_na` / `region_role_eu` | `"NA"` / `"EU"` — Discord role names checked by `/role add`'s region breakdown table |
+| `region_role_na` / `region_role_eu` | `"NA"` / `"EU"` — Discord role names checked by the live region-breakdown message below the signup message |
 
 Two channel IDs are hardcoded constants in `discord_bot.py` rather than config keys: `_AI_DIRECTOR_CHANNEL_ID` (queue-full ping) and the notify channel used in `_do_reaction_reset` (`1520509256678506737`, removed-players re-signup ping). Both were confirmed to belong to the current guild (`480566249609232389`) after the server migration — if the guild ever changes again, these need updating in code, not config.
 
@@ -773,12 +776,13 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     // Scrim signup system
     "scrim_signup_channel_id": "1520517054988419123",
     "scrim_signup_message_id": null,     // Auto-persisted by bot on startup — do not edit manually
+    "scrim_region_message_id": null,     // Auto-persisted — live region-breakdown message posted below the signup message
     "scrim_player_role": "PC Scrim Player",
     "scrim_player_role_2": "PC Scrim Player 2", // optional — second-lobby role for signups 11-20
     "scrim_admin_role": "PC Scrim Admin", // same value as discord_required_role — see merge note above
     "scrim_min_players": 8,
     "scrim_reaction_emoji": "✅",
-    "region_role_na": "NA",               // Discord role name checked by /role add's region breakdown table
+    "region_role_na": "NA",               // Discord role name checked by the live region-breakdown message
     "region_role_eu": "EU",
 
     // OBS Twitch streaming — see game/obs_control.py. Off by default; OBS must already
