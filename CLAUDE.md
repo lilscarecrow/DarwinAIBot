@@ -539,7 +539,7 @@ Controls OBS Studio remotely via **obs-websocket** (built into OBS 28+, enabled 
 Complete sequence triggered by `/custom <region>` from `IN_MENU` state. All coordinates are for **1920×1080**.
 
 ```
-Step 0 — Region setup
+Step 0 — Region setup (skipped entirely if last_selected_region already matches — see below)
   hover_click(355, 258)                          PLAY button on main menu
   wait: play_screen_region.png                   confirms PLAY screen loaded
   check region_na.png / region_eu.png            detect current region
@@ -551,6 +551,7 @@ Step 0 — Region setup
     verify: play_screen_region.png               popup closed, back on PLAY screen
   click_until(1840, 1044)                        BACK → main menu
   verify: play_button.png
+  persist last_selected_region = wanted
 
 Step 1 — Enter custom flow
   click(226, 333)                                CUSTOM button
@@ -577,12 +578,20 @@ Step 8 — Director role
 
 Step 9 — Lobby
   wait: lobby_password_label.png (timeout=80s)  "SEARCHING FOR GAME" transition is normal
-  sleep(10.0)                                    wait for game lag before clipboard
+  snapshot clipboard                             remember what's there BEFORE the click — see below
   click(center[0]+316, center[1]-9)             clipboard icon offset from label center
-  pyperclip.paste()                             → lobby code
+  poll clipboard until it differs from the snapshot (timeout 10s) → lobby code
   press_key("escape")                           close the lobby menu
   press_key("shift")                            dismiss the initial tray display
 ```
+
+**Region setup skipped entirely when the cached region already matches (2026-09-09):** `last_selected_region` (config, persisted via `_persist_config_value()` — same read-modify-write helper `/tournament` and the ladder tournament slug use) remembers the region the last successful `/custom` left the game set to. If it equals the region requested this time, Step 0's entire PLAY-screen round trip — open PLAY, template-check the region, click BACK, wait for main menu — is skipped outright and `_do_create_custom` goes straight to clicking CUSTOM on the main menu; nothing in the log even mentions a PLAY screen in this case. This was the common case anyway (the region rarely changes between matches) and that whole round trip was pure overhead on every single `/custom` even when nothing needed to change — several template waits and two hover-click delays, all for a check that almost always confirmed "already correct." Only on an actual mismatch (or before this key is ever set) does the full original flow run — visit PLAY, template-check, change the region if the screen itself disagrees with what was cached, click BACK — and `last_selected_region` is updated to the requested region right before returning to the main menu.
+
+**Trade-off, accepted deliberately:** if the game's region is ever changed by something other than this bot (manual play through the game's own menus, a `/custom` that got interrupted mid region-change on a previous run) `last_selected_region` goes stale, and since the cache-hit path never opens the PLAY screen, there is no check left to catch that drift — the match would run in the cached region rather than the game's actual one until the next time an intentional region switch resyncs it. Acceptable here because this bot is the only thing that ever touches the region setting in the deployed setup; if that stops being true, the fix is either dropping the whole skip (revert to always checking) or having it re-verify on-screen every Nth call instead of every call.
+
+**Clipboard step polls for a change instead of a flat 10s sleep, and checks freshness against the pre-click value (2026-09-09):** the old code slept a flat 10 seconds after the Director lobby appeared ("game can lag here and a clipboard copy attempted too early will return empty"), then read `pyperclip.paste()` exactly once. That paid the full 10s on every single `/custom` even when the lobby settled in 1-2s. It's now `previous_clipboard = pyperclip.paste().strip()` captured **before** clicking the copy icon, then a poll loop (`_CLIPBOARD_POLL_TIMEOUT_SECONDS` = 10.0 ceiling, `_CLIPBOARD_POLL_INTERVAL_SECONDS` = 0.3) that clicks, then keeps re-reading the clipboard until it sees a non-empty value that's **different from `previous_clipboard`**, returning as soon as that happens rather than waiting out the full ceiling. The pre-click snapshot matters for correctness, not just speed: `pyperclip.paste()` only ever reports whatever the OS clipboard currently holds, with no way to know whether *this* click actually landed yet — reading it once, immediately, with no comparison point would read a previous lobby's leftover code as a perfectly valid (but wrong) success. Comparing against the snapshot works regardless of what happened to be in the clipboard beforehand — a previous lobby code, empty, or something unrelated the user copied earlier — the only thing that matters is that the value changed after the click. The 10s ceiling is kept as a worst-case fallback matching the old sleep's budget, so if it's ever hit, `Custom: clipboard never changed after copy button` logs the stale value it saw instead of the old ambiguous "clipboard empty."
+
+**Two `wait_for_template_center` calls tightened to a 0.5s poll interval (2026-09-09):** `create_custom_match.png` (step 2) and `lobby_password_label.png` (step 9) previously omitted `poll_interval`, falling back to the function's own default of 2.0s — every other wait in this flow already passes `poll_interval=0.5` explicitly. Both now match; a screen that becomes ready just after a check is caught up to 1.5s sooner on average.
 
 **Key offsets calibrated at 1920×1080:**
 - Clipboard icon: `lobby_password_label` center + (316px right, 9px up)
@@ -695,6 +704,8 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "discord_guild_ids": ["..."],        // Guild IDs for instant slash command sync — removing an ID here does NOT un-register commands already synced to that guild, see note above
     "zone_selection_strategy": "weighted_outer",
     "active_profile": "standard",        // Match card play profile (see game/profiles.py)
+    "last_selected_region": null,        // Auto-persisted by _do_create_custom — last region /custom left the game set to;
+                                          // skips the whole PLAY-screen region check when it matches the next request (2026-09-09)
     "tournament_mode": false,            // Toggled via /tournament — delays /custom's stream start 2 min, keeps minimap cover up all match
     "ahk_bypass_mode": false,            // true = log actions instead of executing
     "verify_card_plays": true,           // false = play once and trust it, skip pixel-verify/retries (kept, not deleted)

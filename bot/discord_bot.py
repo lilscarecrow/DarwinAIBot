@@ -178,6 +178,13 @@ _LAUNCH_TIMEOUT = 420.0    # 7 min: game start + splash + menu detection (slow H
 _CUSTOM_TIMEOUT = 180.0    # 3 min: menu navigation to lobby (lobby load can be slow)
 _MATCH_TIMEOUT  = 3600.0   # 60 min: safety net — real matches can exceed 20 min
 
+# _do_create_custom's clipboard-copy step (2026-09-09): replaces a flat 10s sleep
+# with polling for the clipboard to actually change after the copy-icon click, so
+# the common case (lobby settles fast) doesn't pay the full 10s every time. The
+# ceiling stays at the old sleep's budget as a worst-case fallback.
+_CLIPBOARD_POLL_TIMEOUT_SECONDS = 10.0
+_CLIPBOARD_POLL_INTERVAL_SECONDS = 0.3
+
 # Ceiling for a single Discord API call (fetch channel/message, send, delete, add
 # reaction) in the scrim signup message lifecycle. Found live: a stalled/dead
 # connection left one of these hanging for 7+ minutes with the /role remove
@@ -1126,61 +1133,76 @@ class DirectorCog(commands.Cog):
             return None
 
         try:
-            # 0. Navigate to PLAY screen and verify/set the region
-            logger.info("Custom: opening PLAY screen for region check (want %s)", region)
-            if not hover_click(355, 258):   # orange PLAY button on main menu
-                return None
-            if not wait_for_template_center("templates/play_screen_region.png", timeout=8, poll_interval=0.5):
-                logger.error("Custom: PLAY screen not detected")
-                save_error_screenshot("play_screen_not_found")
-                return None
-
+            # 0. Verify/set the region — skipped entirely (no PLAY screen visit at
+            # all) when last_selected_region (config, persisted below) already
+            # matches what was requested. This is the common case — the region
+            # rarely changes between matches — and the PLAY-screen round trip
+            # (open PLAY, template-check, click BACK, wait for main menu) was
+            # costing real time on every single /custom even when nothing needed
+            # to change. Trade-off: if the game's region is ever changed by some
+            # means other than this bot (manual play, a crashed mid-change from a
+            # prior run), the cache goes stale and this skips a check that would
+            # have caught it — accepted deliberately for the speedup.
             wanted = region.upper()
-            screenshot = take_screenshot()
-            region_matches = {
-                "NA": find_template(screenshot, "templates/region_na.png"),
-                "EU": find_template(screenshot, "templates/region_eu.png"),
-                "APAC": find_template(screenshot, "templates/region_apac.png"),
-            }
-            region_correct = bool(region_matches.get(wanted))
-            logger.info("Custom: current region — %s  wanted=%s  correct=%s",
-                        {k: bool(v) for k, v in region_matches.items()}, wanted, region_correct)
-
-            if not region_correct:
-                # Open the region popup and select the right row.
-                # Row positions are fixed — we use hardcoded coords rather than
-                # template-matching because the game highlights the active row
-                # white, which breaks template detection.
-                _REGION_ROW = {"NA": (960, 480), "EU": (960, 525), "APAC": (960, 568)}
-                logger.info("Custom: changing region to %s", region)
-                if not hover_click(215, 1045, delay=0.5):   # CHANGE REGION button (bottom-left)
-                    return None
-                if not wait_for_template_center("templates/region_popup_header.png", timeout=8, poll_interval=0.5):
-                    logger.error("Custom: region popup not detected")
-                    save_error_screenshot("region_popup_not_found")
-                    return None
-                # Move cursor away from the popup rows so the hover highlight
-                # doesn't interfere before we make our deliberate click.
-                pyautogui.moveTo(960, 700)
-                time.sleep(0.3)
-                row_x, row_y = _REGION_ROW[wanted]
-                # Click the row — popup closes automatically and region updates
-                if not click_until(row_x, row_y, "templates/play_screen_region.png", verify_timeout=6):
-                    logger.error("Custom: PLAY screen not detected after region selection")
-                    save_error_screenshot("play_screen_not_found_after_region")
-                    return None
+            last_region = self.bot.config.get("last_selected_region")
+            if last_region == wanted:
+                logger.info("Custom: cached region already %s — skipping PLAY screen region check", wanted)
             else:
-                logger.info("Custom: region already %s, no change needed", region)
+                logger.info("Custom: opening PLAY screen for region check (want %s, cached %s)", wanted, last_region)
+                if not hover_click(355, 258):   # orange PLAY button on main menu
+                    return None
+                if not wait_for_template_center("templates/play_screen_region.png", timeout=8, poll_interval=0.5):
+                    logger.error("Custom: PLAY screen not detected")
+                    save_error_screenshot("play_screen_not_found")
+                    return None
 
-            # Return to main menu from PLAY screen
-            logger.info("Custom: clicking BACK to return to main menu")
-            back_center = wait_for_template_center("templates/play_screen_back.png", timeout=5, poll_interval=0.5)
-            if not back_center:
-                back_center = (1840, 1044)
-            if not click_until(*back_center, "templates/play_button.png", verify_timeout=8):
-                logger.error("Custom: main menu not detected after BACK from PLAY screen")
-                save_error_screenshot("main_menu_not_found_after_play")
-                return None
+                screenshot = take_screenshot()
+                region_matches = {
+                    "NA": find_template(screenshot, "templates/region_na.png"),
+                    "EU": find_template(screenshot, "templates/region_eu.png"),
+                    "APAC": find_template(screenshot, "templates/region_apac.png"),
+                }
+                region_correct = bool(region_matches.get(wanted))
+                logger.info("Custom: current region — %s  wanted=%s  correct=%s",
+                            {k: bool(v) for k, v in region_matches.items()}, wanted, region_correct)
+
+                if not region_correct:
+                    # Open the region popup and select the right row.
+                    # Row positions are fixed — we use hardcoded coords rather than
+                    # template-matching because the game highlights the active row
+                    # white, which breaks template detection.
+                    _REGION_ROW = {"NA": (960, 480), "EU": (960, 525), "APAC": (960, 568)}
+                    logger.info("Custom: changing region to %s", region)
+                    if not hover_click(215, 1045, delay=0.5):   # CHANGE REGION button (bottom-left)
+                        return None
+                    if not wait_for_template_center("templates/region_popup_header.png", timeout=8, poll_interval=0.5):
+                        logger.error("Custom: region popup not detected")
+                        save_error_screenshot("region_popup_not_found")
+                        return None
+                    # Move cursor away from the popup rows so the hover highlight
+                    # doesn't interfere before we make our deliberate click.
+                    pyautogui.moveTo(960, 700)
+                    time.sleep(0.3)
+                    row_x, row_y = _REGION_ROW[wanted]
+                    # Click the row — popup closes automatically and region updates
+                    if not click_until(row_x, row_y, "templates/play_screen_region.png", verify_timeout=6):
+                        logger.error("Custom: PLAY screen not detected after region selection")
+                        save_error_screenshot("play_screen_not_found_after_region")
+                        return None
+                else:
+                    logger.info("Custom: region already %s, no change needed", region)
+
+                # Return to main menu from PLAY screen
+                logger.info("Custom: clicking BACK to return to main menu")
+                back_center = wait_for_template_center("templates/play_screen_back.png", timeout=5, poll_interval=0.5)
+                if not back_center:
+                    back_center = (1840, 1044)
+                if not click_until(*back_center, "templates/play_button.png", verify_timeout=8):
+                    logger.error("Custom: main menu not detected after BACK from PLAY screen")
+                    save_error_screenshot("main_menu_not_found_after_play")
+                    return None
+
+                self._persist_config_value("last_selected_region", wanted)
 
             # 1. Click CUSTOM button on main menu
             logger.info("Custom: clicking CUSTOM button")
@@ -1189,7 +1211,7 @@ class DirectorCog(commands.Cog):
 
             # 2. Wait for the match browser, then click CREATE NEW CUSTOM MATCH
             logger.info("Custom: waiting for match browser")
-            center = wait_for_template_center("templates/create_custom_match.png", timeout=10)
+            center = wait_for_template_center("templates/create_custom_match.png", timeout=10, poll_interval=0.5)
             if not center or stopped():
                 logger.error("Custom: match browser not detected")
                 save_error_screenshot("custom_browser_not_found")
@@ -1244,17 +1266,20 @@ class DirectorCog(commands.Cog):
 
             # 9. Wait for Director lobby with MATCH PASSWORD label
             logger.info("Custom: waiting for Director lobby")
-            center = wait_for_template_center("templates/lobby_password_label.png", timeout=80)
+            center = wait_for_template_center("templates/lobby_password_label.png", timeout=80, poll_interval=0.5)
             if not center or stopped():
                 logger.error("Custom: Director lobby not detected")
                 save_error_screenshot("lobby_not_found")
                 return None
 
-            # Wait for the lobby to fully settle — game can lag here and a clipboard
-            # copy attempted too early will return empty even if the icon is visible.
-            time.sleep(10.0)
-            if stopped():
-                return None
+            # Capture whatever's in the clipboard BEFORE clicking the copy icon —
+            # pyperclip.paste() just reads whatever the OS clipboard currently
+            # holds, with no idea whether OUR click actually landed yet, so a
+            # stale code left over from a previous lobby would otherwise read as
+            # a perfectly valid (but wrong) success. Comparing against this lets
+            # the poll below tell "still the old value" apart from "genuinely
+            # copied," regardless of what happened to be in the clipboard before.
+            previous_clipboard = pyperclip.paste().strip()
 
             # Clipboard icon is 316 px right and 9 px above the MATCH PASSWORD label center
             clipboard_x = center[0] + 316
@@ -1263,9 +1288,24 @@ class DirectorCog(commands.Cog):
             if not click(clipboard_x, clipboard_y, delay=0.5):
                 return None
 
-            code = pyperclip.paste().strip()
+            # Poll for the clipboard to actually change, rather than a flat sleep
+            # before reading it once — the lobby can lag before the copy button
+            # is really live, so a fixed wait either pays for the worst case every
+            # time or risks reading the icon's press-state too early. Polling
+            # resolves as soon as the copy genuinely lands.
+            code = ""
+            deadline = time.monotonic() + _CLIPBOARD_POLL_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                if stopped():
+                    return None
+                current = pyperclip.paste().strip()
+                if current and current != previous_clipboard:
+                    code = current
+                    break
+                time.sleep(_CLIPBOARD_POLL_INTERVAL_SECONDS)
+
             if not code:
-                logger.error("Custom: clipboard empty after copy button")
+                logger.error("Custom: clipboard never changed after copy button (still %r)", previous_clipboard)
                 save_error_screenshot("empty_lobby_code")
                 return None
 
