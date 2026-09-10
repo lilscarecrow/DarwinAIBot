@@ -94,9 +94,9 @@ exactly one of the lobby's players. The reply carries:
 exposes `snap_names(reads)` — `game/name_snap.py` folds the player-bar OCR the
 way the ladder does and replaces a read with the canonical name when exactly
 one player matches (a stream tag glued to a handle, "F0 ayitbunny", is handled;
-anything ambiguous stays verbatim). `MatchRunner` snaps at both player-bar
-inits (V1 and V2), so `match_start.slots`, eliminations and the match-start
-roster push all carry ladder names. `DraftLifecycle.claim_nudge()` turns
+anything ambiguous stays verbatim). `MatchRunner` snaps at player-bar init, so
+`match_start.slots`, eliminations and the match-start roster push all carry
+ladder names. `DraftLifecycle.claim_nudge()` turns
 `unlinked` into `{mentions, text}`; `/custom` adds a "Not on the ladder yet"
 field with it to the "Custom Match Ready" embed, which is posted to the
 lobby-ping channel (that is what the players read), with the unlinked members
@@ -213,9 +213,9 @@ draft is open; a queue over 1000 drops the newest.
 | `match_start` | after the lobby nameplates are read    | `elapsed_ms: 0`   | `slots`: name or null per slot          |
 | `first_blood` | first alive→dead flip (once per game)  | `slot`, `player`  | `notification`: OCR'd kill text or null |
 | `eliminated`  | every alive→dead flip, all match       | `slot`, `player`  | `alive`: players still alive after it   |
-| `detector_v2` | at match start when `player_bar_detector` is `shadow` or `v2` | `elapsed_ms: 0` | `drive`, `n`, `alive`, `xs`, `names` — what the V2 card detector saw (docs/PLAYER_BAR_CALIBRATION.md) |
-| `eliminated_v2` | shadow mode only: every flip V2 saw   | `slot`, `player`  | `alive` — compare with `eliminated` (V1) and the HUD counter |
-| `slot_map`    | right at match start (B press / auto-start), always, regardless of `player_bar_detector` | `elapsed_ms: 0` | `n`, `slots` (each card's `/pov` digit, derived from position — no OCR, see docs/PLAYER_BAR_CALIBRATION.md §8), `names`, `xs`, `badge_ocr` (untrusted cross-check), `linked` (per-slot bool: name resolved to a known ladder lobby player vs. is raw OCR standing in for an unlinked one), `captured` (bool: every one of the `n` cards got a usable name, an N/N read — see `MatchRunner.is_lobby_captured()`) — `MatchRunner._log_slot_map_snapshot()`, still diagnostic-only as of 2026-09-09 |
+| `slot_map`    | right at match start (B press / auto-start), always | `elapsed_ms: 0` | `n`, `slots` (each card's `/pov` digit, derived from position — no OCR, see docs/PLAYER_BAR_CALIBRATION.md §8), `names`, `xs`, `badge_ocr` (untrusted cross-check), `linked` (per-slot bool: name resolved to a known ladder lobby player vs. is raw OCR standing in for an unlinked one), `captured` (bool: every one of the `n` cards got a usable name, an N/N read — see `MatchRunner.is_lobby_captured()`) — `MatchRunner._log_slot_map_snapshot()`, still diagnostic-only as of 2026-09-09 |
+| `feed_first_blood` | whenever the "X DREW FIRST BLOOD FROM Y" damage-feed line is OCR'd — polled all match on a background thread, not just once | — | `killer_raw`/`victim_raw` (raw OCR names), `killer_slot`/`victim_slot` (resolved 0-based card index as a string, same numbering as `eliminated`'s `slot` field — NOT the `/pov` digit — or `null` if unresolved/ambiguous), `text` (the matched feed line) — `MatchRunner._poll_damage_feed()`/`_FEED_PATTERNS` (2026-09-10, add more keyword patterns there); distinct from `first_blood` above, which only knows WHO died, not who got the kill. A confirmed `killer_slot` also queues the "Give Wood" reward (`_maybe_queue_first_blood_reward`/`_maybe_fire_first_blood_reward`, see CLAUDE.md's Match Runner section) — when it fires, it's a normal `card_play` event (`card: "give_wood"`) like any scheduled card, just outside the profile's own schedule |
+| `feed_kill`   | every "X KILLED Y BY Z" damage-feed line, all match — same background poll as `feed_first_blood` | — | `killer_raw`/`victim_raw`/`killer_slot`/`victim_slot` (same shape as `feed_first_blood` above), `method` (the kill method — axe, arrow, cold, etc. — omitted if the line had no "BY Z" clause), `text` — same `_FEED_PATTERNS` mechanism (2026-09-10), no reward/action logic, purely for the live feed. A `deque(maxlen=50)` of already-emitted `(kind, line)` pairs (`MatchRunner._recent_feed_matches`) skips re-emitting the identical line if it's still on screen on a later poll — this one recurs many times a match, unlike first blood |
 | `match_end`   | placement badge detected               | `elapsed_ms`      | —                                       |
 | `card_play`   | the director fires a card              | —                 | `card`: card_type, `name`: event name   |
 | `say`         | `/say` megaphone                       | —                 | `text`, `by` (Discord display name)     |

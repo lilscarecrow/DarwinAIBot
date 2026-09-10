@@ -1,14 +1,16 @@
 """
-player_cards_v2.py — geometry-based player-card detection (V2).
+player_cards_v2.py — geometry-based player-card detection.
 
-Why a second detector: the V1 scan in screen_detection.detect_player_slot_xs
-looks for dark separator columns inside a fixed player_bar_region. On real
-frames (measured on 1920x1080 VOD frames, 2026-09-06) that finds 20-60
-"separators" — the translucent HUD lets the game world through, and the
-strip is not a fixed box anyway: it is CENTRED on the screen and its width
+This is the bot's only player-bar detector (game/match_runner.py calls
+detect_cards/ocr_names/cards_alive directly — no per-machine calibration
+needed). An earlier separator-scan detector (screen_detection.py, looking
+for dark columns inside a fixed player_bar_region config box) was removed
+2026-09-09: on real frames it found 20-60 "separators" instead of the real
+card boundaries — the translucent HUD lets the game world through, and the
+strip is not a fixed box anyway — it is CENTRED on the screen and its width
 follows the player count (9, 10, 11 cards at a constant ~131.6px pitch).
 
-V2 uses that geometry. For a candidate count n the card centres are
+This detector uses that geometry instead. For a candidate count n the card centres are
     x_i = center_x + (i - (n-1)/2) * pitch
 and each candidate is tested for the one thing every card has: a name band.
     alive  → a solid, saturated, bright colour band (V≈186, S≈255 on every
@@ -19,11 +21,12 @@ The spectated player's card is drawn enlarged with its band lower, so the
 band is searched over a range of rows, not one. The n whose positions ALL
 read as cards wins (largest such n; an expected count from the lobby breaks
 ties). The always-present "glitch" card sits LEFT of the centred block and
-is never a candidate.
-
-Select with config `player_bar_detector`: "v1" (default, unchanged
-behaviour), "v2" (this drives the bot), or "shadow" (v1 drives, v2 reports
-what it would have said as live events / log lines for an A/B on the ladder).
+is never a candidate — confirmed live 2026-09-09 that this can be a full
+duplicate of a real player's card (name, health bar, everything), not just
+the blank/no-name form this comment used to describe. Either way it lands
+exactly one pitch-width left of position(n, cfg)[0], which detect_cards()
+never samples, so it was never actually corrupting a real read — no dedup
+logic needed. See docs/PLAYER_BAR_CALIBRATION.md §8 for the investigation.
 """
 from __future__ import annotations
 
@@ -95,6 +98,16 @@ def slot_number_for_index(index: int) -> str:
     secondary cross-check in the diagnostic log, not as anything trusted.
     """
     return "0" if index == 9 else str(index + 1)
+
+
+def index_for_slot_number(key: str) -> int:
+    """Inverse of slot_number_for_index() — a /pov hotkey digit (1-9, 0,
+    e.g. from a viewer's channel-points redemption text) -> the card's
+    left-to-right index. "0" maps to index 9 (the 10th slot), matching
+    /pov's own key mapping. Caller's responsibility to validate `key` is
+    one of "1".."9","0" first (e.g. via bot/twitch_bot.py's
+    _extract_pov_key) — this does not itself guard against a bad key."""
+    return 9 if key == "0" else int(key) - 1
 
 
 def positions(n: int, cfg: dict) -> list[int]:
@@ -233,7 +246,17 @@ def ocr_prepare(crop: np.ndarray, scale: int = 4, pad: int = 20) -> np.ndarray:
 
 def ocr_names(img: np.ndarray, cards: list[Card], cfg: Optional[dict] = None) -> list[str]:
     """Best-effort names via the same tesseract path V1 uses; [] if OCR is
-    unavailable. See ocr_prepare for the preprocessing."""
+    unavailable. See ocr_prepare for the preprocessing.
+
+    Falls back to `--psm 8` (single word) when `--psm 7` (single line) reads
+    nothing — found live 2026-09-09: a short single-word name (e.g. "M",
+    "Guts") sits in a lot of blank padding inside the fixed-width crop, and
+    psm 7's line-segmentation sometimes discards that as noise instead of
+    text, returning "" even though the band itself is perfectly legible
+    (confirmed: psm 8 reads the exact same crop correctly). Longer names
+    already read fine under psm 7 and are left alone — the fallback only
+    fires on an empty result, so it can only ever recover a miss, never
+    override a real read."""
     try:
         from game.ocr import _ocr_region_img
     except Exception:
@@ -244,10 +267,17 @@ def ocr_names(img: np.ndarray, cards: list[Card], cfg: Optional[dict] = None) ->
         if crop.size == 0:
             names.append("")
             continue
+        prepped = ocr_prepare(crop)
         try:
-            names.append(_ocr_region_img(ocr_prepare(crop), config="--psm 7").strip())
+            text = _ocr_region_img(prepped, config="--psm 7").strip()
         except Exception:
-            names.append("")
+            text = ""
+        if not text:
+            try:
+                text = _ocr_region_img(prepped, config="--psm 8").strip()
+            except Exception:
+                text = ""
+        names.append(text)
     return names
 
 

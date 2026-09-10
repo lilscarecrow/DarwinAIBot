@@ -1,6 +1,8 @@
 import logging
+import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -52,6 +54,60 @@ _DIRECTOR_POINTS_REGION = (808, 1002, 20, 24)
 # (still a real config toggle) is false, kept for if pip reading is ever revisited.
 # Moved out of config.json (2026-09-07).
 _DIRECTOR_POINTS_PIPS = {"x_start": 862, "y": 1012, "spacing": 26, "count": 10}
+
+# Damage/kill feed text patterns (2026-09-10) — each entry is (event_kind,
+# compiled regex), checked against one physical feed line at a time (see
+# _poll_damage_feed_worker). Add more entries here for future keyword
+# matches — no other code changes needed. Named groups "killer"/"victim"
+# (if present) are resolved against the match-start roster via
+# game.name_snap.find_winning_slot() before the event is emitted; a pattern
+# with no such groups still emits, just without a *_slot field. A "method"
+# group (feed_kill below) is captured too if present, as plain text — no
+# name resolution attempted on it, it's not a player. Every match still just
+# emits its event_kind — feed_first_blood is the one exception, additionally
+# queuing the first-blood reward (see _maybe_queue_first_blood_reward in
+# _poll_damage_feed_worker, and _maybe_fire_first_blood_reward in the main
+# loop) once its killer resolves confidently.
+_FEED_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("feed_first_blood", re.compile(r"(?P<killer>.+?)\s+DREW FIRST BLOOD FROM\s+(?P<victim>.+)", re.IGNORECASE)),
+    # "X KILLED Y BY Z" (2026-09-10) — every kill, not just the first. The
+    # trailing "BY <method>" is optional (a non-capturing group with method
+    # inside it) so a line that's missing it — a genuinely method-less kill,
+    # or OCR clipping the tail — still matches with method=None rather than
+    # not matching at all.
+    ("feed_kill", re.compile(r"(?P<killer>.+?)\s+KILLED\s+(?P<victim>.+?)(?:\s+BY\s+(?P<method>.+))?$", re.IGNORECASE)),
+]
+
+# How many recent (kind, matched-line) pairs _poll_damage_feed_worker
+# remembers, to avoid re-emitting the same feed line as a duplicate event if
+# it's still on screen on a later poll (2026-09-10) — first blood's own
+# emission never needed this (a permanent one-shot queue flag already
+# prevented acting on it twice), but feed_kill has no such flag: kills
+# happen repeatedly all match, and the feed can plausibly still show the
+# same line on two consecutive polls. A plain bounded deque (membership
+# check is O(n), n capped here) rather than a set, since a set would grow
+# unbounded over a long match; a match realistically has at most a few
+# dozen kills, so 50 is comfortably more than enough lookback.
+_RECENT_FEED_MATCHES_MAXLEN = 50
+
+# Bonus-card reward timing buffer (2026-09-10) — shared by every "queued
+# bonus card" flow (first-blood's give_wood, Crowd Favorite's
+# favorite_player): each one's own drag (~1-2s, same as any tray card play)
+# must never be started this close to a real scheduled card's own trigger
+# time, so the two never overlap. See _maybe_fire_first_blood_reward() and
+# _maybe_fire_favorite_reward().
+_BONUS_CARD_TIMING_BUFFER_SECONDS = 5
+
+# How long _give_reward_card() waits after switching POV before dropping the
+# reward card (2026-09-10, found in review — not verified against the live
+# game). "Give X to player" cards target whoever is currently spectated at
+# drop time; with verify_card_plays: false (this repo's own current
+# setting) there was otherwise no delay at all between the POV keypress and
+# the drag starting, resting entirely on the unverified assumption that
+# Darwin Project's client applies a spectate-target switch instantly. This
+# is a defensive margin, not a measured value — tighten or drop it if a
+# live match confirms the switch is already effectively instant.
+_POV_SWITCH_SETTLE_SECONDS = 0.3
 
 # Zone map sample points and per-zone drop coordinates for the legacy per-zone
 # selection path (_attempt_zone_close_legacy() / _attempt_zone_close_bypass() /
@@ -116,15 +172,14 @@ class MatchRunner:
         # that talks to the darwinstalker ladder. None = ingest not wired.
         self._ds = draft_lifecycle
         self._session = session
-        # Locked here, at construction, so it's engaged from the moment a match
-        # is about to run regardless of which call site created this runner
-        # (/start, the auto-start watcher) — unlocked in run() right after the
-        # forced default-POV-1 press. See SessionState._pov_locked's docstring
-        # for why: a manual POV switch during this narrow startup window would
-        # enlarge a different card's band and corrupt the slot-map OCR
-        # snapshot taken in that same window. If this runner never reaches
-        # that press (aborted early), _reset_session()'s session.reset() is
-        # the safety net that clears it so POV can never stay stuck locked.
+        # Also (re-)locked here, at construction — belt and suspenders on top of
+        # DirectorCog.custom() already locking it the moment the lobby was
+        # created (see SessionState._pov_locked's docstring for the full
+        # lifecycle and why locking only here was found live to be too late).
+        # Unlocked in run() right after the forced default-POV-1 press. If this
+        # runner never reaches that press (aborted early), _reset_session()'s
+        # session.reset() is the safety net that clears it so POV can never
+        # stay stuck locked.
         self._session.lock_pov()
         self._on_action_update = on_action_update
         self._stop = threading.Event()
@@ -138,6 +193,16 @@ class MatchRunner:
         # still plays every card for real, it just trusts the play worked instead of
         # verifying it with a before/after pixel check.
         self._verify_plays = config.get("verify_card_plays", True)
+        # Master toggle for the bonus-card reward system (first blood's
+        # give_wood, Crowd Favorite's favorite_player — 2026-09-10), default
+        # on. Deliberately does NOT gate the underlying feed_first_blood/
+        # feed_kill event logging to the ladder (_poll_damage_feed) — that's
+        # informational data with no gameplay side effect, not a card, so it
+        # stays on regardless. Gated at the two "queue" entry points
+        # (_maybe_queue_first_blood_reward, try_queue_favorite_reward)
+        # rather than the "maybe fire" methods too — if nothing's ever
+        # queued, those are already no-ops by construction.
+        self._advanced_cards_enabled = bool(config.get("advanced_cards", True))
         # Anti-cheat minimap cover — see _fire_card_event's sibling logic in run() for the
         # show, and the main loop below for the timed hide. One-shot flag so the hide
         # only fires once per match even though the loop polls elapsed time repeatedly.
@@ -156,12 +221,40 @@ class MatchRunner:
         self._player_names: list[str] = []
         self._player_alive: list[bool] = []
         self._first_blood_logged: bool = False
-        # V2 card detector state (game/player_cards_v2.py). In "v2" mode these
-        # feed _player_slot_xs / _player_alive; in "shadow" mode they run
-        # alongside V1 and only report (detector_v2 / eliminated_v2 events).
-        self._v2_xs: list[int] = []
-        self._v2_alive: list[bool] = []
-        self._v2_names: list[str] = []
+        # See _poll_damage_feed() — True while a background thread is
+        # already OCRing the damage feed, so the main loop skips starting a
+        # second one on top of it rather than letting them stack up.
+        self._feed_poll_busy: bool = False
+        # (kind, matched-line) pairs already emitted this match — see
+        # _RECENT_FEED_MATCHES_MAXLEN's own comment. Only ever touched from
+        # the feed-poll's own background thread (one at a time, per
+        # self._feed_poll_busy above), so no lock needed despite being a
+        # mutable container.
+        self._recent_feed_matches: deque = deque(maxlen=_RECENT_FEED_MATCHES_MAXLEN)
+        # First-blood reward (give_wood, 2026-09-10) — set from the feed-poll
+        # thread once a killer resolves confidently (_maybe_queue_first_blood_reward),
+        # consumed by the main loop (_maybe_fire_first_blood_reward). Plain
+        # attribute assignment, no lock, same cross-thread-flag convention as
+        # this class's other such flags (_lobby_captured, _slot_map_ready, etc.).
+        self._first_blood_reward_slot: Optional[int] = None
+        # True once the reward has been given, canceled, or otherwise settled
+        # (deck lacks the card, etc.) — there is only one first blood per
+        # match, so once this is set nothing acts on a first-blood reward
+        # again even if a later poll re-detects the same feed line.
+        self._first_blood_reward_resolved: bool = False
+        # Crowd Favorite channel-points reward (2026-09-10) — set by
+        # try_queue_favorite_reward(), called from the Twitch bot's event
+        # loop thread (bot/twitch_bot.py, a different thread from this
+        # class's own match thread — plain attribute mutation, no lock, same
+        # cross-thread convention as the first-blood reward state above).
+        # Only one redemption is ever allowed pending at a time by design —
+        # unlike first blood (a true one-time event), a viewer could redeem
+        # this repeatedly across a match as long as favorite_player copies
+        # remain in the deck, but a second redemption while one is already
+        # queued is rejected (refunded) rather than queued behind it. None
+        # when nothing is pending; the main loop's own
+        # _maybe_fire_favorite_reward() is what actually consumes this.
+        self._favorite_reward_target: Optional[int] = None
         # Set by _log_slot_map_snapshot() (2026-09-09) once every card it detected got
         # a usable (non-empty) name — "10/10", "9/9", never a partial read. Written from
         # that method's background thread (see _fire_slot_map_snapshot()); simple
@@ -171,6 +264,11 @@ class MatchRunner:
         # whenever the capture was partial, so there's nothing to accidentally trust.
         self._lobby_captured: bool = False
         self._slot_map: dict[str, str] = {}  # {"/pov" digit: name}, only meaningful once captured
+        # Set (regardless of outcome) when _log_slot_map_snapshot() finishes — lets an
+        # async waiter (e.g. a "should we open a prediction" check) block on the
+        # snapshot completing instead of guessing at timing, without caring whether it
+        # actually succeeded (check is_lobby_captured() for that after the wait).
+        self._slot_map_ready = threading.Event()
         # monotonic clock at match start; every live event carries elapsed_ms from it
         self._match_started_at: Optional[float] = None
         # Latest confirmed director-points reading — see _update_points_reading().
@@ -207,19 +305,24 @@ class MatchRunner:
         if self._stop.is_set():
             return "Match aborted before start."
 
-        # Capture player roster from lobby nameplates before the match countdown begins.
-        # The bar layout is identical in the lobby and in-match; this is the most stable
-        # moment to read names and establish slot order.
-        self._init_player_bar()
-
-        # Push the OCR'd roster onto the ladder draft opened at /custom (or open
-        # one now if none is). Empty OCR is logged, never silently skipped.
-        # Fire-and-forget (see on_match_start_async's docstring) — this used to
-        # be a plain awaited call and its network round-trip delayed the B-press
-        # below on every match (found live 2026-09-07).
-        if self._ds is not None:
-            self._ds.on_match_start_async(self._player_names)
-            self._ds.event("match_start", elapsed_ms=0, slots=[n or None for n in self._player_names])
+        # Capture player roster from lobby nameplates before the match countdown
+        # begins, and push it to the ladder once read. Fire-and-forget
+        # (2026-09-10 fix, found in review) — _init_player_bar() alone can do
+        # up to one tesseract call per card (game/player_cards_v2.py::ocr_names,
+        # each individually timeout-guarded up to 10s in game/ocr.py), which
+        # was blocking the B-press below on every match, the exact same class
+        # of bug already found live and fixed for the ladder roster push
+        # (on_match_start_async, 2026-09-07) and the slot-map snapshot
+        # (_fire_slot_map_snapshot, 2026-09-09) — just never applied here too.
+        # _fire_player_bar_init() spawns a daemon thread that does the
+        # detection, OCR, and both of those pushes together, and returns
+        # immediately. self._player_slot_xs/_player_names/_player_alive stay
+        # at their empty defaults until that thread finishes; _poll_player_bar()
+        # already no-ops gracefully on an empty _player_slot_xs (same "not
+        # ready yet" tolerance _log_slot_map_snapshot's own async state uses),
+        # so a match's first poll or two simply detects nothing rather than
+        # blocking anything waiting for it.
+        self._fire_player_bar_init()
 
         from game import tts
 
@@ -320,9 +423,16 @@ class MatchRunner:
 
                 # Poll the player bar all match: first blood once, and every
                 # elimination as a live event for the ladder's LIVE card.
-                if self._player_slot_xs or self._v2_xs:
+                # Fast (pixel/color sampling, no OCR) — safe to run inline.
+                if self._player_slot_xs:
                     from game.screen_detection import take_screenshot as _take_ss
                     self._poll_player_bar(_take_ss())
+
+                # Damage/kill feed OCR — fire-and-forget on its own thread
+                # (see _poll_damage_feed), so a slow tesseract call can never
+                # delay a scheduled card play. No-ops until _init_player_bar()
+                # has populated a roster to resolve names against.
+                self._poll_damage_feed()
 
                 # Continuously sample director points throughout the match, not just
                 # reactively when a card is about to fire — a small, steady cost (one
@@ -338,6 +448,29 @@ class MatchRunner:
                     sample = self._read_points(_take_ss2())
                     self._update_points_reading(sample, "background poll")
                     self._last_points_sample_time = now_ts
+
+                # First-blood reward (give_wood) — see _maybe_fire_first_blood_reward
+                # for the full "safe to fire" checklist. Cheap no-op most
+                # iterations (nothing queued, or one of the conditions isn't
+                # met yet); when it does fire, it blocks for the card's own
+                # drag exactly like a real scheduled card play already does,
+                # which is why it's checked after the points sample above —
+                # freshest possible confirmed value for this iteration.
+                self._maybe_fire_first_blood_reward(elapsed, card_schedule)
+
+                # Crowd Favorite channel-points reward — see
+                # _maybe_fire_favorite_reward for its own "safe to fire"
+                # checklist (same shape as first blood's above, minus the
+                # points check since favorite_player costs 0). elapsed is
+                # recomputed here (2026-09-10 fix, found in review) rather
+                # than reusing the value from the top of this iteration —
+                # if first blood's reward just fired above, it blocked for
+                # its own ~1-2s drag, and checking this reward's "no
+                # scheduled card due within the buffer" against the
+                # now-stale pre-drag elapsed would understate how close a
+                # real card actually is by however long that drag took.
+                elapsed = time.monotonic() - start_time
+                self._maybe_fire_favorite_reward(elapsed, card_schedule)
 
                 # Sleep until the next card trigger, but no longer than poll_interval
                 now = time.monotonic()
@@ -368,41 +501,73 @@ class MatchRunner:
     # Player bar
     # ------------------------------------------------------------------
 
+    def _fire_player_bar_init(self) -> None:
+        """Fire-and-forget wrapper — see the call site in run() for why.
+        Spawns a daemon thread running _init_player_bar_and_push() and
+        returns immediately."""
+        threading.Thread(
+            target=self._init_player_bar_and_push, daemon=True, name="PlayerBarInit",
+        ).start()
+
+    def _init_player_bar_and_push(self) -> None:
+        """Runs on its own thread — see _fire_player_bar_init(). Detects the
+        roster (_init_player_bar()) then pushes it to the ladder, in that
+        order, since the push needs the names _init_player_bar() just read.
+        Wrapped in try/except: a failure here must never take down the match
+        thread that spawned it."""
+        try:
+            self._init_player_bar()
+            if self._ds is not None:
+                self._ds.on_match_start_async(self._player_names)
+                self._ds.event("match_start", elapsed_ms=0, slots=[n or None for n in self._player_names])
+        except Exception as e:
+            logger.warning("Player bar init/roster push failed: %s", e)
+
     def _init_player_bar(self):
         """
-        Snapshot the player bar from the lobby screen before the match starts.
-        Detects slot count, x-positions, and OCRs player names in slot order.
-        Called once; results are reused for first-blood tracking during the match.
+        Snapshot the player bar from the lobby screen before the match starts,
+        via the V2 geometry detector (game/player_cards_v2.py — no per-machine
+        calibration needed, proven on real VOD/match frames). Detects slot
+        count, x-positions, and OCRs player names in slot order. Called once;
+        results are reused for first-blood/elimination tracking during the
+        match.
         """
-        from game.screen_detection import take_screenshot, detect_player_slot_xs
-        from game.ocr import ocr_player_names
+        from game.screen_detection import take_screenshot
+        from game import player_cards_v2 as v2
 
         screenshot = take_screenshot()
-        mode = self._detector_mode()
-        if mode != "v1":
-            self._init_player_bar_v2(screenshot, drive=(mode == "v2"))
-            if mode == "v2":
-                return
-        self._player_slot_xs = detect_player_slot_xs(screenshot, self._config)
-        if not self._player_slot_xs:
+        expected = None
+        if self._ds is not None:
+            try:
+                expected = self._ds.roster_size or None
+            except Exception:
+                expected = None
+        try:
+            cards = v2.detect_cards(screenshot, self._config, expected=expected)
+        except Exception as e:
+            logger.warning("Player bar: detection failed: %s", e)
+            cards = []
+        if not cards:
             logger.warning(
-                "Player bar snapshot: no slots detected — player tracking disabled. "
-                "Set player_count in config if auto-detect fails."
+                "Player bar snapshot: no cards detected — player tracking disabled."
             )
             return
 
-        self._player_names = self._snap_names(
-            ocr_player_names(screenshot, self._player_slot_xs, self._config)
-        )
-        self._player_alive = [True] * len(self._player_slot_xs)
+        try:
+            names = v2.ocr_names(screenshot, cards, self._config)
+        except Exception as e:
+            logger.debug("Player bar: name OCR failed: %s", e)
+            names = []
+        if len(names) != len(cards):
+            names = ["" for _ in cards]
+
+        self._player_slot_xs = [c.x for c in cards]
+        self._player_names = self._snap_names(names)
+        self._player_alive = [c.alive for c in cards]
 
         logger.info("Player bar snapshot — %d players:", len(self._player_slot_xs))
         for i, (name, x) in enumerate(zip(self._player_names, self._player_slot_xs)):
             logger.info("  slot %d  x=%-4d  %s", i + 1, x, name or "(unread)")
-
-    # ------------------------------------------------------------------
-    # V2 card detector (config player_bar_detector: "v1" | "v2" | "shadow")
-    # ------------------------------------------------------------------
 
     def _snap_names(self, names: list[str]) -> list[str]:
         """Nameplate OCR → the ladder's canonical names for this lobby, where
@@ -419,10 +584,6 @@ class MatchRunner:
             if before != after:
                 logger.info("  nameplate %r snapped to ladder name %r", before, after)
         return snapped
-
-    def _detector_mode(self) -> str:
-        mode = str(self._config.get("player_bar_detector", "v1")).strip().lower()
-        return mode if mode in ("v1", "v2", "shadow") else "v1"
 
     def _fire_slot_map_snapshot(self) -> None:
         """Fire-and-forget wrapper (2026-09-09 fix, found live) — the actual
@@ -558,6 +719,11 @@ class MatchRunner:
             )
         except Exception as e:
             logger.warning("Slot map snapshot failed: %s", e)
+        finally:
+            # Set regardless of outcome (success, early "no cards detected"
+            # return, or exception) — a waiter only cares that the attempt is
+            # over, not whether it succeeded; check is_lobby_captured() for that.
+            self._slot_map_ready.set()
 
     def is_lobby_captured(self) -> bool:
         """True once _log_slot_map_snapshot() resolved a usable name for every
@@ -571,93 +737,19 @@ class MatchRunner:
         """{"/pov" digit: name}, populated only once is_lobby_captured() is True."""
         return dict(self._slot_map)
 
-    def _init_player_bar_v2(self, screenshot, drive: bool) -> None:
-        """Run the geometry detector on the lobby snapshot. drive=True makes it
-        the source of slots/names/alive for this match; drive=False (shadow)
-        records what it saw for an A/B against V1 without touching the match."""
-        from game import player_cards_v2 as v2
-        expected = None
-        if self._ds is not None:
-            try:
-                expected = self._ds.roster_size or None
-            except Exception:
-                expected = None
-        try:
-            cards = v2.detect_cards(screenshot, self._config, expected=expected)
-        except Exception as e:
-            logger.warning("Player bar v2: detection failed: %s", e)
-            cards = []
-        names: list[str] = []
-        if cards:
-            try:
-                names = v2.ocr_names(screenshot, cards, self._config)
-            except Exception as e:
-                logger.debug("Player bar v2: name OCR failed: %s", e)
-                names = []
-        if len(names) != len(cards):
-            names = ["" for _ in cards]
-        self._v2_xs = [c.x for c in cards]
-        self._v2_alive = [c.alive for c in cards]
-        names = self._snap_names(names)
-        self._v2_names = names
-        n_alive = sum(1 for c in cards if c.alive)
-        logger.info("Player bar v2 (%s): %d cards, %d alive", "driving" if drive else "shadow", len(cards), n_alive)
-        for c in cards:
-            logger.info("  v2 slot %d  x=%-4d  %s  %s", c.index + 1, c.x, "alive" if c.alive else "DEAD", names[c.index] or "(unread)")
-        self._emit("detector_v2", elapsed_ms=0, drive=drive, n=len(cards), alive=n_alive,
-                   xs=self._v2_xs, names=[nm or None for nm in names])
-        if not drive:
-            return
-        if not cards:
-            logger.warning("Player bar v2: no cards detected — player tracking disabled for this match")
-            return
-        self._player_slot_xs = list(self._v2_xs)
-        self._player_names = list(names)
-        self._player_alive = list(self._v2_alive)
-        logger.info("Player bar snapshot (v2) — %d players:", len(self._player_slot_xs))
-        for i, (name, x) in enumerate(zip(self._player_names, self._player_slot_xs)):
-            logger.info("  slot %d  x=%-4d  %s", i + 1, x, name or "(unread)")
-
-    def _poll_player_bar_v2_shadow(self, screenshot) -> None:
-        """Shadow mode: re-read alive/dead at V2's card columns and emit
-        eliminated_v2 for every flip, so the ladder's event stream shows what
-        V2 would have reported next to what V1 did."""
-        if not self._v2_xs:
-            return
-        from game import player_cards_v2 as v2
-        try:
-            new = v2.cards_alive(screenshot, self._v2_xs, self._config)
-        except Exception as e:
-            logger.debug("Player bar v2 shadow poll failed: %s", e)
-            return
-        alive_after = sum(1 for a in new if a)
-        for i, (was, now) in enumerate(zip(self._v2_alive, new)):
-            if was and not now:
-                name = self._v2_names[i] if i < len(self._v2_names) and self._v2_names[i] else f"slot {i + 1}"
-                self._emit("eliminated_v2", slot=i, player=name, alive=alive_after)
-        self._v2_alive = new
-
     def _poll_player_bar(self, screenshot):
         """
         Check alive/eliminated status for each player slot.
-        On the first death (first blood), logs the victim and attempts to OCR
-        the kill notification text to identify the killer.
+        On the first death (first blood), logs the victim. Who got the kill
+        is NOT looked up here (see _poll_damage_feed's feed_first_blood event
+        for that) — this method does no OCR at all, just a color/pixel check
+        on the screenshot it's given.
         """
-        mode = self._detector_mode()
-        if mode == "shadow":
-            self._poll_player_bar_v2_shadow(screenshot)
         if not self._player_slot_xs:
             return
 
-        if mode == "v2":
-            from game import player_cards_v2 as v2
-            new_alive = v2.cards_alive(screenshot, self._player_slot_xs, self._config)
-        else:
-            from game.screen_detection import sample_player_alive
-            new_alive = [
-                sample_player_alive(screenshot, x, self._config)
-                for x in self._player_slot_xs
-            ]
+        from game import player_cards_v2 as v2
+        new_alive = v2.cards_alive(screenshot, self._player_slot_xs, self._config)
 
         prev_dead = sum(1 for a in self._player_alive if not a)
         curr_dead = sum(1 for a in new_alive if not a)
@@ -672,9 +764,15 @@ class MatchRunner:
                 if self._player_names and newly_dead
                 else f"slot {newly_dead[0] if newly_dead else '?'}"
             )
-            from game.screen_detection import take_screenshot as _take_ss
-            from game.ocr import ocr_kill_notification
-            notif = ocr_kill_notification(_take_ss(), self._config)
+            # notif used to come from an inline ocr_kill_notification() call
+            # here — removed 2026-09-10 along with that function entirely
+            # (game/ocr.py): it was a synchronous OCR call sitting inline in
+            # the match loop, gated on a config key never calibrated on any
+            # machine, and _poll_damage_feed's feed_first_blood event already
+            # covers "who got the kill" better (multi-line, resolved against
+            # the roster, off the match thread). Kept as None here so the
+            # first_blood event's shape doesn't change.
+            notif = None
             logger.info(
                 "FIRST BLOOD — victim: %s | kill notification: %r",
                 victim_name, notif,
@@ -691,6 +789,337 @@ class MatchRunner:
             self._emit("eliminated", slot=i, player=self._slot_name(i), alive=alive_after)
 
         self._player_alive = new_alive
+
+    def _poll_damage_feed(self) -> None:
+        """Fire-and-forget (2026-09-10 fix, found in review before it shipped
+        live): OCR is tesseract-backed, and game/ocr.py's own timeout guard
+        (_OCR_TIMEOUT_SECONDS = 10) admits a single call can occasionally take
+        real time — running that inline in the main loop, like the first cut
+        of this feature did, would delay a scheduled card play by however
+        long that call took, since the loop's next card-fire check only
+        happens after whatever synchronous work the current iteration is
+        doing finishes. Spawns a daemon thread that takes its own screenshot
+        and does the OCR/matching independently — same pattern as
+        _fire_slot_map_snapshot() for the same reason. self._feed_poll_busy
+        (plain bool, no lock — same cross-thread-flag convention as
+        self._lobby_captured etc.) skips starting a new poll while one is
+        still in flight rather than letting them stack up; at the normal
+        screen_poll_interval_seconds cadence there should only ever be zero
+        or one in flight.
+
+        No-ops if _init_player_bar() hasn't populated a roster yet — nothing
+        to resolve names against.
+        """
+        if self._feed_poll_busy or not self._player_names:
+            return
+        self._feed_poll_busy = True
+        threading.Thread(
+            target=self._poll_damage_feed_worker, daemon=True, name="DamageFeedPoll",
+        ).start()
+
+    def _poll_damage_feed_worker(self) -> None:
+        """Runs on its own thread — see _poll_damage_feed(). Checks the
+        OCR'd feed text against _FEED_PATTERNS (currently "X DREW FIRST
+        BLOOD FROM Y" and "X KILLED Y BY Z" — add more entries there for
+        future keyword matches, each one gets checked the same way with no
+        other code changes needed). Matched **per physical line**, not the
+        whole block flattened to one string — the feed stacks several
+        unrelated lines (other kills, zone events) in this crop, and
+        flattening first would let an adjacent line's words bleed into a
+        pattern's captured groups. Runs for the whole match, every poll —
+        earlier drafts stopped after the first match found (there's only
+        one first blood), but most patterns (kills, in particular) are
+        expected to recur, so nothing here assumes "only fires once";
+        self._recent_feed_matches instead skips re-emitting the exact same
+        (kind, line) if it's still on screen on a later poll, and the
+        busy-flag above bounds how much work is in flight at a time, not
+        how many times a pattern can fire.
+        """
+        try:
+            from game.screen_detection import take_screenshot
+            from game.video_recorder import _CROP_REGION
+            from game.ocr import ocr_feed_text
+            from game.name_snap import find_winning_slot
+
+            text = ocr_feed_text(take_screenshot(), _CROP_REGION)
+            if not text:
+                return
+            slot_map = {str(i): name for i, name in enumerate(self._player_names) if name}
+            for raw_line in text.splitlines():
+                line = re.sub(r"\s+", " ", raw_line).strip()
+                if not line:
+                    continue
+                for kind, pattern in _FEED_PATTERNS:
+                    m = pattern.search(line)
+                    if not m:
+                        continue
+                    match_key = f"{kind}|{line}"
+                    if match_key in self._recent_feed_matches:
+                        continue
+                    self._recent_feed_matches.append(match_key)
+
+                    fields: dict = {"text": line}
+                    groups = m.groupdict()
+                    for role in ("killer", "victim"):
+                        if role in groups:
+                            raw_name = groups[role].strip()
+                            fields[f"{role}_raw"] = raw_name
+                            fields[f"{role}_slot"] = find_winning_slot(raw_name, slot_map)
+                    if groups.get("method"):
+                        fields["method"] = groups["method"].strip()
+                    logger.info("Feed match [%s]: %r -> %s", kind, line, fields)
+                    self._emit(kind, **fields)
+                    if kind == "feed_first_blood":
+                        self._maybe_queue_first_blood_reward(fields.get("killer_slot"))
+        except Exception as e:
+            logger.debug("Damage feed poll failed: %s", e)
+        finally:
+            self._feed_poll_busy = False
+
+    def _maybe_queue_first_blood_reward(self, killer_slot: Optional[str]) -> None:
+        """Called from _poll_damage_feed_worker() (its own background
+        thread) right after a feed_first_blood match. Queues the give_wood
+        reward for the main loop (_maybe_fire_first_blood_reward) to act on
+        once it's safe to — never fires anything itself, just records which
+        card index to reward. No-ops if the killer couldn't be confidently
+        resolved (never guess who to reward), if a reward has already been
+        queued or resolved this match — there is only one first blood, so
+        only one reward is ever queued, and a later re-detection of the same
+        feed line (polling continues all match, see _poll_damage_feed_worker's
+        own docstring) must not re-queue or overwrite it — or if
+        advanced_cards (config) is off. The feed_first_blood event itself
+        (emitted by the caller, not here) still fires either way — this
+        toggle only gates the reward, not the ladder logging.
+        """
+        if not self._advanced_cards_enabled:
+            return
+        if killer_slot is None or self._first_blood_reward_resolved or self._first_blood_reward_slot is not None:
+            return
+        self._first_blood_reward_slot = int(killer_slot)
+        logger.info(
+            "First blood reward queued for slot index %d (%s)",
+            self._first_blood_reward_slot, self._slot_name(self._first_blood_reward_slot),
+        )
+
+    def _maybe_fire_first_blood_reward(self, elapsed: float, card_schedule: list["CardEvent"]) -> None:
+        """Called every main-loop iteration (match thread). Gives the
+        first-blood killer a "Give Wood" card once three things are all
+        true — checked cheaply, no blocking wait, so a match with none of
+        them true yet just gets checked again next iteration:
+
+        1. A reward is actually queued (_maybe_queue_first_blood_reward) and
+           not already resolved.
+        2. The target hasn't died since being queued — checked against
+           self._player_alive, which _poll_player_bar() (called earlier this
+           same iteration) already refreshed, so this needs no OCR/screenshot
+           of its own. Cancels outright if so: a dead player never gets the
+           reward, no partial/late attempt.
+        3. Enough director points (self._last_confirmed_points, the same
+           continuously-ratcheted value the main loop already maintains —
+           no fresh read here) AND no real scheduled card due within
+           _BONUS_CARD_TIMING_BUFFER_SECONDS, so the reward's own drag
+           (~1-2s, same as any tray card play) never overlaps a scheduled
+           card's.
+
+        Claims the reward (sets self._first_blood_reward_resolved) BEFORE
+        calling _give_first_blood_reward() — that call blocks for the
+        drag, same as any other card play — so a later iteration can't
+        re-enter and double-fire while it's in progress.
+        """
+        if self._first_blood_reward_slot is None or self._first_blood_reward_resolved:
+            return
+        slot = self._first_blood_reward_slot
+
+        if slot < len(self._player_alive) and not self._player_alive[slot]:
+            logger.info(
+                "First blood reward canceled — %s was eliminated before it could be given",
+                self._slot_name(slot),
+            )
+            self._first_blood_reward_resolved = True
+            return
+
+        pending_times = [e.trigger_seconds - elapsed for e in card_schedule if not e.done]
+        if pending_times and min(pending_times) <= _BONUS_CARD_TIMING_BUFFER_SECONDS:
+            return
+
+        from game.deck_utils import CARD_POINT_COSTS
+        cost = CARD_POINT_COSTS.get("give_wood", 0)
+        if cost and (self._last_confirmed_points is None or self._last_confirmed_points < cost):
+            return
+
+        deck_pos = self._next_available_deck_pos(self._positions_for_card_type("give_wood"))
+        if deck_pos is None:
+            logger.warning("First blood reward: no 'give_wood' card available in the deck — canceling")
+            self._first_blood_reward_resolved = True
+            return
+
+        self._first_blood_reward_resolved = True
+        self._give_first_blood_reward(slot, deck_pos)
+
+    def _give_reward_card(
+        self, card_type: str, player_index: int, deck_pos: int, tts_prefix: str, event_label: str,
+    ) -> None:
+        """Shared by every "queued bonus card" reward (first-blood's
+        give_wood, Crowd Favorite's favorite_player — see
+        _give_first_blood_reward/_give_favorite_reward below): locks POV,
+        switches the camera to player_index, and drops card_type at
+        screen-center (960, 540) — deliberately NOT through the
+        player-target-coordinate system (_PLAYER_TARGETED_CARDS, gated on
+        player_target_coordinates, never calibrated on any machine): the
+        game applies a "give X to player" card to whichever player is
+        currently spectated when it's dropped at center, the same drop
+        point electromania/beach_party/etc. use, so switching POV to the
+        target first is what actually targets the reward at them.
+
+        Locks POV the same way the match-start sequence does (see
+        SessionState._pov_locked's docstring) so a viewer's own /pov can't
+        switch the camera away mid-sequence; unlocks in a finally block so
+        normal POV control resumes whether the card play succeeds or not.
+
+        Builds a synthetic CardEvent to reuse _play_tray_card() (the same
+        drag/verify/announce logic every scheduled card goes through) rather
+        than duplicating it — trigger_seconds/play_time_seconds are unused
+        outside the schedule so they're left at 0. tts_prefix is spoken as
+        "{tts_prefix}! Rewarding X with Y."; event_label names the emitted
+        card_play event as "{event_label} (Y)".
+        """
+        from game.player_cards_v2 import slot_number_for_index
+        from game.deck_utils import CARD_POINT_COSTS
+        from game import tts
+
+        pov_key = slot_number_for_index(player_index)
+        target_label = self._slot_name(player_index)
+        card_label = tts.card_announce(card_type)
+        logger.info(
+            "Reward: switching POV to %s (key %s), then dropping %s at screen center",
+            target_label, pov_key, card_label,
+        )
+
+        self._session.lock_pov()
+        try:
+            self._press(pov_key)
+            # Let the spectate-target switch actually apply before dropping
+            # a card that targets whoever's currently spectated — see
+            # _POV_SWITCH_SETTLE_SECONDS' own comment. self._stop.wait()
+            # rather than a bare sleep so a force-stop during this brief
+            # window is still picked up promptly, same as every other wait
+            # in this class.
+            if self._stop.wait(_POV_SWITCH_SETTLE_SECONDS):
+                return  # force-stopped during the settle wait — don't play into a dying match
+            tts.speak_cable(f"{tts_prefix}! Rewarding {target_label} with {card_label}.")
+            event = CardEvent(
+                name=f"{event_label} ({card_label})",
+                card_type=card_type,
+                trigger_seconds=0,
+                play_time_seconds=0,
+                deck_position=deck_pos,
+                drop_target=(960, 540),
+                points_cost=CARD_POINT_COSTS.get(card_type),
+            )
+            # _fire_card_event() normally emits this before dispatching by
+            # card_type — bypassed here (see docstring), so it's emitted
+            # explicitly instead, to keep this reward visible on the
+            # ladder's live feed like any other card play.
+            self._emit("card_play", card=event.card_type, name=event.name)
+            self._play_tray_card(event, (960, 540), card_label, next_event=None, broadcast_open=False)
+        finally:
+            self._session.unlock_pov()
+
+    def _give_first_blood_reward(self, killer_index: int, deck_pos: int) -> None:
+        """See _give_reward_card() — first-blood's give_wood reward."""
+        self._give_reward_card("give_wood", killer_index, deck_pos,
+                                tts_prefix="First blood", event_label="First Blood Reward")
+
+    def _give_favorite_reward(self, player_index: int, deck_pos: int) -> None:
+        """See _give_reward_card() — the Crowd Favorite channel-points
+        reward's favorite_player card."""
+        self._give_reward_card("favorite_player", player_index, deck_pos,
+                                tts_prefix="Crowd favorite", event_label="Crowd Favorite Reward")
+
+    def try_queue_favorite_reward(self, player_index: int) -> bool:
+        """Reserves the Crowd Favorite reward for player_index, if — and
+        only if — nothing is already pending, player_index names a real,
+        currently-alive player in this match's roster, and at least one
+        'favorite_player' card remains unplayed in the deck. Only one
+        redemption is ever allowed pending at a time, by explicit design
+        choice — unlike first blood (a true one-time event), a viewer could
+        otherwise redeem this repeatedly across a match as long as copies
+        remain, but a second redemption while one is already queued is
+        rejected here rather than queued behind it; the caller (Twitch bot)
+        refunds on a False return.
+
+        Called from the Twitch bot's event loop thread (bot/twitch_bot.py)
+        — a different thread from this class's own match thread. Plain
+        attribute mutation, no lock, same cross-thread convention as this
+        class's other such flags; safe here because Twitch redemptions are
+        handled one at a time (no concurrent handler execution) and this
+        method's check-then-set happens in one call with no await in
+        between.
+
+        Rejects immediately if advanced_cards (config) is off — the caller
+        refunds exactly as it would for any other rejection, same as if the
+        deck had no favorite_player cards left.
+        """
+        if not self._advanced_cards_enabled:
+            return False
+        if self._favorite_reward_target is not None:
+            return False
+        if not (0 <= player_index < len(self._player_names) and self._player_names[player_index]):
+            return False
+        if not (player_index < len(self._player_alive) and self._player_alive[player_index]):
+            return False
+        if self._next_available_deck_pos(self._positions_for_card_type("favorite_player")) is None:
+            return False
+        self._favorite_reward_target = player_index
+        logger.info("Crowd Favorite reward queued for %s", self._slot_name(player_index))
+        return True
+
+    def _maybe_fire_favorite_reward(self, elapsed: float, card_schedule: list["CardEvent"]) -> None:
+        """Called every main-loop iteration (match thread) — the
+        Crowd-Favorite counterpart to _maybe_fire_first_blood_reward()
+        above, same shape minus the points check (favorite_player costs 0
+        director points, so there's nothing to wait on):
+
+        1. Something is actually queued (try_queue_favorite_reward).
+        2. The target hasn't died since being queued — same
+           self._player_alive check, already refreshed this same iteration
+           by _poll_player_bar(). Cancels outright if so.
+        3. No real scheduled card due within _BONUS_CARD_TIMING_BUFFER_SECONDS
+           — the reward's own drag must never overlap a scheduled card's.
+
+        Once clear, resolves self._favorite_reward_target to None BEFORE
+        calling _give_favorite_reward() (which blocks for the drag) so a
+        later iteration can't re-enter and double-fire while it's in
+        progress. Setting it back to None (rather than a separate
+        "resolved" latch like first blood's) is deliberate: a NEW
+        redemption should be accept-able again immediately once this one
+        settles, since Crowd Favorite is a repeatable reward, not a
+        one-time match event.
+        """
+        if self._favorite_reward_target is None:
+            return
+        target = self._favorite_reward_target
+
+        if target < len(self._player_alive) and not self._player_alive[target]:
+            logger.info(
+                "Crowd Favorite reward canceled — %s was eliminated before it could be given",
+                self._slot_name(target),
+            )
+            self._favorite_reward_target = None
+            return
+
+        pending_times = [e.trigger_seconds - elapsed for e in card_schedule if not e.done]
+        if pending_times and min(pending_times) <= _BONUS_CARD_TIMING_BUFFER_SECONDS:
+            return
+
+        deck_pos = self._next_available_deck_pos(self._positions_for_card_type("favorite_player"))
+        if deck_pos is None:
+            logger.warning("Crowd Favorite reward: no 'favorite_player' card available in the deck — canceling")
+            self._favorite_reward_target = None
+            return
+
+        self._favorite_reward_target = None
+        self._give_favorite_reward(target, deck_pos)
 
     def _slot_name(self, i: int) -> str:
         if self._player_names and i < len(self._player_names) and self._player_names[i]:

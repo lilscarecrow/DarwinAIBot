@@ -75,6 +75,16 @@ def test_config_overrides_and_positions():
     assert v2.positions(2, cfg) == [450, 550]
 
 
+def test_slot_number_for_index_and_its_inverse_round_trip():
+    for index in range(10):
+        key = v2.slot_number_for_index(index)
+        assert v2.index_for_slot_number(key) == index
+    assert v2.slot_number_for_index(9) == "0"  # the 10th slot is key "0"
+    assert v2.index_for_slot_number("0") == 9
+    assert v2.slot_number_for_index(0) == "1"
+    assert v2.index_for_slot_number("1") == 0
+
+
 # ── name OCR: runs only where a tesseract binary is reachable ──────────────
 NAMES = {
     "vod_900.png": ["Nivoko", "SlyK", "Dom!n4toR", "BenHope", ":]", "Philipeace", "Justice", "coco pops", "-LAGADOU", "soid"],

@@ -51,12 +51,14 @@ _POV_REDEMPTION_COOLDOWN_SECONDS = 30
 # sub/resub/gift-sub shoutouts (channel:read:subscriptions), cheer shoutouts
 # (bits:read), the channel-points POV reward (channel:read:redemptions +
 # channel:manage:redemptions, the latter so redemptions can be fulfilled/refunded
-# instead of sitting UNFULFILLED forever in the dashboard), and checking whether a
-# channel-points redeemer is a mod (moderation:read, for the cooldown bypass below).
+# instead of sitting UNFULFILLED forever in the dashboard), checking whether a
+# channel-points redeemer is a mod (moderation:read, for the cooldown bypass below),
+# and the "who wins" match prediction (channel:manage:predictions).
 _OAUTH_SCOPES = (
     "user:bot+user:read:chat+user:write:chat+channel:bot"
     "+channel:edit:commercial+channel:read:subscriptions+bits:read"
     "+channel:read:redemptions+channel:manage:redemptions+moderation:read"
+    "+channel:manage:predictions"
 )
 _OAUTH_URL = f"http://localhost:4343/oauth?scopes={_OAUTH_SCOPES}"
 
@@ -74,6 +76,16 @@ class DarwinTwitchBot(commands.Bot):
         self._config = config
         self.session = session
         self._owner_id = str(config["twitch_owner_id"])
+        # The live MatchRunner, if a match is in progress — set/cleared by
+        # DirectorCog (bot/discord_bot.py) alongside its own _active_runner,
+        # at the same call sites, so this never drifts out of sync with
+        # whether a match is actually running. Needed for the Crowd Favorite
+        # redemption (_handle_favorite_redemption below), which has to check
+        # deck availability and queue the reward on the runner itself — the
+        # only cross-thread reference of its kind in this file (everything
+        # else here, like !pov/POV redemptions, only ever needs self.session
+        # or a raw press_key() call, neither of which needs the runner).
+        self.active_runner = None
         # monotonic timestamp: channel-points POV redemptions from non-mods are
         # rejected (refunded) until this passes — see event_custom_redemption_add.
         self._pov_redemption_available_at: float = 0.0
@@ -108,6 +120,8 @@ class DarwinTwitchBot(commands.Bot):
         # gets granted, so a fresh setup completes itself automatically.
         self.chat_subscribed = await self._subscribe_chat()
         self.events_subscribed = await self._subscribe_events()
+        await self._ensure_pov_reward()
+        await self._ensure_favorite_reward()
         self.startup_done.set()
         logger.info("Twitch bot: setup complete, listening for !pov")
 
@@ -220,10 +234,77 @@ class DarwinTwitchBot(commands.Bot):
                 )
         return succeeded, attempted
 
+    async def _ensure_custom_reward(self, title: str, cost: int, prompt: str) -> None:
+        """Best-effort: make sure a channel-points reward with this title
+        exists as one THIS app's Client-ID created, so fulfill()/refund()
+        calls against its redemptions actually work. Shared by every
+        channel-points reward this bot owns (_ensure_pov_reward,
+        _ensure_favorite_reward) — see _ensure_pov_reward's docstring for
+        the full story of why this matters (a Dashboard-created reward can
+        never be managed by any third-party app, found live 2026-09-10 as a
+        100% fulfill/refund failure rate).
+
+        Idempotent — checks fetch_custom_rewards(manageable=True) first
+        (rewards this app can already manage) and does nothing if one with
+        this title is already there, so this is safe to call on every
+        startup/reauth. Requires channel:manage:redemptions (already in
+        _OAUTH_SCOPES). Never raises — same fire-and-forget convention as
+        everywhere else here.
+        """
+        try:
+            broadcaster = self.create_partialuser(user_id=self._owner_id)
+            existing = await broadcaster.fetch_custom_rewards(manageable=True)
+            if any(r.title.lower() == title.lower() for r in existing):
+                logger.debug("Twitch bot: '%s' reward already exists and is manageable by this app", title)
+                return
+            await broadcaster.create_custom_reward(title=title, cost=cost, prompt=prompt)
+            logger.info(
+                "Twitch bot: created '%s' custom reward (cost=%d) via API — "
+                "this app can now fulfill/refund its redemptions", title, cost,
+            )
+        except Exception as e:
+            logger.warning(
+                "Twitch bot: could not create/verify the '%s' custom reward (%s) — if one with this "
+                "title already exists but was created elsewhere (e.g. the Creator Dashboard), delete "
+                "it first; Twitch requires reward titles to be unique per channel.",
+                title, e,
+            )
+
+    async def _ensure_pov_reward(self) -> None:
+        """See _ensure_custom_reward() — the "Change POV" reward."""
+        await self._ensure_custom_reward(
+            title=self._config.get("twitch_pov_reward_title", "Change POV"),
+            cost=int(self._config.get("twitch_pov_reward_cost", 250)),
+            prompt="Enter the player number to switch the Director's camera to (1-9, 0 for the 10th slot).",
+        )
+
+    async def _ensure_favorite_reward(self) -> None:
+        """See _ensure_custom_reward() — the "Crowd Favorite" reward
+        (game.match_runner.MatchRunner.try_queue_favorite_reward /
+        _maybe_fire_favorite_reward, 2026-09-10): drops a favorite_player
+        card on the redeemed player once the deck actually has one left and
+        it's safe to (see that method's docstring).
+
+        No-ops entirely if advanced_cards (config, default true) is off —
+        MatchRunner.try_queue_favorite_reward() would refuse every
+        redemption anyway in that case, so there's no point letting viewers
+        spend points on a reward that can only ever refund.
+        """
+        if not self._config.get("advanced_cards", True):
+            logger.debug("Twitch bot: advanced_cards is off — skipping Crowd Favorite reward creation")
+            return
+        await self._ensure_custom_reward(
+            title=self._config.get("twitch_favorite_reward_title", "Crowd Favorite"),
+            cost=int(self._config.get("twitch_favorite_reward_cost", 500)),
+            prompt="Enter the player number to make the crowd favorite (1-9, 0 for the 10th slot).",
+        )
+
     async def event_oauth_authorized(self, payload: UserTokenPayload) -> None:
         await super().event_oauth_authorized(payload)
         await self._subscribe_chat()
         await self._subscribe_events()
+        await self._ensure_pov_reward()
+        await self._ensure_favorite_reward()
         # Save immediately, during completely normal execution, rather than relying
         # on Client.close() to persist it at shutdown. That path turned out to be
         # fundamentally unreliable here: a Task that's mid-unwind from its own
@@ -284,6 +365,45 @@ class DarwinTwitchBot(commands.Bot):
             return True
         except Exception as e:
             logger.warning("Twitch ad break failed: %s", e)
+            return False
+
+    async def create_prediction(self, title: str, outcomes: list[str], prediction_window: int):
+        """Best-effort: open a Twitch prediction on the broadcaster's channel.
+        Requires the channel:manage:predictions scope (part of _OAUTH_SCOPES —
+        visit _OAUTH_URL to authorize) and no other prediction already active
+        on the channel (Twitch allows only one at a time — that failure surfaces
+        here as a caught exception, same as any other rejection).
+
+        Returns the twitchio Prediction object (`.id`, `.outcomes[].id/.title`)
+        on success, None on failure. Never raises — same fire-and-forget
+        convention as announce()/start_ad_break() above."""
+        try:
+            broadcaster = self.create_partialuser(user_id=self._owner_id)
+            prediction = await broadcaster.create_prediction(
+                title=title, outcomes=outcomes, prediction_window=prediction_window,
+            )
+            logger.info(
+                "Twitch prediction opened: %r (%d outcomes, %ds window, id=%s)",
+                title, len(outcomes), prediction_window, prediction.id,
+            )
+            return prediction
+        except Exception as e:
+            logger.warning("Twitch prediction creation failed: %s", e)
+            return None
+
+    async def end_prediction(self, prediction_id: str, status: str, winning_outcome_id: Optional[str] = None) -> bool:
+        """Best-effort: resolve/lock/cancel an open prediction. status is one of
+        'RESOLVED' (requires winning_outcome_id), 'CANCELED' (full refund), or
+        'LOCKED'. Never raises — same convention as create_prediction() above."""
+        try:
+            broadcaster = self.create_partialuser(user_id=self._owner_id)
+            await broadcaster.end_prediction(
+                id=prediction_id, status=status, winning_outcome_id=winning_outcome_id,
+            )
+            logger.info("Twitch prediction %s: %s (winning_outcome_id=%s)", prediction_id, status, winning_outcome_id)
+            return True
+        except Exception as e:
+            logger.warning("Twitch prediction %s (id=%s) failed: %s", status, prediction_id, e)
             return False
 
     async def _shoutout(self, text: str) -> None:
@@ -348,18 +468,44 @@ class DarwinTwitchBot(commands.Bot):
             logger.warning("Twitch bot: could not check moderator status for %s: %s", user_id, e)
             return False
 
+    async def _refund(self, payload, reason: str) -> None:
+        """Shared by every custom-reward redemption handler below: refunds a
+        redemption that didn't resolve, logging why. Never raises."""
+        logger.info(
+            "Twitch bot: '%s' redemption from %s refunded (%s)",
+            payload.reward.title, payload.user.display_name, reason,
+        )
+        try:
+            await payload.refund(token_for=self._owner_id)
+        except Exception as e:
+            logger.warning("Twitch bot: could not refund '%s' redemption: %s", payload.reward.title, e)
+
     async def event_custom_redemption_add(self, payload) -> None:
-        """channel.channel_points_custom_reward_redemption.add — only acts on the
-        one reward whose title matches twitch_pov_reward_title (config, default
-        'Change POV'); any other custom reward on the channel is left completely
-        alone. That reward must be created manually in the Twitch Creator
-        Dashboard with "require viewer to enter text" enabled, so payload.user_input
-        carries the player number — same 1-9/0 choices as /pov and !pov. Parsed
-        via _extract_pov_key() rather than an exact match: viewers used to
-        typing chat commands often type "!pov 5" or "pov 5" into the redemption
-        box instead of the bare "5" it asks for, so those (and case variants)
-        are accepted too. Anything that still doesn't resolve to a valid key
-        is refunded, never fulfilled.
+        """channel.channel_points_custom_reward_redemption.add — dispatches by
+        payload.reward.title to whichever of this bot's own custom rewards it
+        matches (twitch_pov_reward_title / twitch_favorite_reward_title,
+        config); any other custom reward on the channel is left completely
+        alone. Both rewards are created by this app itself
+        (_ensure_pov_reward/_ensure_favorite_reward), not the Creator
+        Dashboard — see _ensure_custom_reward's docstring for why that
+        matters (fulfill()/refund() only work for a reward this app's own
+        Client-ID created).
+        """
+        title = payload.reward.title.strip().lower()
+        if title == self._config.get("twitch_pov_reward_title", "Change POV").strip().lower():
+            await self._handle_pov_redemption(payload)
+        elif title == self._config.get("twitch_favorite_reward_title", "Crowd Favorite").strip().lower():
+            await self._handle_favorite_redemption(payload)
+
+    async def _handle_pov_redemption(self, payload) -> None:
+        """The "Change POV" reward — requires "require viewer to enter text"
+        enabled so payload.user_input carries the player number — same 1-9/0
+        choices as /pov and !pov. Parsed via _extract_pov_key() rather than
+        an exact match: viewers used to typing chat commands often type
+        "!pov 5" or "pov 5" into the redemption box instead of the bare "5"
+        it asks for, so those (and case variants) are accepted too.
+        Anything that still doesn't resolve to a valid key is refunded,
+        never fulfilled.
 
         A regular viewer redeeming this is rate-limited to one POV change per
         _POV_REDEMPTION_COOLDOWN_SECONDS globally (not per-viewer) — this is enforced
@@ -374,28 +520,15 @@ class DarwinTwitchBot(commands.Bot):
         success) or refund() (cooldown active, invalid input, wrong game state, or
         the keystroke couldn't be sent) — both require channel:manage:redemptions.
         """
-        reward_title = self._config.get("twitch_pov_reward_title", "Change POV")
-        if payload.reward.title.strip().lower() != reward_title.strip().lower():
-            return
-
         is_privileged = await self._is_mod_or_broadcaster(payload.user.id)
 
         if not is_privileged and time.monotonic() < self._pov_redemption_available_at:
-            logger.info(
-                "Twitch bot: POV redemption from %s rejected — cooldown active", payload.user.display_name
-            )
-            try:
-                await payload.refund(token_for=self._owner_id)
-            except Exception as e:
-                logger.warning("Twitch bot: could not refund cooldown-blocked POV redemption: %s", e)
+            await self._refund(payload, "cooldown active")
             return
 
         key = _extract_pov_key(payload.user_input)
         if not self.session.is_command_valid("pov") or self.session.is_pov_locked() or key is None:
-            try:
-                await payload.refund(token_for=self._owner_id)
-            except Exception as e:
-                logger.warning("Twitch bot: could not refund invalid POV redemption: %s", e)
+            await self._refund(payload, "invalid input or wrong game state")
             return
 
         from game.card_actions import press_key
@@ -408,13 +541,54 @@ class DarwinTwitchBot(commands.Bot):
         if sent and not is_privileged:
             self._pov_redemption_available_at = time.monotonic() + _POV_REDEMPTION_COOLDOWN_SECONDS
 
-        try:
-            if sent:
+        if sent:
+            try:
                 await payload.fulfill(token_for=self._owner_id)
-            else:
-                await payload.refund(token_for=self._owner_id)
-        except Exception as e:
-            logger.warning("Twitch bot: could not update POV redemption status: %s", e)
+            except Exception as e:
+                logger.warning("Twitch bot: could not update POV redemption status: %s", e)
+        else:
+            await self._refund(payload, "keystroke send failed")
+
+    async def _handle_favorite_redemption(self, payload) -> None:
+        """The "Crowd Favorite" reward (500 points by default) — drops a
+        favorite_player card on the redeemed player, via
+        game.match_runner.MatchRunner.try_queue_favorite_reward() /
+        _maybe_fire_favorite_reward() (see those methods' docstrings for the
+        full queue/fire/cancel behavior: one pending redemption at a time,
+        fires once no real scheduled card is due within 5s, canceled if the
+        target dies first). Requires "require viewer to enter text" enabled,
+        same player-number input and _extract_pov_key() parsing as the POV
+        reward above.
+
+        No cooldown (unlike POV) — the natural rate limiter here is deck
+        scarcity: try_queue_favorite_reward() itself refuses a redemption
+        while one is already queued, or once the deck has no favorite_player
+        copies left, both of which flow back here as a plain False -> refund.
+        Fulfilled the moment the redemption is validly QUEUED, not once the
+        card is actually given — the queue/fire delay (waiting for a safe
+        moment, potentially anywhere from instant to several minutes) is a
+        bot implementation detail, not something that should leave a valid
+        redemption sitting in the dashboard's queue.
+        """
+        key = _extract_pov_key(payload.user_input)
+        if key is None:
+            await self._refund(payload, "invalid input")
+            return
+        if self.active_runner is None:
+            await self._refund(payload, "no match in progress")
+            return
+
+        from game.player_cards_v2 import index_for_slot_number
+
+        player_index = index_for_slot_number(key)
+        accepted = self.active_runner.try_queue_favorite_reward(player_index)
+        if accepted:
+            try:
+                await payload.fulfill(token_for=self._owner_id)
+            except Exception as e:
+                logger.warning("Twitch bot: could not update Crowd Favorite redemption status: %s", e)
+        else:
+            await self._refund(payload, "no eligible player at that slot, one already queued, or no cards left")
 
 
 class PovComponent(commands.Component):

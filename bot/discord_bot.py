@@ -201,6 +201,13 @@ _LOBBY_PING_ROLE_ID = 1520526014600577134
 # delays /custom's OBS stream start by this long instead of going live instantly.
 _TOURNAMENT_STREAM_DELAY_SECONDS = 120
 
+# "Who wins?" Twitch prediction (config: twitch_predictions_enabled). Betting window —
+# Twitch auto-locks the prediction once this elapses; chosen short since the winner
+# tends to become obvious well before a match ends. Also the ceiling on how long
+# _maybe_open_prediction() waits for the match-start slot-map snapshot to finish
+# before giving up on opening a prediction at all for this match.
+_PREDICTION_WINDOW_SECONDS = 60
+
 # Embed accent colors
 _COLOR_OK      = 0x2ECC71  # green   — success
 _COLOR_FAIL    = 0xE74C3C  # red     — failure / error
@@ -367,6 +374,15 @@ class DirectorCog(commands.Cog):
         # Discord IDs (strings) of scrim signup reactors, captured at /custom time
         # so they're available to pass through to the ingest API at match end.
         self._resolved_roster: Optional[list[str]] = None
+        # "Who wins this match?" Twitch prediction — opened once the lobby is fully
+        # captured (see _maybe_open_prediction), resolved/canceled at match end (see
+        # _resolve_prediction), and canceled by _reset_session on any abort so it
+        # never sits open with nothing left to resolve it. _prediction_slot_map and
+        # _prediction_outcome_by_slot are snapshotted at creation time, not read back
+        # off the runner later, since _active_runner is already None by match end.
+        self._active_prediction = None
+        self._prediction_slot_map: dict[str, str] = {}
+        self._prediction_outcome_by_slot: dict[str, str] = {}
         # The darwinstalker ladder draft for the current lobby. Opened at /custom,
         # roster pushed at match start, screenshot per game, closed on every
         # path back to IDLE (_reset_session). See docs/DS_LIFECYCLE_HANDOFF.md.
@@ -407,6 +423,20 @@ class DirectorCog(commands.Cog):
         e.set_footer(text=f"State: {state_label}")
         return e
 
+    def _set_active_runner(self, runner: Optional[MatchRunner]) -> None:
+        """Sets self._active_runner AND the Twitch bot's own active_runner
+        reference (bot/twitch_bot.py) together, in one place, rather than
+        repeating the same two-line set at every call site that starts or
+        ends a match. The Twitch bot needs this reference for the Crowd
+        Favorite channel-points reward (2026-09-10) —
+        DarwinTwitchBot._handle_favorite_redemption() has to check deck
+        availability and queue the reward directly on the live MatchRunner,
+        and it has no other way to reach it. No-ops the Twitch side if
+        twitch_enabled is false (self.bot.twitch_bot is None)."""
+        self._active_runner = runner
+        if self.bot.twitch_bot is not None:
+            self.bot.twitch_bot.active_runner = runner
+
     async def _upload_recording(self, path: str):
         """Upload the match recording to the API endpoint in the background, then delete the local file."""
         endpoint = self.bot.config.get("recording_api_endpoint", "")
@@ -429,7 +459,7 @@ class DirectorCog(commands.Cog):
 
     async def _post_results_to_ingest(
         self, results_text: str, roster: Optional[list[str]] = None,
-    ):
+    ) -> Optional[dict]:
         """Best-effort push of the raw results screenshot to the darwinstalker ladder.
 
         Delegates to DraftLifecycle.post_results, which targets the draft opened
@@ -439,16 +469,111 @@ class DirectorCog(commands.Cog):
         roster: optional list of Discord ID strings for the players known to be in
         this match (captured from scrim signup reactions at /custom time). Passed
         through so the server can narrow its OCR prompt and fuzzy candidate pool.
+
+        Returns the server's response body (draft_id/game_index/ocr_error, plus
+        placements when OCR succeeded — see game/ingest.py's docstring) so the
+        caller can resolve the "who wins" Twitch prediction against it. None
+        when there's no screenshot to upload or the upload failed.
         """
         if not results_text.endswith(".png"):
-            return
+            return None
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(
+            return await loop.run_in_executor(
                 None, lambda: self._ds.post_results(results_text, roster=roster),
             )
         except Exception as e:
             logger.warning("darwinstalker ingest failed: %s", e)
+            return None
+
+    # ------------------------------------------------------------------
+    # "Who wins?" Twitch prediction
+    # ------------------------------------------------------------------
+
+    async def _maybe_open_prediction(self, runner: MatchRunner) -> None:
+        """Open a Twitch prediction — one outcome per player, "{slot} - {name}"
+        — once the match-start slot map is fully captured. Waits for
+        runner._slot_map_ready (bounded by _PREDICTION_WINDOW_SECONDS, the
+        same constant used as the betting window itself — no reason to wait
+        longer for the snapshot than the prediction would even stay open) then
+        requires is_lobby_captured() — a partial capture means no prediction
+        this match, not a guess. No-ops entirely if twitch_predictions_enabled
+        (config) is false or the Twitch bot isn't running. Never raises.
+        """
+        if not self.bot.config.get("twitch_predictions_enabled", False):
+            return
+        if self.bot.twitch_bot is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            ready = await loop.run_in_executor(
+                None, runner._slot_map_ready.wait, _PREDICTION_WINDOW_SECONDS,
+            )
+            if not ready or not runner.is_lobby_captured():
+                logger.info("Prediction: lobby not fully captured — skipping this match")
+                return
+
+            slot_map = runner.slot_map()
+            slots = sorted(slot_map, key=lambda s: (s == "0", s))[:10]
+            title_by_slot = {slot: f"{slot} - {slot_map[slot][:21]}" for slot in slots}
+            if len(title_by_slot) < 2:
+                logger.info("Prediction: only %d player(s) captured — need at least 2, skipping", len(title_by_slot))
+                return
+
+            prediction = await self.bot.twitch_bot.create_prediction(
+                title="Who wins this Darwin Project match?",
+                outcomes=list(title_by_slot.values()),
+                prediction_window=_PREDICTION_WINDOW_SECONDS,
+            )
+            if prediction is None:
+                return
+            outcome_id_by_title = {o.title: o.id for o in prediction.outcomes}
+            self._active_prediction = prediction
+            self._prediction_slot_map = dict(slot_map)
+            self._prediction_outcome_by_slot = {
+                slot: outcome_id_by_title.get(title) for slot, title in title_by_slot.items()
+            }
+        except Exception as e:
+            logger.warning("Prediction: could not open: %s", e)
+
+    async def _resolve_prediction(self, placements: Optional[list[dict]]) -> None:
+        """Resolve the open "who wins" prediction against the ladder's OCR'd
+        placements (rank-1 entry), or cancel it (full refund) if there's no
+        prediction, no placements, or the winner's name doesn't confidently
+        match any captured slot (find_winning_slot() never guesses). Never
+        raises — same fire-and-forget convention as the rest of this
+        integration.
+        """
+        prediction = self._active_prediction
+        if prediction is None:
+            return
+        slot_map = self._prediction_slot_map
+        outcome_by_slot = self._prediction_outcome_by_slot
+        self._active_prediction = None
+        self._prediction_slot_map = {}
+        self._prediction_outcome_by_slot = {}
+        if self.bot.twitch_bot is None:
+            return
+
+        from game.name_snap import find_winning_slot
+        winner_name = None
+        if placements:
+            first = next((p for p in placements if p.get("rank") == 1), placements[0])
+            winner_name = str(first.get("name") or "").strip() or None
+
+        slot = find_winning_slot(winner_name, slot_map) if winner_name else None
+        outcome_id = outcome_by_slot.get(slot) if slot else None
+        try:
+            if outcome_id:
+                await self.bot.twitch_bot.end_prediction(prediction.id, "RESOLVED", winning_outcome_id=outcome_id)
+            else:
+                logger.info(
+                    "Prediction: could not match winner %r to a captured slot — canceling for a refund",
+                    winner_name,
+                )
+                await self.bot.twitch_bot.end_prediction(prediction.id, "CANCELED")
+        except Exception as e:
+            logger.warning("Prediction: could not resolve: %s", e)
 
     async def _twitch_announce(self, text: str):
         """Best-effort: post to Twitch chat if the Twitch bot is configured/running."""
@@ -692,6 +817,18 @@ class DirectorCog(commands.Cog):
         self._resolved_profile = None
         self._resolved_roster = None
         self._lobby_expiry = None
+        # Any still-open "who wins" prediction has nothing left to resolve it —
+        # cancel for a full refund rather than leave it dangling. Cleared
+        # synchronously (so a second reset before the cancel lands can't double-fire)
+        # with the actual Twitch call fired fire-and-forget, same convention as
+        # stop_stream()/_clear_streaming_presence() below.
+        if self._active_prediction is not None:
+            _prediction = self._active_prediction
+            self._active_prediction = None
+            self._prediction_slot_map = {}
+            self._prediction_outcome_by_slot = {}
+            if self.bot.twitch_bot is not None:
+                asyncio.ensure_future(self.bot.twitch_bot.end_prediction(_prediction.id, "CANCELED"))
         from game import tts
         tts.stop()
         from game import obs_control
@@ -984,6 +1121,19 @@ class DirectorCog(commands.Cog):
                 last_action="Custom match created",
                 next_action="Await /start",
             )
+            # Locked here, not just at /start — the same player-bar UI (and its
+            # spectate-camera mechanic) is already live in the lobby, so a POV
+            # switch there persists into match start and can still corrupt
+            # _log_slot_map_snapshot()'s read even though the switch happened
+            # before /start. Found live 2026-09-09: a viewer's !pov during the
+            # lobby went through unblocked because the lock previously only
+            # engaged at MatchRunner construction. Unlocked by MatchRunner's
+            # own unlock_pov() call after the match's forced default-POV-1
+            # press, same as before — /menu's success path (abandoning the
+            # lobby without ever starting a match) is the one exit from
+            # IN_CUSTOM that doesn't go through _reset_session(), so it
+            # explicitly unlocks too, below.
+            self.bot.session.lock_pov()
 
             # Open the ladder draft for this lobby now — roster comes later at
             # match start; this is what puts the Twitch embed on the LIVE tab
@@ -1361,6 +1511,13 @@ class DirectorCog(commands.Cog):
                 return
 
         if success:
+            # /custom locks POV for the lobby (see its success branch); this is
+            # the one path that leaves IN_CUSTOM without ever starting a match
+            # or going through _reset_session(), so it's the one place besides
+            # those two that must unlock it explicitly — otherwise abandoning a
+            # lobby via /menu would leave POV stuck refusing for the rest of
+            # the session.
+            self.bot.session.unlock_pov()
             self.bot.session.transition(
                 BotState.IN_MENU,
                 last_action="Returned to main menu",
@@ -1569,7 +1726,8 @@ class DirectorCog(commands.Cog):
         self._resolved_profile = None
         _match_roster = self._resolved_roster
         self._resolved_roster = None
-        self._active_runner = runner
+        self._set_active_runner(runner)
+        asyncio.ensure_future(self._maybe_open_prediction(runner))
 
         # Respond immediately — match runs in the background so the interaction
         # token never expires waiting for results.
@@ -1593,7 +1751,7 @@ class DirectorCog(commands.Cog):
                 except asyncio.TimeoutError:
                     if self._active_runner is not None:
                         self._active_runner.stop()
-                    self._active_runner = None
+                    self._set_active_runner(None)
                     self._reset_session("aborted: match safety timeout")
                     await channel.send(embed=self._fail(
                         "Match Safety Timeout",
@@ -1604,7 +1762,7 @@ class DirectorCog(commands.Cog):
 
             results_text, recording_path = result if isinstance(result, tuple) else (result, None)
 
-            self._active_runner = None
+            self._set_active_runner(None)
             self.bot.session.transition(
                 BotState.MATCH_ENDED,
                 last_action="Match ended",
@@ -1634,7 +1792,8 @@ class DirectorCog(commands.Cog):
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
-            await self._post_results_to_ingest(results_text, roster=_match_roster)
+            _ingest_body = await self._post_results_to_ingest(results_text, roster=_match_roster)
+            await self._resolve_prediction(_ingest_body.get("placements") if _ingest_body else None)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
@@ -1716,7 +1875,8 @@ class DirectorCog(commands.Cog):
             self._resolved_profile = None
             _match_roster = self._resolved_roster
             self._resolved_roster = None
-            self._active_runner = runner
+            self._set_active_runner(runner)
+            asyncio.ensure_future(self._maybe_open_prediction(runner))
 
             async with self._session_lock:
                 loop = asyncio.get_running_loop()
@@ -1728,7 +1888,7 @@ class DirectorCog(commands.Cog):
                 except asyncio.TimeoutError:
                     if self._active_runner is not None:
                         self._active_runner.stop()
-                    self._active_runner = None
+                    self._set_active_runner(None)
                     self._reset_session("aborted: match safety timeout")
                     await channel.send(embed=self._fail(
                         "Match Safety Timeout",
@@ -1739,7 +1899,7 @@ class DirectorCog(commands.Cog):
 
             results_text, recording_path = result if isinstance(result, tuple) else (result, None)
 
-            self._active_runner = None
+            self._set_active_runner(None)
             self.bot.session.transition(
                 BotState.MATCH_ENDED,
                 last_action="Match ended",
@@ -1769,7 +1929,8 @@ class DirectorCog(commands.Cog):
             if not results_text.endswith(".png"):
                 await channel.send(embed=self._info("Match Complete", results_text))
             await self._mirror_results(results_text)
-            await self._post_results_to_ingest(results_text, roster=_match_roster)
+            _ingest_body = await self._post_results_to_ingest(results_text, roster=_match_roster)
+            await self._resolve_prediction(_ingest_body.get("placements") if _ingest_body else None)
             if results_text.endswith(".png"):
                 try:
                     os.remove(results_text)
