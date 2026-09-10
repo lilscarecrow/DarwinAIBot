@@ -1317,6 +1317,28 @@ class MatchRunner:
             )
         return self._last_confirmed_points
 
+    def _debit_points(self, cost: Optional[int]) -> None:
+        """A card that just played spent `cost` points — subtract it directly
+        from self._last_confirmed_points instead of invalidating the whole
+        value and waiting on a fresh OCR read (2026-09-10). Every card's cost
+        is already known (CARD_POINT_COSTS / CardEvent.points_cost), so once
+        a play is confirmed there's no need to guess at a re-read when plain
+        arithmetic gives an exact answer — this keeps a card fired immediately
+        after another from blocking on `_wait_for_points()` for a fresh read
+        that would just confirm what was already knowable.
+
+        Falls back to invalidating (`None`, forcing the next read to be
+        trusted as a fresh baseline — the old behavior) only when the cost
+        isn't known (a card_type missing from CARD_POINT_COSTS) or there's no
+        confirmed baseline yet to subtract from in the first place. Clamped
+        at 0 as a defensive floor — points should never go negative, but a
+        stale overestimate subtracting past zero shouldn't produce one.
+        """
+        if cost is None or self._last_confirmed_points is None:
+            self._last_confirmed_points = None
+            return
+        self._last_confirmed_points = max(0, self._last_confirmed_points - cost)
+
     def _wait_for_points(self, needed: int, card_name: str,
                          broadcast_open: bool = False, card_label: str = "") -> bool:
         """Block until the director has enough points.
@@ -1493,16 +1515,16 @@ class MatchRunner:
             shift_up()
 
         if not self._stop.is_set():
-            # A real points decrease is likely now (a play attempt was just made,
-            # whether or not it verified) — invalidate the confirmed reading so the
-            # next read, whatever it is, becomes the new trusted baseline instead of
-            # being compared against a now-stale pre-attempt value.
-            self._last_confirmed_points = None
             if played:
+                # The card actually played and spent event.points_cost points —
+                # debit that directly rather than invalidating the confirmed
+                # reading and waiting on a fresh OCR read (see _debit_points).
+                self._debit_points(event.points_cost)
                 ann = self._next_card_announce(next_event)
                 if ann:
                     tts.speak_cable(ann)
             else:
+                # Nothing was spent — the known points value is left untouched.
                 tts.speak_cable(f"Sorry, failed to deploy {card_label}")
             if broadcast_open:
                 tts.queue_close_broadcast()
@@ -1607,10 +1629,11 @@ class MatchRunner:
             bypass_mode=self._bypass,
         )
         self._deck_played.add(deck_pos)
-        # See the matching comment in _play_tray_card() — a real points decrease is
-        # likely now, so invalidate the confirmed reading rather than let a later wait
-        # trust a now-stale pre-play value.
-        self._last_confirmed_points = None
+        # No verification step here (see docstring above) — the play is always
+        # assumed to have happened, so always debit its cost directly, same
+        # reasoning as _play_tray_card()'s _debit_points call.
+        from game.deck_utils import CARD_POINT_COSTS
+        self._debit_points(CARD_POINT_COSTS.get("zone_close"))
         # No "Closing a zone" TTS confirmation here (2026-09-06) — this drag is never
         # verified regardless of verify_card_plays (the drop area handles zone validity
         # on the game's side, see the docstring above), so that line always spoke as if
