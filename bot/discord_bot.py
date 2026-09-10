@@ -208,6 +208,24 @@ _TOURNAMENT_STREAM_DELAY_SECONDS = 120
 # before giving up on opening a prediction at all for this match.
 _PREDICTION_WINDOW_SECONDS = 60
 
+# Auto-start watcher's lobby-countdown OCR (2026-09-10 fix, found live): a single
+# unverified read drove the whole watcher, and one bad read fired a match roughly
+# 10 minutes early — the raw OCR text was "(9:47" instead of "19:47", the leading
+# "1" misread as a stray "(" character, exactly halving the real remaining time.
+# A grep of months of logs confirmed nothing had changed here — read_lobby_countdown()
+# itself hasn't been touched since it was first written, and this exact "9:47"
+# pattern was already appearing intermittently in the log for weeks, always paired
+# with a correct "19:47"-range read moments before/after — it just hadn't previously
+# lined up with a live watcher invocation. The fix lives in
+# game/ocr.py::read_lobby_countdown() itself now: a single-digit minutes capture is
+# reconstructed as 10 + that digit (the leading "1" is never genuinely absent —
+# this is only ever called moments after /custom against a fixed ~20-minute lobby
+# timeout, and every legitimate read across months of logs is "19:XX", never lower).
+# That fixes the failure at its source, so a second confirming read is no longer
+# needed — _COUNTDOWN_MIN_PLAUSIBLE_SECONDS remains as a final sanity floor in case
+# OCR ever fails in some other, not-yet-seen way.
+_COUNTDOWN_MIN_PLAUSIBLE_SECONDS = 900  # 15 min — comfortably below the observed ~19:30-19:50 floor
+
 # Embed accent colors
 _COLOR_OK      = 0x2ECC71  # green   — success
 _COLOR_FAIL    = 0xE74C3C  # red     — failure / error
@@ -1808,25 +1826,47 @@ class DirectorCog(commands.Cog):
     # Auto-start watcher
     # ------------------------------------------------------------------
 
+    async def _read_lobby_countdown(self) -> Optional[int]:
+        """OCRs the lobby countdown banner once. The single-digit-minutes
+        misread that used to require a second confirming read is now fixed
+        at the source (game/ocr.py::read_lobby_countdown() reconstructs a
+        dropped leading "1" itself) — this just keeps the plausibility floor
+        (_COUNTDOWN_MIN_PLAUSIBLE_SECONDS) as a final sanity check in case
+        OCR ever fails in some other way. Returns None (watcher inactive)
+        if the read failed to parse or came back implausibly low.
+        """
+        loop = asyncio.get_running_loop()
+        from game.screen_detection import take_screenshot
+        from game.ocr import read_lobby_countdown
+
+        def _read() -> Optional[int]:
+            return read_lobby_countdown(take_screenshot(), debug=False)
+
+        countdown = await loop.run_in_executor(None, _read)
+        if countdown is None:
+            logger.warning("Auto-start watcher: could not read lobby countdown — watcher inactive")
+            return None
+
+        if countdown < _COUNTDOWN_MIN_PLAUSIBLE_SECONDS:
+            logger.warning(
+                "Auto-start watcher: countdown %ds is implausibly low (floor %ds) — watcher inactive",
+                countdown, _COUNTDOWN_MIN_PLAUSIBLE_SECONDS,
+            )
+            return None
+
+        return countdown
+
     async def _watch_for_auto_start(self, channel: discord.TextChannel):
         """
-        Started after /custom creates a lobby. OCRs the on-screen countdown,
-        sleeps until it expires, then fires the match runner automatically
-        (skip_start=True — no B press needed since the game already started).
-        Cancelled immediately if /start is called manually first.
+        Started after /custom creates a lobby. OCRs the on-screen countdown
+        (see _read_lobby_countdown), sleeps until it expires, then fires the
+        match runner automatically (skip_start=True — no B press needed
+        since the game already started). Cancelled immediately if /start is
+        called manually first.
         """
         try:
-            loop = asyncio.get_running_loop()
-            from game.screen_detection import take_screenshot
-            from game.ocr import read_lobby_countdown
-
-            screenshot = await loop.run_in_executor(None, take_screenshot)
-            countdown = await loop.run_in_executor(
-                None, lambda: read_lobby_countdown(screenshot, debug=False)
-            )
-
+            countdown = await self._read_lobby_countdown()
             if countdown is None:
-                logger.warning("Auto-start watcher: could not read lobby countdown — watcher inactive")
                 return
 
             logger.info("Auto-start watcher: lobby expires in %ds", countdown)

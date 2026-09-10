@@ -1,6 +1,6 @@
 """V2 card detection against real VOD strips (tests/fixtures/player_bar)."""
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -53,6 +53,35 @@ def test_expected_count_is_a_lower_bound_the_strip_overrides():
     # A signup roster smaller than the strip (a late joiner) never shrinks the read.
     assert len(v2.detect_cards(img, expected=8)) == 9, "the strip wins over a smaller roster"
     assert len(v2.detect_cards(img, expected=None)) == 9
+
+
+def test_a_smaller_expected_count_never_overrides_a_larger_genuine_fit():
+    """2026-09-10 fix, found live: a real 10-player match had a stale
+    scrim-signup roster count of 9 (captured at /custom time, before two
+    more players joined the queue) passed in as `expected`. The true strip
+    was 10 cards, and 9 also spuriously fit (a smaller n's wider-spaced
+    windows can land within neighboring real cards) — the old
+    `expected if expected in complete else max(complete)` picked 9 anyway,
+    silently dropping a real player's card from tracking for the whole
+    match. detect_cards()'s own docstring says the largest fitting n always
+    wins; this proves that holds even when a smaller `expected` also fits.
+
+    Uses a patched read_card() rather than a real captured frame — isolates
+    the selection logic itself from needing a pixel-perfect image where two
+    different candidate counts both genuinely fit."""
+    cfg = v2.v2_config({})
+    xs_9 = set(v2.positions(9, cfg))
+    xs_10 = set(v2.positions(10, cfg))
+
+    def fake_read_card(hsv, x, config):
+        if x in xs_9 or x in xs_10:
+            return v2.Card(index=-1, x=x, alive=True, band_y=0, band_v=200, band_s=200, red_x=0.0)
+        return None
+
+    img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    with patch("game.player_cards_v2.read_card", side_effect=fake_read_card):
+        cards = v2.detect_cards(img, expected=9)
+    assert len(cards) == 10, "a smaller `expected` must never override a larger fitting count"
 
 
 def test_dead_cards_carry_the_red_x_and_alive_ones_do_not():

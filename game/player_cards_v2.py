@@ -19,8 +19,10 @@ and each candidate is tested for the one thing every card has: a name band.
              strong-red pixels in the portrait box; alive portraits 0-2 %)
 The spectated player's card is drawn enlarged with its band lower, so the
 band is searched over a range of rows, not one. The n whose positions ALL
-read as cards wins (largest such n; an expected count from the lobby breaks
-ties). The always-present "glitch" card sits LEFT of the centred block and
+read as cards wins — always the LARGEST such n (see the comment inside
+detect_cards() for why a smaller n can spuriously fit but a larger one
+can't, and the live incident that proved a lobby's "expected" player count
+is only ever a lower bound, never allowed to shrink the read). The always-present "glitch" card sits LEFT of the centred block and
 is never a candidate — confirmed live 2026-09-09 that this can be a full
 duplicate of a real player's card (name, health bar, everything), not just
 the blank/no-name form this comment used to describe. Either way it lands

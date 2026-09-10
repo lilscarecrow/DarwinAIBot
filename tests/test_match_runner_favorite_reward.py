@@ -67,9 +67,15 @@ def test_rejects_an_out_of_range_index():
     assert runner._favorite_reward_target is None
 
 
-def test_rejects_an_index_with_no_captured_name():
+def test_accepts_an_index_with_no_captured_name_if_still_alive():
+    """2026-09-10 fix: unlike first blood, this flow never matches a name —
+    the viewer names the slot directly. A real, alive player whose nameplate
+    simply failed to OCR at match start must not be rejected just because
+    their specific name didn't resolve; self._slot_name() falls back to
+    "slot N" for logging/TTS, so nothing needs the name to be present."""
     runner = make_runner(names=["SteffKnight", "", "Guts"])
-    assert runner.try_queue_favorite_reward(1) is False
+    assert runner.try_queue_favorite_reward(1) is True
+    assert runner._favorite_reward_target == 1
 
 
 def test_rejects_an_already_eliminated_target():

@@ -5,8 +5,10 @@ its own tests below); the actual OCR/pattern-matching logic lives in
 _poll_damage_feed_worker(), called directly here for deterministic,
 non-threaded tests.
 """
+import os
 from unittest.mock import patch
 
+import cv2
 import pytest
 
 from game.match_runner import MatchRunner
@@ -138,6 +140,84 @@ def test_does_not_re_emit_the_exact_same_line_still_on_screen():
     run_worker(runner, "STEFFKNIGHT DREW FIRST BLOOD FROM HELLCRYING")
     run_worker(runner, "STEFFKNIGHT DREW FIRST BLOOD FROM HELLCRYING")
     assert len(ds.events) == 1
+
+
+# ---- real feed_kill captures (2026-09-10) — see tests/fixtures/feed_kill/README --
+
+_FEED_KILL_FIX = os.path.join(os.path.dirname(__file__), "fixtures", "feed_kill")
+
+
+def run_worker_on_real_capture(runner, filename):
+    """Drives _poll_damage_feed_worker() through the REAL ocr_feed_text()
+    (not mocked) against a real captured raw crop — end-to-end proof that
+    the \\s* regex relaxation below actually resolves a real merged-word
+    kill line, not just the regex in isolation."""
+    img = cv2.imread(os.path.join(_FEED_KILL_FIX, filename))
+    assert img is not None, f"missing fixture: {filename}"
+    # The fixture is already cropped to _CROP_REGION's size — point that
+    # constant at (0, 0, w, h) so _poll_damage_feed_worker()'s real crop
+    # step is a no-op against this already-cropped image.
+    h, w = img.shape[:2]
+    with patch("game.screen_detection.take_screenshot", return_value=img), \
+         patch("game.video_recorder._CROP_REGION", (0, 0, w, h)), \
+         patch("game.ocr.save_feed_debug_images"):  # don't actually write files during a test
+        runner._poll_damage_feed_worker()
+
+
+def test_a_merged_no_space_kill_line_still_resolves_end_to_end():
+    """feed_kill_1.png OCRs as 'TWOKILLEDTHUGZBY ARROW,' — no space around
+    KILLED, since that boundary sits against the colored player name. The
+    old \\s+-based pattern silently failed to match this at all even though
+    every word reads correctly; \\s* must catch it."""
+    runner, ds = make_runner(["TWO", "THUGZ", "PEFISS"])
+    run_worker_on_real_capture(runner, "feed_kill_1.png")
+    assert len(ds.events) == 1
+    kind, fields = ds.events[0]
+    assert kind == "feed_kill"
+    assert fields["killer_slot"] == "0" and fields["victim_slot"] == "1"
+    assert fields["method"].startswith("ARROW")
+
+
+def test_a_second_merged_kill_line_also_resolves():
+    runner, ds = make_runner(["THEAURI", "KERO"])
+    run_worker_on_real_capture(runner, "feed_kill_2.png")
+    assert len(ds.events) == 1
+    kind, fields = ds.events[0]
+    assert kind == "feed_kill"
+    assert fields["killer_slot"] == "0" and fields["victim_slot"] == "1"
+    assert fields["method"] == "COLD"
+
+
+# ---- feed debug image capture (2026-09-10) ---------------------------------
+
+def test_a_matched_line_triggers_a_debug_image_save():
+    """save_feed_debug_images() (game/ocr.py) is called whenever a pattern
+    matches, so the next live occurrence leaves behind a raw-color crop to
+    inspect — this is how the still-open colored-name OCR gap (player names
+    render orange/red, not white; the current preprocessing can't separate
+    them from a colored background) gets fixed with real pixel data instead
+    of another guess."""
+    runner, ds = make_runner(ROSTER)
+    with patch("game.ocr.save_feed_debug_images") as save_debug:
+        run_worker(runner, "STEFFKNIGHT DREW FIRST BLOOD FROM HELLCRYING")
+    save_debug.assert_called_once()
+    args = save_debug.call_args[0]
+    assert args[0] is None  # the (patched) screenshot, passed straight through
+    assert "feed_first_blood" in args[3]  # label embeds the matched kind
+
+
+def test_a_debug_save_failure_does_not_break_event_emission():
+    runner, ds = make_runner(ROSTER)
+    with patch("game.ocr.save_feed_debug_images", side_effect=RuntimeError("disk full")):
+        run_worker(runner, "STEFFKNIGHT DREW FIRST BLOOD FROM HELLCRYING")
+    assert len(ds.events) == 1
+
+
+def test_no_debug_save_when_nothing_matches():
+    runner, ds = make_runner(ROSTER)
+    with patch("game.ocr.save_feed_debug_images") as save_debug:
+        run_worker(runner, "ZONE CLOSING IN 30 SECONDS")
+    save_debug.assert_not_called()
 
 
 def test_worker_clears_the_busy_flag_even_on_failure():

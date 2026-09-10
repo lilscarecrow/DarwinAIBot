@@ -30,7 +30,7 @@ def main() -> int:
     ap.add_argument("--no-ocr", action="store_true", help="skip name OCR")
     ap.add_argument("--out", help="annotated image path (default: <frame>.annotated.png)")
     ap.add_argument("--json", action="store_true", help="print the report as JSON instead of text")
-    ap.add_argument("--expected", type=int, help="the lobby's player count, if known — breaks ties only when it fits")
+    ap.add_argument("--expected", type=int, help="the lobby's player count, if known — only flags a mismatch in the report, doesn't change which count is picked (see game/player_cards_v2.py::detect_cards)")
     a = ap.parse_args()
 
     img = cv2.imread(a.frame)

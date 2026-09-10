@@ -16,7 +16,11 @@ calibration, works at 1920×1080 out of the box:
   layout ever changes) — each candidate is checked against the one thing
   every card has: the name band (solid bright colour = alive) or a red X
   over the portrait (= eliminated). The n whose positions ALL read as cards
-  wins (largest such n; an expected count from the lobby breaks ties).
+  wins — always the largest such n (2026-09-10 fix, found live: a lobby's
+  "expected" player count used to override this when a smaller n also
+  spuriously fit, silently dropping a real 10th player's card for the whole
+  match after a stale scrim-signup count of 9 got passed in — see
+  `detect_cards()`'s docstring in `game/player_cards_v2.py`).
 - Names come from OCR on that same band (`ocr_names()` — see §6 for its
   accuracy and the psm 7/8 fallback fixed 2026-09-09, §9).
 - Alive/dead is re-sampled every poll (`cards_alive()`) at the x-positions
@@ -51,9 +55,10 @@ comparison mode.
 the bot uses on a saved screenshot (any machine, no game or display
 needed) and writes an annotated image (green box = alive, red box = dead,
 orange line = the band row it matched on). Add `--expected N` if you know
-the lobby's player count (only breaks ties when the count would otherwise
-be ambiguous). `python calibrate.py`'s F8 hotkey does the same thing live,
-mid-match, no terminal input needed.
+the lobby's player count — as of 2026-09-10 this only flags a mismatch in
+the report, it can no longer change which count gets picked (see above).
+`python calibrate.py`'s F8 hotkey does the same thing live, mid-match, no
+terminal input needed.
 
 ## 3. Verify it end to end
 

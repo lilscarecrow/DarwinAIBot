@@ -68,14 +68,24 @@ _DIRECTOR_POINTS_PIPS = {"x_start": 862, "y": 1012, "spacing": 26, "count": 10}
 # queuing the first-blood reward (see _maybe_queue_first_blood_reward in
 # _poll_damage_feed_worker, and _maybe_fire_first_blood_reward in the main
 # loop) once its killer resolves confidently.
+# Keyword boundaries use \s* (zero-or-more), not \s+ — found live 2026-09-10,
+# after the outline-detection OCR rewrite made names finally legible: the
+# game renders near-zero pixel gap between a colored player name and an
+# immediately adjacent white word (but a normal gap between two white
+# words), so tesseract sometimes reads e.g. "TWO KILLED THUGZ BY ARROW" as
+# "TWOKILLEDTHUGZBY ARROW" — no space around "KILLED", one preserved
+# before "ARROW" since that boundary is white-to-white. \s+ silently failed
+# to match these even though every word in them reads correctly; \s*
+# matches whether or not tesseract happened to preserve the gap, with no
+# regression on lines that do have it (see tests/fixtures/feed_kill/).
 _FEED_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("feed_first_blood", re.compile(r"(?P<killer>.+?)\s+DREW FIRST BLOOD FROM\s+(?P<victim>.+)", re.IGNORECASE)),
+    ("feed_first_blood", re.compile(r"(?P<killer>.+?)\s*DREW FIRST BLOOD FROM\s*(?P<victim>.+)", re.IGNORECASE)),
     # "X KILLED Y BY Z" (2026-09-10) — every kill, not just the first. The
     # trailing "BY <method>" is optional (a non-capturing group with method
     # inside it) so a line that's missing it — a genuinely method-less kill,
     # or OCR clipping the tail — still matches with method=None rather than
     # not matching at all.
-    ("feed_kill", re.compile(r"(?P<killer>.+?)\s+KILLED\s+(?P<victim>.+?)(?:\s+BY\s+(?P<method>.+))?$", re.IGNORECASE)),
+    ("feed_kill", re.compile(r"(?P<killer>.+?)\s*KILLED\s*(?P<victim>.+?)(?:\s*BY\s*(?P<method>.+))?$", re.IGNORECASE)),
 ]
 
 # How many recent (kind, matched-line) pairs _poll_damage_feed_worker
@@ -108,6 +118,22 @@ _BONUS_CARD_TIMING_BUFFER_SECONDS = 5
 # is a defensive margin, not a measured value — tighten or drop it if a
 # live match confirms the switch is already effectively instant.
 _POV_SWITCH_SETTLE_SECONDS = 0.3
+
+# Ceiling on the main loop's own iteration cadence, independent of
+# screen_poll_interval_seconds (2026-09-10 fix, found live). Kill-feed
+# banners (feed_first_blood, feed_kill — see _poll_damage_feed) are
+# transient: visible for only a few seconds, then gone, with no way for a
+# later poll to retroactively catch one that's already faded. First blood
+# in particular is a one-time event — it gets exactly one chance. At the
+# previous cadence (capped at screen_poll_interval_seconds, 12s by
+# default), a real first blood was missed entirely: the banner had already
+# faded by the next iteration. Every other per-iteration check is either
+# already independently time-gated on its own interval (director points —
+# see self._last_points_sample_time) or a cheap pixel/template comparison
+# that was already being run at whatever cadence the loop happened to hit
+# (_poll_player_bar, _match_has_ended, card-fire timing), so iterating more
+# often costs little beyond an extra screenshot or two per second.
+_MAIN_LOOP_MAX_SLEEP_SECONDS = 3
 
 # Zone map sample points and per-zone drop coordinates for the legacy per-zone
 # selection path (_attempt_zone_close_legacy() / _attempt_zone_close_bypass() /
@@ -472,14 +498,19 @@ class MatchRunner:
                 elapsed = time.monotonic() - start_time
                 self._maybe_fire_favorite_reward(elapsed, card_schedule)
 
-                # Sleep until the next card trigger, but no longer than poll_interval
+                # Sleep until the next card trigger, but no longer than
+                # poll_interval, and never longer than _MAIN_LOOP_MAX_SLEEP_SECONDS
+                # regardless — see that constant's own comment for why
+                # (screen_poll_interval_seconds alone was too coarse to
+                # reliably catch a transient kill-feed banner).
                 now = time.monotonic()
                 now_elapsed = now - start_time
                 pending_times = [
                     e.trigger_seconds - now_elapsed
                     for e in card_schedule if not e.done
                 ]
-                sleep_time = min(poll_interval, min(pending_times)) if pending_times else poll_interval
+                loop_cap = min(poll_interval, _MAIN_LOOP_MAX_SLEEP_SECONDS)
+                sleep_time = min(loop_cap, min(pending_times)) if pending_times else loop_cap
                 self._stop.wait(max(0.1, sleep_time))
         finally:
             if recorder is not None:
@@ -841,7 +872,8 @@ class MatchRunner:
             from game.ocr import ocr_feed_text
             from game.name_snap import find_winning_slot
 
-            text = ocr_feed_text(take_screenshot(), _CROP_REGION)
+            screenshot = take_screenshot()
+            text = ocr_feed_text(screenshot, _CROP_REGION)
             if not text:
                 return
             slot_map = {str(i): name for i, name in enumerate(self._player_names) if name}
@@ -871,10 +903,36 @@ class MatchRunner:
                     self._emit(kind, **fields)
                     if kind == "feed_first_blood":
                         self._maybe_queue_first_blood_reward(fields.get("killer_slot"))
+                    self._save_feed_debug_images(screenshot, kind)
         except Exception as e:
             logger.debug("Damage feed poll failed: %s", e)
         finally:
             self._feed_poll_busy = False
+
+    def _save_feed_debug_images(self, screenshot, kind: str) -> None:
+        """Saves the raw-color feed crop (plus the processed image OCR
+        actually used) to screenshots/errors/ whenever a feed pattern
+        matches (2026-09-10, added specifically to chase the still-open
+        colored-name OCR gap — see ocr_feed_text()'s "Known remaining gap"
+        docstring note). Player names in this feed render orange/red, not
+        white, and the current min-channel preprocessing can't separate
+        orange/red text from a colored background (both have a low blue
+        channel) — action words parse fine, names come back garbage. No
+        amount of further guessing at a color threshold is worth it without
+        real pixel samples of the name text; this gives the next live
+        first-blood or kill line a saved raw crop to actually inspect.
+        Own try/except — a debug-save failure must never break event
+        emission or the first-blood reward queue that runs right before
+        this in the caller.
+        """
+        try:
+            import datetime
+            from game.ocr import save_feed_debug_images
+            from game.video_recorder import _CROP_REGION
+            ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+            save_feed_debug_images(screenshot, _CROP_REGION, "screenshots/errors", f"{ts}_{kind}")
+        except Exception as e:
+            logger.debug("Feed debug image save failed: %s", e)
 
     def _maybe_queue_first_blood_reward(self, killer_slot: Optional[str]) -> None:
         """Called from _poll_damage_feed_worker() (its own background
@@ -1038,8 +1096,8 @@ class MatchRunner:
 
     def try_queue_favorite_reward(self, player_index: int) -> bool:
         """Reserves the Crowd Favorite reward for player_index, if — and
-        only if — nothing is already pending, player_index names a real,
-        currently-alive player in this match's roster, and at least one
+        only if — nothing is already pending, player_index is a real,
+        currently-alive card index in this match's roster, and at least one
         'favorite_player' card remains unplayed in the deck. Only one
         redemption is ever allowed pending at a time, by explicit design
         choice — unlike first blood (a true one-time event), a viewer could
@@ -1047,6 +1105,15 @@ class MatchRunner:
         remain, but a second redemption while one is already queued is
         rejected here rather than queued behind it; the caller (Twitch bot)
         refunds on a False return.
+
+        Deliberately does NOT require self._player_names[player_index] to be
+        non-empty (2026-09-10 fix, found in review) — unlike first blood,
+        this flow never matches a name at all; the viewer names the slot
+        directly via /pov-style digit input, so a real, alive player whose
+        nameplate simply failed to OCR at match start must not be rejected
+        just because their name specifically didn't resolve. self._slot_name()
+        already falls back to "slot N" for logging/TTS when the name is
+        missing, so nothing downstream needs it either.
 
         Called from the Twitch bot's event loop thread (bot/twitch_bot.py)
         — a different thread from this class's own match thread. Plain
@@ -1064,9 +1131,7 @@ class MatchRunner:
             return False
         if self._favorite_reward_target is not None:
             return False
-        if not (0 <= player_index < len(self._player_names) and self._player_names[player_index]):
-            return False
-        if not (player_index < len(self._player_alive) and self._player_alive[player_index]):
+        if not (0 <= player_index < len(self._player_alive) and self._player_alive[player_index]):
             return False
         if self._next_available_deck_pos(self._positions_for_card_type("favorite_player")) is None:
             return False
