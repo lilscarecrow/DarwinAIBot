@@ -94,6 +94,41 @@ def test_rejects_once_all_favorite_player_copies_are_already_played():
     assert runner.try_queue_favorite_reward(1) is False
 
 
+# ---- _past_last_scheduled_card gating (2026-09-10) --------------------------
+#
+# The schedule always ends with a zone_close, which has no verification at
+# all (see CLAUDE.md's Zone Logic section) — if the match is already down to
+# one zone by the time it fires, the game silently rejects it, which is fine
+# only because nothing else is scheduled afterward. Crowd Favorite isn't tied
+# to the schedule the way zone_close is, so it needs its own check to avoid
+# firing well after the last card, right when the match is likely down to
+# its final zone/players and a POV-switch-then-drag is least predictable.
+
+def test_accepts_when_no_schedule_has_been_set_yet():
+    """An empty self._card_schedule (before run() builds one, or any test
+    that doesn't care about this) must not be treated as 'exhausted' — that
+    would reject every existing test above that doesn't set it."""
+    runner = make_runner()
+    assert runner._card_schedule == []
+    assert runner.try_queue_favorite_reward(1) is True
+
+
+def test_accepts_while_the_schedule_still_has_pending_cards():
+    runner = make_runner()
+    runner._card_schedule = make_schedule(200, 400)
+    assert runner.try_queue_favorite_reward(1) is True
+
+
+def test_rejects_once_the_card_schedule_is_fully_done():
+    runner = make_runner()
+    schedule = make_schedule(200, 400)
+    for e in schedule:
+        e.done = True
+    runner._card_schedule = schedule
+    assert runner.try_queue_favorite_reward(1) is False
+    assert runner._favorite_reward_target is None
+
+
 # ---- _maybe_fire_favorite_reward ---------------------------------------------
 
 def test_noop_when_nothing_is_queued():
@@ -109,6 +144,22 @@ def test_cancels_if_the_target_died_before_the_reward_could_be_given():
     runner._player_alive[1] = False
     with patch.object(runner, "_give_favorite_reward") as give:
         runner._maybe_fire_favorite_reward(elapsed=100.0, card_schedule=make_schedule(200))
+    give.assert_not_called()
+    assert runner._favorite_reward_target is None  # released, not stuck
+
+
+def test_cancels_if_the_schedule_is_already_exhausted_before_it_could_fire():
+    """Covers being queued just before the last scheduled card fired and
+    still pending once it has — self._card_schedule (not the card_schedule
+    parameter) is what _past_last_scheduled_card() actually reads, since in
+    real operation run() passes the exact same list to both."""
+    runner = make_runner()
+    runner._favorite_reward_target = 1
+    schedule = make_schedule(200)
+    schedule[0].done = True
+    runner._card_schedule = schedule
+    with patch.object(runner, "_give_favorite_reward") as give:
+        runner._maybe_fire_favorite_reward(elapsed=250.0, card_schedule=schedule)
     give.assert_not_called()
     assert runner._favorite_reward_target is None  # released, not stuck
 

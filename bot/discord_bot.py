@@ -491,9 +491,23 @@ class DirectorCog(commands.Cog):
         Returns the server's response body (draft_id/game_index/ocr_error, plus
         placements when OCR succeeded — see game/ingest.py's docstring) so the
         caller can resolve the "who wins" Twitch prediction against it. None
-        when there's no screenshot to upload or the upload failed.
+        when there's no screenshot to upload, tournament mode is on (see
+        below), or the upload failed.
+
+        **Skipped entirely under tournament_mode (2026-09-10):** tournament
+        matches aren't counted as scrims, so their results shouldn't land on
+        the darwinstalker ladder at all — not even as an unpublished draft
+        game. This only gates the ladder upload; _mirror_results() (the
+        Discord results-channel post) runs at both call sites regardless,
+        exactly as before. A caller still gets a clean None back (same as
+        the "no screenshot" case), so _resolve_prediction() already handles
+        it the same way it handles a genuine upload failure — no guess, no
+        crash, prediction just gets canceled/refunded for lack of placements.
         """
         if not results_text.endswith(".png"):
+            return None
+        if self.bot.config.get("tournament_mode", False):
+            logger.info("darwinstalker ingest: skipped (tournament_mode) — not counted as a scrim")
             return None
         loop = asyncio.get_running_loop()
         try:
@@ -1207,20 +1221,29 @@ class DirectorCog(commands.Cog):
             if obs_control.is_enabled():
                 embed.add_field(name="Twitch Stream", value=stream_status_text, inline=False)
 
-            ping_ch = self.bot.get_channel(_LOBBY_PING_CHANNEL_ID)
-            if ping_ch is None:
-                try:
-                    ping_ch = await self.bot.fetch_channel(_LOBBY_PING_CHANNEL_ID)
-                except Exception as e:
-                    logger.warning("Could not reach lobby ping channel %d: %s", _LOBBY_PING_CHANNEL_ID, e)
-                    ping_ch = None
-            if ping_ch is not None:
-                await ping_ch.send(content=ping_content, embed=embed)
+            if tournament_mode:
+                # Tournament matches skip the public lobby-ping channel entirely —
+                # the full details embed (lobby code included) goes straight back
+                # to whoever ran /custom instead, the same way it worked before
+                # the 2026-09-07 change routed it to _LOBBY_PING_CHANNEL_ID. No
+                # role ping either: a tournament's participant list is the
+                # organizer's to manage directly, not a public signup queue.
+                await interaction.followup.send(embed=embed)
+            else:
+                ping_ch = self.bot.get_channel(_LOBBY_PING_CHANNEL_ID)
+                if ping_ch is None:
+                    try:
+                        ping_ch = await self.bot.fetch_channel(_LOBBY_PING_CHANNEL_ID)
+                    except Exception as e:
+                        logger.warning("Could not reach lobby ping channel %d: %s", _LOBBY_PING_CHANNEL_ID, e)
+                        ping_ch = None
+                if ping_ch is not None:
+                    await ping_ch.send(content=ping_content, embed=embed)
 
-            await interaction.followup.send(embed=self._ok(
-                "Custom Match Ready",
-                "Private lobby created. Run `/start` to begin the match.",
-            ))
+                await interaction.followup.send(embed=self._ok(
+                    "Custom Match Ready",
+                    "Private lobby created. Run `/start` to begin the match.",
+                ))
 
             # Anti-cheat: cover the minimap as soon as the lobby exists, not just once
             # the match itself starts — the minimap is potentially visible from here on,
@@ -2278,6 +2301,9 @@ class ScrimCog(commands.Cog):
         # timer below), and _ordered_reactors() falls back to appending anyone
         # missing from this list in _reactors()'s own order.
         self._signup_order: list[int] = []
+        # Serializes _ensure_region_message()'s check-then-create sequence (2026-09-10
+        # fix, found live) — see that method's docstring for the race it closes.
+        self._region_message_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Startup — ensure a static signup message exists
@@ -2361,46 +2387,65 @@ class ScrimCog(commands.Cog):
         """Post (or verify) the live region-breakdown message right below the
         signup message. No-op if scrim_signup_channel_id isn't configured, or if
         neither region_role_na nor region_role_eu exists in the guild — same
-        "nothing to show" case _region_table_lines() already covers."""
-        ch_id = self._cfg("scrim_signup_channel_id")
-        if not ch_id:
-            return
+        "nothing to show" case _region_table_lines() already covers.
 
-        ch = self.bot.get_channel(int(ch_id))
-        if ch is None:
-            try:
-                ch = await asyncio.wait_for(
-                    self.bot.fetch_channel(int(ch_id)), timeout=_DISCORD_API_TIMEOUT_SECONDS
-                )
-            except Exception as e:
-                logger.warning("ScrimCog: could not fetch signup channel for region message: %s", e)
+        The whole check-then-create body is serialized behind
+        self._region_message_lock (2026-09-10 fix, found live): a reset
+        (_delete_and_repost_signup_message()) deletes the old region message
+        and reposts a fresh signup message BEFORE calling this to repost the
+        region message too — and a viewer reacting to that brand-new signup
+        message in the gap between those two steps fires on_raw_reaction_add,
+        which calls _update_region_message(), which (seeing the same
+        now-stale scrim_region_message_id the reset hasn't cleared yet) falls
+        back to calling this method too. Without a lock, both calls see
+        "existing_id doesn't resolve" at the same time and both post a brand
+        new message — one gets tracked (whichever's _save_message_id() runs
+        last), the other is a permanent orphan that no future reset ever
+        finds or cleans up, since nothing points to it anymore. With the
+        lock, whichever call gets there first finishes its own post-and-save
+        before the second one's existing_id check runs, so the second call
+        sees the freshly-saved id and returns without posting anything.
+        """
+        async with self._region_message_lock:
+            ch_id = self._cfg("scrim_signup_channel_id")
+            if not ch_id:
                 return
 
-        existing_id = self._region_message_id()
-        if existing_id:
+            ch = self.bot.get_channel(int(ch_id))
+            if ch is None:
+                try:
+                    ch = await asyncio.wait_for(
+                        self.bot.fetch_channel(int(ch_id)), timeout=_DISCORD_API_TIMEOUT_SECONDS
+                    )
+                except Exception as e:
+                    logger.warning("ScrimCog: could not fetch signup channel for region message: %s", e)
+                    return
+
+            existing_id = self._region_message_id()
+            if existing_id:
+                try:
+                    await asyncio.wait_for(ch.fetch_message(existing_id), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+                    return  # still exists — on_raw_reaction_add/remove keep its content fresh
+                except discord.NotFound:
+                    logger.warning("ScrimCog: region message %d was deleted — posting a new one", existing_id)
+                except Exception as e:
+                    logger.warning("ScrimCog: could not verify region message: %s", e)
+                    return
+
+            signup_message = await self._get_signup_message()
+            members = await self._reactors(signup_message) if signup_message else []
+            embed = self._region_breakdown_embed(ch.guild, members)
+            if embed is None:
+                return  # neither region role exists in this guild yet
+
             try:
-                await asyncio.wait_for(ch.fetch_message(existing_id), timeout=_DISCORD_API_TIMEOUT_SECONDS)
-                return  # still exists — on_raw_reaction_add/remove keep its content fresh
-            except discord.NotFound:
-                logger.warning("ScrimCog: region message %d was deleted — posting a new one", existing_id)
+                msg = await asyncio.wait_for(ch.send(embed=embed), timeout=_DISCORD_API_TIMEOUT_SECONDS)
             except Exception as e:
-                logger.warning("ScrimCog: could not verify region message: %s", e)
+                logger.warning("ScrimCog: could not post region breakdown message: %s", e)
                 return
+            logger.info("ScrimCog: posted new region breakdown message %d in channel %s", msg.id, ch_id)
 
-        signup_message = await self._get_signup_message()
-        members = await self._reactors(signup_message) if signup_message else []
-        embed = self._region_breakdown_embed(ch.guild, members)
-        if embed is None:
-            return  # neither region role exists in this guild yet
-
-        try:
-            msg = await asyncio.wait_for(ch.send(embed=embed), timeout=_DISCORD_API_TIMEOUT_SECONDS)
-        except Exception as e:
-            logger.warning("ScrimCog: could not post region breakdown message: %s", e)
-            return
-        logger.info("ScrimCog: posted new region breakdown message %d in channel %s", msg.id, ch_id)
-
-        self._save_message_id("scrim_region_message_id", msg.id)
+            self._save_message_id("scrim_region_message_id", msg.id)
 
     async def _update_region_message(self, guild: discord.Guild, members: list[discord.Member]) -> None:
         """Refresh the live region-breakdown message's content — called after every

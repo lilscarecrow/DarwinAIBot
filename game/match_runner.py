@@ -281,6 +281,11 @@ class MatchRunner:
         # when nothing is pending; the main loop's own
         # _maybe_fire_favorite_reward() is what actually consumes this.
         self._favorite_reward_target: Optional[int] = None
+        # Populated by run() once the match's card schedule is built (see
+        # _past_last_scheduled_card()) — stays [] beforehand/in tests that
+        # never call run(), which _past_last_scheduled_card() treats as "not
+        # past anything" rather than "everything's done".
+        self._card_schedule: list["CardEvent"] = []
         # Set by _log_slot_map_snapshot() (2026-09-09) once every card it detected got
         # a usable (non-empty) name — "10/10", "9/9", never a partial read. Written from
         # that method's background thread (see _fire_slot_map_snapshot()); simple
@@ -390,6 +395,7 @@ class MatchRunner:
         self._match_started_at = start_time
 
         card_schedule = self._build_card_schedule(_profile)
+        self._card_schedule = card_schedule
         phrases = self._build_tts_phrases(card_schedule)
         profile_announce = f"Using profile: {_profile['display_name']}"
         phrases.append(profile_announce)
@@ -1094,6 +1100,29 @@ class MatchRunner:
         self._give_reward_card("favorite_player", player_index, deck_pos,
                                 tts_prefix="Crowd favorite", event_label="Crowd Favorite Reward")
 
+    def _past_last_scheduled_card(self) -> bool:
+        """True once every card in self._card_schedule has fired (or if it's
+        simply empty — before run() builds it, or in a test that never sets
+        it — this returns False, not True: "we don't know the schedule yet"
+        is not the same claim as "the schedule is exhausted").
+
+        Crowd Favorite is gated on this (2026-09-10) because of the same
+        limitation zone_close already lives with: the schedule always ends
+        with a zone_close, and that card has no verification at all (see the
+        Zone Logic section in CLAUDE.md) — if the match is already down to
+        one zone by the time it fires, the game silently rejects it with
+        nothing checking or caring, which is fine only because nothing else
+        is scheduled afterward to be thrown off by it. Crowd Favorite isn't
+        tied to the schedule the way zone_close is, so without this check a
+        viewer could still redeem it well after the last card — right when
+        the match is likely down to its final zone/players and a POV-switch-
+        then-drag is at its least predictable. Once the schedule is
+        exhausted, this stops treating "no card is due soon" as "safe to
+        fire" — there's no longer a later card to avoid overlapping, just an
+        end-of-match state nothing here was built to act into.
+        """
+        return bool(self._card_schedule) and all(e.done for e in self._card_schedule)
+
     def try_queue_favorite_reward(self, player_index: int) -> bool:
         """Reserves the Crowd Favorite reward for player_index, if — and
         only if — nothing is already pending, player_index is a real,
@@ -1123,11 +1152,15 @@ class MatchRunner:
         method's check-then-set happens in one call with no await in
         between.
 
-        Rejects immediately if advanced_cards (config) is off — the caller
-        refunds exactly as it would for any other rejection, same as if the
-        deck had no favorite_player cards left.
+        Rejects immediately if advanced_cards (config) is off, or once the
+        match's card schedule is exhausted (_past_last_scheduled_card(),
+        2026-09-10 — see its own docstring) — the caller refunds exactly as
+        it would for any other rejection, same as if the deck had no
+        favorite_player cards left.
         """
         if not self._advanced_cards_enabled:
+            return False
+        if self._past_last_scheduled_card():
             return False
         if self._favorite_reward_target is not None:
             return False
@@ -1149,7 +1182,12 @@ class MatchRunner:
         2. The target hasn't died since being queued — same
            self._player_alive check, already refreshed this same iteration
            by _poll_player_bar(). Cancels outright if so.
-        3. No real scheduled card due within _BONUS_CARD_TIMING_BUFFER_SECONDS
+        3. The card schedule isn't already exhausted
+           (_past_last_scheduled_card(), 2026-09-10) — cancels outright if
+           so, same as the target dying. Covers the case where this was
+           queued just before the last scheduled card fired and is still
+           pending once it has.
+        4. No real scheduled card due within _BONUS_CARD_TIMING_BUFFER_SECONDS
            — the reward's own drag must never overlap a scheduled card's.
 
         Once clear, resolves self._favorite_reward_target to None BEFORE
@@ -1169,6 +1207,13 @@ class MatchRunner:
             logger.info(
                 "Crowd Favorite reward canceled — %s was eliminated before it could be given",
                 self._slot_name(target),
+            )
+            self._favorite_reward_target = None
+            return
+
+        if self._past_last_scheduled_card():
+            logger.info(
+                "Crowd Favorite reward canceled — the card schedule is already exhausted",
             )
             self._favorite_reward_target = None
             return
