@@ -30,11 +30,14 @@ logic needed. See docs/PLAYER_BAR_CALIBRATION.md §8 for the investigation.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 V2_DEFAULTS: dict = {
     "player_cards_center_x": 960.0,     # centre of the real-card block, px (1920x1080)
@@ -200,8 +203,16 @@ def detect_cards(img: np.ndarray, config: Optional[dict] = None, expected: Optio
     # A count that fits with an even/odd offset different from the truth puts
     # windows on card edges and fails; among the ones that fit, the largest is
     # the strip (a smaller n is a subset of it). The lobby's expected count
-    # wins when it fits.
-    n = expected if expected in complete else max(complete)
+    # (the signup reactors) is a LOWER bound, not the truth: a player who
+    # joined after signup is on the strip and not in the roster (found live
+    # 2026-09-10 — 9 reactors, 10 on the bar, and `expected` pinned the read
+    # to 9, dropping the tenth card). So the largest fitting count wins; the
+    # hint only decides when it is at least as large as what fits.
+    n = max(complete)
+    if expected in complete and expected > n:
+        n = expected
+    if expected is not None and expected != n:
+        logger.info("Player bar: %d cards on the strip, roster expected %d — trusting the strip", n, expected)
     out = complete[n]
     for i, c in enumerate(out):
         c.index = i

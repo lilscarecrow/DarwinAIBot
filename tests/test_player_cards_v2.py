@@ -46,10 +46,13 @@ def test_per_poll_alive_matches_detection(name):
     assert v2.cards_alive(img, [c.x for c in cards]) == [c.alive for c in cards]
 
 
-def test_expected_count_breaks_ties_only_when_it_fits():
+def test_expected_count_is_a_lower_bound_the_strip_overrides():
     img = load("vod_3300.png")
     assert len(v2.detect_cards(img, expected=9)) == 9
     assert len(v2.detect_cards(img, expected=10)) == 9, "an expected count that does not fit is ignored"
+    # A signup roster smaller than the strip (a late joiner) never shrinks the read.
+    assert len(v2.detect_cards(img, expected=8)) == 9, "the strip wins over a smaller roster"
+    assert len(v2.detect_cards(img, expected=None)) == 9
 
 
 def test_dead_cards_carry_the_red_x_and_alive_ones_do_not():

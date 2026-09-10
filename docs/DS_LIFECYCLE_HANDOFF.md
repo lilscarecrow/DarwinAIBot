@@ -152,6 +152,15 @@ new row while the draft has no game data — so an older bot without this
 change no longer grows the card either; it just keeps sending misspelled
 event names, which the LIVE card re-attributes to the row by the same fold.
 
+**The signup roster is a lower bound on the lobby (2026-09-10).** Scarecrow
+saw a 9-reactor lobby that 10 people joined: `detect_cards(expected=
+roster_size)` pinned the read to 9 and dropped the tenth card. The strip now
+wins whenever it fits a larger count than the roster (`expected` only decides
+when it is at least as large as what fits), with an info log when the two
+disagree. Server side the same lobby is handled by the roster rule: the late
+joiner's nameplate read joins the draft when the ladder resolves it, and
+otherwise game 1's scorecard adds them.
+
 An unlinked member's Discord name (in `unlinked[].names`) and their in-game
 display name still live in unrelated namespaces — cross-referencing them
 would be a guess, so the code doesn't try; before game 1, an unlinked
