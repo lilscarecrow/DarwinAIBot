@@ -478,3 +478,69 @@ def test_claim_nudge_uses_configured_site_and_none_when_all_linked():
     ds, t = make(open_result={"draft_id": 14, "created": True, "unlinked": []})
     ds.open_lobby(roster=["d1"])
     assert ds.claim_nudge() is None
+
+
+# ---- draft rows as the snap anchor (2026-09-10, draft 287) --------------------
+
+def test_open_reply_draft_players_anchor_nameplate_snapping():
+    """The scorecard's own rows — not only Discord-linked members — are what a
+    player-bar read snaps to. FrozenNQ/Lou/thugz had no Discord link, so they
+    were never in `lobby`; the server now hands them over as `draft_players`."""
+    reply = {
+        "draft_id": 11, "created": False, "rows": 4, "roster_resolved": 0,
+        "lobby": [{"discord_id": "d1", "player": "kero", "persona": "kero", "names": ["kero"]}],
+        "expected_names": ["kero", "FrozenNQ", "Lou", "thugz", "thugztiago"],
+        "unlinked": [{"discord_id": "d2", "names": ["thugztiago"]}],
+        "draft_players": [
+            {"player": "kero", "player_id": 59, "games": 1, "names": ["kero"]},
+            {"player": "FrozenNQ", "player_id": 355, "games": 1, "names": ["FrozenNQ"]},
+            {"player": "Lou", "player_id": 10351, "games": 1, "names": ["Lou"]},
+            {"player": "thugz", "player_id": 106, "games": 1, "names": ["thugz", "thugztiago"]},
+        ],
+        "skipped_unresolved": ["FrozenNO"],
+    }
+    ds, t = make(open_result=reply)
+    assert ds.open_lobby(roster=["d1", {"id": "d2", "names": ["thugztiago"]}]) == 11
+    assert [p["player"] for p in ds.draft_players] == ["kero", "FrozenNQ", "Lou", "thugz"]
+    assert ds.known_players == {"kero", "FrozenNQ", "Lou", "thugz"}
+    # Exact fold, fuzzy (one glyph), fuzzy (an alias), and a read nobody matches.
+    assert ds.snap_names(["kero", "FrozenNO", "thugztiag", "zzqq"]) == ["kero", "FrozenNQ", "thugz", "zzqq"]
+    # The match-start push sends the snapped names, so the server sees the row's spelling.
+    ds.on_match_start(ds.snap_names(["FrozenNO", "thuaz"]))
+    assert t.calls[-1][1] == ["FrozenNQ", "thugz"]
+    ds.close("quit")
+    assert ds.draft_players == [] and ds.snap_names(["FrozenNO"]) == ["FrozenNO"]
+
+
+def test_results_placements_become_snap_targets_for_the_next_match():
+    """Game 1's scorecard names (the screenshot reply's `placements`) are the
+    roster from then on: the next player-bar read snaps to them even before
+    the next open-draft reply arrives."""
+    shot = {"draft_id": 11, "game_index": 1, "ocr_error": None, "placements": [
+        {"rank": 1, "name": "Remix", "player_id": 89},
+        {"rank": 2, "name": "Phillpeace", "player_id": None},
+        {"rank": 3, "name": "Lou", "player_id": 10351},
+    ]}
+    ds, t = make(open_result={"draft_id": 11, "created": True, "rows": 0, "lobby": [], "expected_names": [], "unlinked": []},
+                 screenshot_result=shot)
+    ds.open_lobby()
+    assert ds.snap_names(["Philipeace"]) == ["Philipeace"], "nothing known yet: verbatim"
+    body = ds.post_results("/tmp/g1.png")
+    assert body["placements"][0]["name"] == "Remix"
+    assert ds.known_players == {"Remix", "Phillpeace", "Lou"}
+    assert ds.snap_names(["Rem1x", "Philipeace", "Tou"]) == ["Remix", "Phillpeace", "Lou"]
+    # A later open-draft reply that lists rows replaces the set (a pruned row stops being a target).
+    t.open_result = {"draft_id": 11, "created": False, "rows": 1, "lobby": [], "expected_names": ["Remix"], "unlinked": [],
+                     "draft_players": [{"player": "Remix", "player_id": 89, "games": 1, "names": ["Remix"]}]}
+    ds.on_match_start(["Rem1x"])
+    assert ds.known_players == {"Remix"}
+
+
+def test_older_server_reply_without_draft_players_still_snaps_from_lobby():
+    reply = {"draft_id": 11, "created": True, "rows": 1, "roster_resolved": 1,
+             "lobby": [{"discord_id": "d1", "player": "Caution", "persona": None, "names": ["Caution", "Robocop"]}],
+             "expected_names": ["Caution", "Robocop"], "unlinked": []}
+    ds, t = make(open_result=reply)
+    ds.open_lobby(roster=["d1"])
+    assert ds.draft_players == []
+    assert ds.snap_names(["Rob0cop"]) == ["Caution"]

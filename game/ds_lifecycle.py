@@ -87,6 +87,16 @@ class DraftLifecycle:
         self._lobby: list[dict] = []
         self._expected_names: list[str] = []
         self._unlinked: list[dict] = []
+        # The draft's own rows as the ladder last reported them: open-draft's
+        # `draft_players` (every row with every handle its identity may
+        # appear as) and the screenshot reply's `placements` (the scorecard
+        # names game N was filed under). This is the anchoring truth the
+        # player-bar OCR snaps to once a results screen has been read — and
+        # the ONLY truth for a player nobody's Discord is linked to, who is
+        # never in `lobby` (2026-09-10, draft 287: the bar read "Tou ——",
+        # "thuaz", "FrozenNO" for the scorecard's "Lou", "thugz", "FrozenNQ"
+        # every match, and the ladder showed 14 rows for a 10-player lobby).
+        self._draft_players: list[dict] = []
         self._snapper = NameSnapper(None)
         # 1-based game the next events belong to: 1 when a draft is first
         # opened, +1 after every results upload, 0 when no lobby is open.
@@ -138,6 +148,55 @@ class DraftLifecycle:
         """Roster members the ladder has no link for: [{discord_id, names}]."""
         return list(self._unlinked)
 
+    @property
+    def draft_players(self) -> list[dict]:
+        """The draft's rows as the ladder last reported them:
+        [{player, player_id, games, names}] (see __init__)."""
+        return list(self._draft_players)
+
+    @property
+    def known_players(self) -> set[str]:
+        """Every name the snapper can resolve a read TO: the lobby's linked
+        members plus the draft's own rows. What a slot's `linked` flag means."""
+        out = {str(m.get("player") or "").strip() for m in self._lobby}
+        out |= {str(m.get("player") or "").strip() for m in self._draft_players}
+        out.discard("")
+        return out
+
+    def _rebuild_snapper(self) -> None:
+        self._snapper = NameSnapper(self._lobby + self._draft_players)
+
+    def _merge_draft_players(self, entries: list[dict]) -> None:
+        """Fold `entries` ({player, names?, player_id?, games?}) into the
+        draft-row snap set, keyed by player name (case-insensitive); names
+        union. Then rebuild the snapper."""
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            player = str(e.get("player") or "").strip()
+            if not player:
+                continue
+            names = [str(n).strip() for n in (e.get("names") or []) if n and str(n).strip()]
+            if player not in names:
+                names.insert(0, player)
+            cur = next((d for d in self._draft_players if d["player"].lower() == player.lower()), None)
+            if cur is None:
+                self._draft_players.append({
+                    "player": player,
+                    "player_id": e.get("player_id"),
+                    "games": e.get("games"),
+                    "names": names,
+                })
+            else:
+                for n in names:
+                    if n not in cur["names"]:
+                        cur["names"].append(n)
+                if e.get("player_id") is not None:
+                    cur["player_id"] = e.get("player_id")
+                if e.get("games") is not None:
+                    cur["games"] = e.get("games")
+        self._rebuild_snapper()
+
     def claim_nudge(self) -> Optional[dict]:
         """What to tell the roster members the ladder cannot place, or None
         when everyone is known: `mentions` (space-joined <@id> pings, ≤10)
@@ -159,8 +218,11 @@ class DraftLifecycle:
         }
 
     def snap_names(self, reads: list[str]) -> list[str]:
-        """Player-bar OCR reads → canonical ladder names where one player
-        matches unambiguously (game/name_snap.py); everything else verbatim."""
+        """Player-bar OCR reads → the ladder's names for this lobby where one
+        player matches unambiguously (game/name_snap.py): the linked members'
+        handles (`lobby`) and the draft's own rows (`draft_players`, fed by
+        every open-draft reply and every results upload); everything else
+        verbatim."""
         try:
             return self._snapper.snap_all(list(reads))
         except Exception as e:
@@ -180,10 +242,22 @@ class DraftLifecycle:
                 self._lobby = [m for m in (result.get("lobby") or []) if isinstance(m, dict)]
                 self._expected_names = [str(n) for n in (result.get("expected_names") or [])]
                 self._unlinked = [u for u in (result.get("unlinked") or []) if isinstance(u, dict)]
-                self._snapper = NameSnapper(self._lobby)
+                self._rebuild_snapper()
                 logger.info(
                     "ds lobby: %d known player(s), %d expected name(s), %d unlinked",
                     len(self._lobby), len(self._expected_names), len(self._unlinked),
+                )
+            if isinstance(result.get("draft_players"), list):
+                # The server's view of the rows REPLACES ours: a row it pruned
+                # (a shell game 1 did not report) must stop being a snap target.
+                self._draft_players = []
+                self._merge_draft_players(result["draft_players"])
+                logger.info("ds draft: %d row(s) on the draft to snap nameplates to", len(self._draft_players))
+            skipped = result.get("skipped_unresolved") or []
+            if skipped:
+                logger.warning(
+                    "ds open-draft: %d nameplate read(s) matched no scorecard row and were NOT added: %s",
+                    len(skipped), ", ".join(str(n) for n in skipped),
                 )
             return int(draft_id)
         return int(result)
@@ -404,6 +478,13 @@ class DraftLifecycle:
         except Exception as e:
             logger.warning("ds post_results: transport raised %s", e)
         self._game_index = (self._game_index or 1) + 1
+        if isinstance(result, dict) and isinstance(result.get("placements"), list):
+            # The scorecard's names are now the roster: the next match's
+            # player-bar reads snap to THESE before anything else.
+            self._merge_draft_players([
+                {"player": p.get("name"), "player_id": p.get("player_id")}
+                for p in result["placements"] if isinstance(p, dict)
+            ])
         return result if isinstance(result, dict) else None
 
     def close(self, reason: str = "session reset") -> bool:
@@ -426,6 +507,7 @@ class DraftLifecycle:
         draft_id, self._draft_id = self._draft_id, None
         self._roster = []
         self._lobby, self._expected_names, self._unlinked = [], [], []
+        self._draft_players = []
         self._snapper = NameSnapper(None)
         self._game_index = 0
         if not self.enabled:

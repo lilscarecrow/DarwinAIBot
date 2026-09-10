@@ -652,7 +652,7 @@ class MatchRunner:
             unlinked_count: Optional[int] = None
             if self._ds is not None:
                 try:
-                    known_players = {str(m.get("player") or "").strip() for m in self._ds.lobby if m.get("player")}
+                    known_players = self._ds.known_players
                 except Exception:
                     known_players = set()
                 try:

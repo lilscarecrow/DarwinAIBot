@@ -87,8 +87,14 @@ exactly one of the lobby's players. The reply carries:
 - `lobby`: each known member, `{discord_id, player, player_id, persona, names}`
   — `names` is everything that player may appear as (canonical, aliases, and
   their Steam persona refreshed at open time = the nameplate).
-- `expected_names`: the flat snap set.
+- `expected_names`: the flat snap set (since 2026-09-10 also every
+  `draft_players[].names`).
 - `unlinked`: `{discord_id, names}` for members the ladder cannot place.
+- `draft_players` (2026-09-10): every row on the draft after this call,
+  `{player, player_id, games, names}` — see "The draft's own rows are the
+  snap anchor" below.
+- `skipped_unresolved` (2026-09-10): sent names the server did not add
+  because the draft already has game data and they matched no row.
 
 `DraftLifecycle` keeps these (`lobby`, `expected_names`, `unlinked`) and
 exposes `snap_names(reads)` — `game/name_snap.py` folds the player-bar OCR the
@@ -123,25 +129,37 @@ but `snap_all()` relaxes, a scrolled/cut-off name, an unrecognizable read
 staying verbatim, the existing shared-fold ambiguity case surviving the fuzzy
 pass too, and confidence-ordering across two competing reads).
 
-**Unlinked players have no ladder identity to correct against, by design.**
-`NameSnapper` is built only from `lobby` (`self._snapper = NameSnapper(self._lobby)`
-in `_take_reply()`) — `unlinked` never feeds it, so a read for an unlinked
-player's slot has no candidate to exact-, substring-, or fuzzy-match against
-and always passes through `snap_all()` unchanged. That's the "just OCR what
-we can" behavior for those slots; there's no automatic way to do better,
-since an unlinked member's Discord name (in `unlinked[].names`) and their
-in-game display name live in unrelated namespaces — cross-referencing them
-would be a guess, not a match, so the code doesn't try. `_log_slot_map_snapshot()`
-(2026-09-09) makes this explicit rather than silent: each slot's `linked` flag
-says whether its name actually resolved to one of `self._ds.lobby`'s known
-players, and the count of `not linked` slots is checked against
-`len(self._ds.unlinked)` as a sanity signal — logged only when they disagree,
-which points at an OCR miss on a linked player (not just an expected unlinked
-one) or a roster that's drifted since `/custom` captured it, rather than
-implying the unlinked count itself is wrong. The actual fix for an unlinked
-player is out-of-band and not per-match: they claim their Steam handle via
-`claim_nudge()`'s prompt, and the *next* open-draft reply then includes them
-in `lobby` with real aliases to match against.
+**The draft's own rows are the snap anchor (2026-09-10).** Found live on
+draft 287: the ladder showed 14 rows for a 10-player lobby. Three players
+(FrozenNQ, Lou, thugz) had no Discord link, so they were never in `lobby`;
+the bar read them as "FrozenNO", "Tou ——", "thuaz", the results screen (the
+server's Gemini OCR) as "FrozenNQ", "Lou", "thugz", and every match-start
+roster push re-added the bar spellings beside the scorecard's. The server now
+answers open-draft with `draft_players` — every row the draft holds, each
+with every handle its identity may appear as — and the results upload already
+answers with `placements` (the scorecard names game N was filed under).
+`DraftLifecycle` folds both into `_draft_players` (`_merge_draft_players()`;
+an open-draft reply's list REPLACES the set, so a row the server pruned stops
+being a target) and builds `NameSnapper` from `lobby + draft_players`
+(`_rebuild_snapper()`), so the next bar read snaps to the scorecard's
+spelling and the match-start push sends the row's name. `known_players`
+(the union's names) is what `_log_slot_map_snapshot()`'s per-slot `linked`
+flag now means. The reply's `skipped_unresolved` (names the server refused
+to add because the draft already has game data) is logged as a warning.
+Server side, a read that glyph-folds equal to exactly one existing row is
+that row (never a second one), and an unresolved read is only added as a
+new row while the draft has no game data — so an older bot without this
+change no longer grows the card either; it just keeps sending misspelled
+event names, which the LIVE card re-attributes to the row by the same fold.
+
+An unlinked member's Discord name (in `unlinked[].names`) and their in-game
+display name still live in unrelated namespaces — cross-referencing them
+would be a guess, so the code doesn't try; before game 1, an unlinked
+player's slot passes through verbatim. The count of `not linked` slots is
+checked against `len(self._ds.unlinked)` as a sanity signal — logged only
+when they disagree. The out-of-band fix stays: they claim their Steam handle
+via `claim_nudge()`'s prompt, and the *next* open-draft reply then includes
+them in `lobby` with real aliases to match against.
 
 ### POST /api/ingest/events (live match events)
 
