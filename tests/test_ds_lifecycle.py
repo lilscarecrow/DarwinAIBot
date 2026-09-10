@@ -9,12 +9,13 @@ from game.ds_lifecycle import DraftLifecycle
 
 
 class FakeTransport:
-    def __init__(self, open_result=11, close_result=True):
+    def __init__(self, open_result=11, close_result=True, screenshot_result=None):
         self.calls = []
         self.rosters = []
         self.slugs = []
         self.open_result = open_result
         self.close_result = close_result
+        self.screenshot_result = screenshot_result
 
     def open_set_draft(self, names, base_url, token, platform="pc", twitch_channel=None, draft_id=None,
                        roster=None, tournament_slug=None):
@@ -38,6 +39,7 @@ class FakeTransport:
 
     def post_results_screenshot(self, path, base_url, token, platform="pc", roster=None, draft_id=None):
         self.calls.append(("shot", path, platform, roster, draft_id))
+        return self.screenshot_result() if callable(self.screenshot_result) else self.screenshot_result
 
 
 CFG = {
@@ -203,6 +205,25 @@ def test_post_results_without_draft_sends_none_id():
     ds, t = make()
     ds.post_results("/tmp/r.png")
     assert t.calls == [("shot", "/tmp/r.png", "pc", None, None)]
+
+
+def test_post_results_returns_the_transport_body_for_prediction_resolution():
+    body = {"draft_id": 11, "game_index": 1, "ocr_error": None, "placements": [{"rank": 1, "name": "pefiss"}]}
+    ds, t = make(screenshot_result=body)
+    ds.open_lobby()
+    assert ds.post_results("/tmp/r.png") == body
+
+
+def test_post_results_returns_none_when_transport_returns_nothing():
+    ds, t = make()  # default screenshot_result=None
+    ds.open_lobby()
+    assert ds.post_results("/tmp/r.png") is None
+
+
+def test_post_results_returns_none_when_disabled():
+    ds, t = make({"ds_ingest_twitch_channel": "x"})
+    assert ds.post_results("/tmp/r.png") is None
+    assert t.calls == []
 
 
 def test_close_sends_reason_and_clears_id():

@@ -20,6 +20,7 @@ resolution works and where it refuses to guess.
 from __future__ import annotations
 
 import difflib
+from typing import Optional
 
 _FOLD = {"1": "l", "i": "l", "0": "o", "y": "v", "5": "s", "8": "b", "q": "g"}
 
@@ -177,3 +178,34 @@ class NameSnapper:
             taken.add(player)
             unresolved.remove(i)
         return out
+
+
+def find_winning_slot(winner_name: str, slot_map: dict[str, str]) -> Optional[str]:
+    """The slot number in `slot_map` (a {"/pov" digit: name} map, e.g.
+    MatchRunner.slot_map()) that `winner_name` — a results-screen OCR read —
+    most likely belongs to, or None if it doesn't clear the bar.
+
+    Same fold + _similarity() + confidence-floor/ambiguity-margin caution as
+    snap_all()'s fuzzy pass, just resolving one name against a small, already
+    fully-resolved map instead of a whole bar against ladder aliases — there's
+    no "exact fold" stage here since slot_map's names are already resolved
+    (ladder-linked or raw OCR, per NameSnapper's docstring), so this only
+    needs the fuzzy comparison. Used to resolve the "who wins" Twitch
+    prediction: never guesses, so a bad or unmatched read means the caller
+    should cancel/refund the prediction rather than resolve it wrong.
+    """
+    f = ocr_fold(winner_name)
+    if len(f) < NameSnapper.MIN_FOLD or not slot_map:
+        return None
+    scored = sorted(
+        ((_similarity(f, ocr_fold(name)), slot) for slot, name in slot_map.items() if name),
+        key=lambda t: -t[0],
+    )
+    if not scored:
+        return None
+    top_score, top_slot = scored[0]
+    if top_score < _MIN_FUZZY_CONFIDENCE:
+        return None
+    if len(scored) > 1 and scored[1][0] >= top_score - _AMBIGUITY_MARGIN:
+        return None  # two slots too close to call — refuse rather than guess
+    return top_slot

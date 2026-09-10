@@ -377,16 +377,24 @@ class DraftLifecycle:
             name="DsOnMatchStart",
         ).start()
 
-    def post_results(self, png_path: str, roster: Optional[list[str]] = None) -> None:
-        """Match over: upload the results screenshot into the open draft."""
+    def post_results(self, png_path: str, roster: Optional[list[str]] = None) -> Optional[dict]:
+        """Match over: upload the results screenshot into the open draft.
+
+        Returns the server's response body (see ingest.post_results_screenshot's
+        docstring — draft_id/game_index/ocr_error, plus placements when OCR
+        succeeded) so the caller can resolve a "who wins" Twitch prediction
+        against it, or None when ingest is disabled/failed/there's nothing to
+        report. Still fire-and-forget in spirit — a None here is never retried.
+        """
         if not self.enabled:
             logger.debug("ds ingest disabled (no ds_ingest_token) — not uploading results")
-            return
+            return None
         # The game's last events (match_end, eliminations) must be on the draft
         # before the results move the counter to the next game.
         self._relay.flush(2.0)
+        result = None
         try:
-            self._transport.post_results_screenshot(
+            result = self._transport.post_results_screenshot(
                 png_path,
                 platform=self._platform(),
                 roster=_roster_ids(roster) if roster else roster,
@@ -396,6 +404,7 @@ class DraftLifecycle:
         except Exception as e:
             logger.warning("ds post_results: transport raised %s", e)
         self._game_index = (self._game_index or 1) + 1
+        return result if isinstance(result, dict) else None
 
     def close(self, reason: str = "session reset") -> bool:
         """Session over (/quit, abort, idle timeout, error reset): close the draft.

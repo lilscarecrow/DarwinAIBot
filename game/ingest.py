@@ -35,7 +35,7 @@ def post_results_screenshot(
     platform: str = "pc",
     roster: Optional[list[str]] = None,
     draft_id: Optional[int] = None,
-) -> None:
+) -> Optional[dict]:
     """
     POST the raw end-of-match results screenshot to /api/ingest/screenshot.
 
@@ -53,6 +53,13 @@ def post_results_screenshot(
     draft_id: optional draft id from a prior open_set_draft() call. When
     supplied, sent as a form field so the server targets that existing draft
     instead of creating a new one. Omitted entirely when None.
+
+    Returns the server's parsed JSON body on a 200 (draft_id, game_index,
+    ocr_error, and — when ocr_error is None — placements: [{rank, name,
+    player_id}, ...] in finish order, used to resolve the "who wins" Twitch
+    prediction), or None on any failure. Still fire-and-forget in spirit: a
+    None return is never retried, just means the caller (DraftLifecycle.post_results)
+    has nothing to resolve the prediction with this game.
     """
     url = f"{base_url.rstrip('/')}/api/ingest/screenshot"
     headers = {"Authorization": f"Bearer {token}"}
@@ -73,11 +80,13 @@ def post_results_screenshot(
                 "darwinstalker ingest ok: draft_id=%s game_index=%s ocr_error=%s",
                 body.get("draft_id"), body.get("game_index"), body.get("ocr_error"),
             )
+            return body if isinstance(body, dict) else None
         else:
             logger.warning("darwinstalker ingest failed: HTTP %d — %s", resp.status_code, resp.text[:300])
+            return None
     except Exception as e:
         logger.warning("darwinstalker ingest request failed: %s", e)
-        return
+        return None
 
 
 def roster_entries(roster: Optional[list]) -> list:

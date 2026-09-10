@@ -1,4 +1,4 @@
-from game.name_snap import NameSnapper, ocr_fold
+from game.name_snap import NameSnapper, find_winning_slot, ocr_fold
 
 
 LOBBY = [
@@ -94,3 +94,35 @@ def test_snap_all_fuzzy_pass_combines_with_exact_and_unknown_reads():
     s = NameSnapper(LOBBY)
     out = s.snap_all(["Robocoo", "‘saibu", "exanderTheGrea", "zzqqxx99", "shifty"])
     assert out == ["Caution", "Saibu", "AlexanderTheGreat", "zzqqxx99", "shifty"]
+
+
+# ---- find_winning_slot() — results-screen winner -> captured slot (2026-09-09) ----
+
+SLOT_MAP = {"1": "pefiss", "2": "Drowsy", "3": "Remix", "4": "nekrosu", "5": "S1lent", "6": "nick"}
+
+
+def test_find_winning_slot_exact_match():
+    assert find_winning_slot("pefiss", SLOT_MAP) == "1"
+
+
+def test_find_winning_slot_near_miss_ocr_read():
+    assert find_winning_slot("Drowsv", SLOT_MAP) == "2"  # y/v fold confusion
+
+
+def test_find_winning_slot_refuses_unknown_name():
+    assert find_winning_slot("totallyunknown", SLOT_MAP) is None
+
+
+def test_find_winning_slot_refuses_empty_or_missing():
+    assert find_winning_slot("", SLOT_MAP) is None
+    assert find_winning_slot(None, SLOT_MAP) is None
+
+
+def test_find_winning_slot_empty_map_refuses():
+    assert find_winning_slot("pefiss", {}) is None
+
+
+def test_find_winning_slot_refuses_a_genuine_tie():
+    # Two slots close enough in name that a garbled read can't be called cleanly.
+    tied = {"1": "abcde", "2": "abcdf"}
+    assert find_winning_slot("abcd_", tied) is None

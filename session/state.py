@@ -32,15 +32,23 @@ class SessionState:
         self._next_action: str = "None"
         self._match_start_time: float | None = None
         self._state_entered_at: float = time.monotonic()
-        # True from the moment a MatchRunner is constructed until its forced
-        # default-POV-1 press completes (see MatchRunner.__init__/run()) —
-        # narrower than is_command_valid("pov")'s state check, which stays
-        # True for the whole match. Exists so a manual /pov, !pov, or the
-        # channel-points redemption can't enlarge a different card's band
-        # mid-startup and corrupt the slot-map OCR snapshot taken in that
-        # same window (found live 2026-09-09). _reset_session()'s universal
-        # reset-to-IDLE path also clears it, so an aborted match can never
-        # leave POV stuck locked for the rest of the session.
+        # True from the moment /custom successfully creates a lobby until the
+        # match's forced default-POV-1 press completes (see DirectorCog.custom's
+        # success branch / MatchRunner.run()) — narrower than
+        # is_command_valid("pov")'s state check, which stays True for the whole
+        # lobby-through-match window. Exists so a manual /pov, !pov, or the
+        # channel-points redemption can't enlarge a different card's band and
+        # corrupt the slot-map OCR snapshot taken at match start — locked at
+        # lobby creation, not just at /start, because the same player-bar UI is
+        # already live in the lobby, so a POV switch there persists into match
+        # start (found live 2026-09-09: a lobby !pov got through when this only
+        # locked at MatchRunner construction). Cleared on whichever of three
+        # paths actually ends the lobby: MatchRunner.run()'s forced-POV-1 press
+        # (the match started normally), _reset_session()'s universal
+        # reset-to-IDLE (the match/lobby was aborted), or /menu's success branch
+        # (the lobby was abandoned without ever starting a match — the one
+        # IN_CUSTOM exit that doesn't go through either of the other two). So
+        # POV can never end up stuck refusing for the rest of the session.
         self._pov_locked: bool = False
 
     @property
