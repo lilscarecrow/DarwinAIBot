@@ -124,6 +124,32 @@ def stop_stream() -> bool:
             return False
 
 
+def set_source_text(source_name: str, text: str) -> bool:
+    """
+    Best-effort: set a text source's content (a "Text (GDI+)"/"Text (FreeType 2)"
+    source in OBS — the source itself, its font/color/position, is set up manually
+    in OBS; the bot only ever pushes new text into it). `overlay=True` merges just
+    the `text` field onto the source's existing settings rather than resetting
+    everything else about it. No-ops if obs_stream_enabled is false.
+
+    Returns True on success. Never raises — see start_stream() for the rationale.
+    """
+    if not _enabled:
+        return False
+    with _lock:
+        try:
+            client = _connect()
+            try:
+                client.set_input_settings(source_name, {"text": text}, True)
+                logger.info("OBS: set '%s' text to %r", source_name, text)
+                return True
+            finally:
+                client.disconnect()
+        except Exception as e:
+            logger.warning("OBS: could not set '%s' text: %s", source_name, e)
+            return False
+
+
 def set_source_visible(source_name: str, visible: bool) -> bool:
     """
     Best-effort: show/hide a source by name, in whichever scene is currently the

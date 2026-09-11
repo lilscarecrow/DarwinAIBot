@@ -660,6 +660,30 @@ class DirectorCog(commands.Cog):
         length = int(self.bot.config.get("twitch_ad_break_seconds", 180))
         asyncio.ensure_future(self.bot.twitch_bot.start_ad_break(length))
 
+    async def _clear_game_number_banner(self):
+        """Blank the OBS "Game N" text banner at match end (2026-09-11).
+
+        Every game gets its own /custom (a fresh lobby, not a reused one
+        across a whole set — see MatchRunner._update_game_number_banner()'s
+        call site for where the number gets set again), so once a match
+        ends there is nothing left to justify the last game's number
+        staying up while the bot sits at the main menu awaiting the next
+        /custom. Best-effort, same as every other OBS call in this class:
+        no-op if obs_stream_enabled is false. Fired from both match-end call
+        sites (the normal /start completion and the auto-start watcher),
+        right alongside the ad break — same "as early as possible" reasoning
+        doesn't really apply here (nothing downstream races this), it's just
+        the natural place match-end cleanup already lives.
+        """
+        from game import obs_control
+        if not obs_control.is_enabled():
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, obs_control.set_source_text,
+            self.bot.config.get("obs_game_number_source", "Game Number"), "",
+        )
+
     async def _delayed_stream_start(self):
         """Tournament mode: start the OBS stream _TOURNAMENT_STREAM_DELAY_SECONDS after
         /custom creates the lobby, instead of instantly. Fire-and-forget — scheduled via
@@ -1256,6 +1280,18 @@ class DirectorCog(commands.Cog):
                     self.bot.config.get("obs_minimap_cover_source", "Map Cover"), True,
                 )
 
+            # Game-number banner: _open_ds_draft() above already seeded self._ds's
+            # game_index (either from the open-draft reply's next_game_index, or 1
+            # for a brand-new set — see DraftLifecycle.open_lobby()), so this is
+            # correct even before /start. MatchRunner refreshes it again at every
+            # subsequent match start in the same lobby (_update_game_number_banner()).
+            if obs_control.is_enabled() and self._ds.game_index:
+                await loop.run_in_executor(
+                    None, obs_control.set_source_text,
+                    self.bot.config.get("obs_game_number_source", "Game Number"),
+                    f"Game {self._ds.game_index}",
+                )
+
             # Start a background watcher that fires the match runner if the lobby
             # auto-starts before /start is called.
             self._auto_start_task = asyncio.create_task(
@@ -1813,6 +1849,7 @@ class DirectorCog(commands.Cog):
             # Fire the Twitch ad break as early as possible — see _twitch_start_ad_break()
             # — so it has the whole post-match/spin-up window to play out.
             await self._twitch_start_ad_break()
+            await self._clear_game_number_banner()
 
             # Click MAIN MENU right away — the game doesn't need to sit on the results
             # screen waiting for the Discord/API work below (mirror, ingest, screenshot
@@ -1972,6 +2009,7 @@ class DirectorCog(commands.Cog):
             # Fire the Twitch ad break as early as possible — see _twitch_start_ad_break()
             # — so it has the whole post-match/spin-up window to play out.
             await self._twitch_start_ad_break()
+            await self._clear_game_number_banner()
 
             # Click MAIN MENU right away — the game doesn't need to sit on the results
             # screen waiting for the Discord/API work below (mirror, ingest, screenshot
@@ -2317,7 +2355,7 @@ class ScrimCog(commands.Cog):
         # the bot is offline, and this catches up on those the moment it's back.
         signup_message = await self._get_signup_message()
         if signup_message is not None:
-            await self._update_region_message(signup_message.guild, await self._reactors(signup_message))
+            await self._update_region_message(signup_message.guild, await self._ordered_reactors(signup_message))
         await self._resume_reset_timer_if_needed()
 
     async def _resume_reset_timer_if_needed(self):
@@ -2387,7 +2425,7 @@ class ScrimCog(commands.Cog):
         """Post (or verify) the live region-breakdown message right below the
         signup message. No-op if scrim_signup_channel_id isn't configured, or if
         neither region_role_na nor region_role_eu exists in the guild — same
-        "nothing to show" case _region_table_lines() already covers.
+        "nothing to show" case _region_list_lines() already covers.
 
         The whole check-then-create body is serialized behind
         self._region_message_lock (2026-09-10 fix, found live): a reset
@@ -2433,7 +2471,7 @@ class ScrimCog(commands.Cog):
                     return
 
             signup_message = await self._get_signup_message()
-            members = await self._reactors(signup_message) if signup_message else []
+            members = await self._ordered_reactors(signup_message) if signup_message else []
             embed = self._region_breakdown_embed(ch.guild, members)
             if embed is None:
                 return  # neither region role exists in this guild yet
@@ -2475,11 +2513,21 @@ class ScrimCog(commands.Cog):
         except Exception as e:
             logger.warning("ScrimCog: could not update region breakdown message: %s", e)
 
-    def _region_table_lines(self, guild: discord.Guild, members: list[discord.Member]) -> Optional[list[str]]:
-        """Rows for the region breakdown table (Player / NA / EU columns), or None
-        if neither region_role_na nor region_role_eu exists in this guild — there's
+    def _region_list_lines(self, guild: discord.Guild, members: list[discord.Member]) -> Optional[list[str]]:
+        """Numbered-list lines (2026-09-11, replacing the old Player/NA/EU
+        monospace table) — `f"{i}. {name} — {tags}"` for each member, in
+        whatever order `members` is already given in. None if neither
+        region_role_na nor region_role_eu exists in this guild — there's
         nothing meaningful to show in that case regardless of who's signed up.
-        Role names come from region_role_na/region_role_eu (config, default 'NA'/'EU')."""
+        Role names come from region_role_na/region_role_eu (config, default
+        'NA'/'EU').
+
+        `members` should already be in signup order (`_ordered_reactors()`,
+        not the plain `_reactors()`) — this only numbers them 1..N as given,
+        it does not reorder anything itself. Signup order is what /role add's
+        first-10/next-10 split is based on, so the numbering here doubles as
+        "which lobby a player is headed for" at a glance.
+        """
         na_role_name = self._cfg("region_role_na", "NA")
         eu_role_name = self._cfg("region_role_eu", "EU")
         na_role = discord.utils.get(guild.roles, name=na_role_name) if na_role_name else None
@@ -2487,25 +2535,28 @@ class ScrimCog(commands.Cog):
         if na_role is None and eu_role is None:
             return None
 
-        name_width = max([len("Player")] + [len(m.display_name) for m in members])
-        header = f"{'Player'.ljust(name_width)}  NA  EU"
-        rows = [header, "-" * len(header)]
-        for m in members:
-            has_na = "X" if na_role and na_role in m.roles else "-"
-            has_eu = "X" if eu_role and eu_role in m.roles else "-"
-            rows.append(f"{m.display_name.ljust(name_width)}  {has_na.center(2)}  {has_eu.center(2)}")
-        return rows
+        lines = []
+        for i, m in enumerate(members, start=1):
+            tags = []
+            if na_role and na_role in m.roles:
+                tags.append("NA")
+            if eu_role and eu_role in m.roles:
+                tags.append("EU")
+            suffix = f" — {', '.join(tags)}" if tags else ""
+            lines.append(f"{i}. {m.display_name}{suffix}")
+        return lines
 
     def _region_breakdown_embed(self, guild: discord.Guild, members: list[discord.Member]) -> Optional[discord.Embed]:
-        """The live region-breakdown message's content — a monospace Player/NA/EU
-        table covering every current signup reactor. None if _region_table_lines()
-        has nothing to show (region roles not configured/found in this guild)."""
-        rows = self._region_table_lines(guild, members)
-        if rows is None:
+        """The live region-breakdown message's content — a numbered list, in
+        signup order, of every current reactor with their region tag(s).
+        None if _region_list_lines() has nothing to show (region roles not
+        configured/found in this guild)."""
+        lines = self._region_list_lines(guild, members)
+        if lines is None:
             return None
         return discord.Embed(
             title="Region Breakdown",
-            description="```\n" + "\n".join(rows) + "\n```",
+            description="\n".join(lines),
             color=_COLOR_NEUTRAL,
         )
 
@@ -2756,7 +2807,7 @@ class ScrimCog(commands.Cog):
         message = await self._get_signup_message()
         if message is None:
             return
-        reactors = await self._reactors(message)
+        reactors = await self._ordered_reactors(message)
         count = len(reactors)
         await self._update_region_message(message.guild, reactors)
         logger.info(
@@ -2812,7 +2863,7 @@ class ScrimCog(commands.Cog):
         message = await self._get_signup_message()
         if message is None:
             return
-        reactors = await self._reactors(message)
+        reactors = await self._ordered_reactors(message)
         await self._update_region_message(message.guild, reactors)
         if not reactors:
             self._cancel_reset_timer()

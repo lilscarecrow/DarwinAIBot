@@ -235,6 +235,8 @@ class MatchRunner:
         self._minimap_cover_source = config.get("obs_minimap_cover_source", "Map Cover")
         self._minimap_cover_seconds = config.get("obs_minimap_cover_seconds", 120)
         self._minimap_uncovered = False
+        # OBS text source showing "Game N" to viewers — see _update_game_number_banner().
+        self._game_number_source = config.get("obs_game_number_source", "Game Number")
         # Tournament mode (toggled via Discord's /tournament, config key tournament_mode):
         # the minimap cover stays up for the entire match instead of revealing at
         # _minimap_cover_seconds — see the main loop below, which skips the timed hide
@@ -551,14 +553,45 @@ class MatchRunner:
         roster (_init_player_bar()) then pushes it to the ladder, in that
         order, since the push needs the names _init_player_bar() just read.
         Wrapped in try/except: a failure here must never take down the match
-        thread that spawned it."""
+        thread that spawned it.
+
+        Calls DraftLifecycle.on_match_start() directly (blocking), not the
+        _async fire-and-forget wrapper that call site's own docstring
+        describes — that wrapper exists to protect the MATCH thread, which
+        this method is already off of (it runs on its own PlayerBarInit
+        thread), so blocking here for the same network call is harmless and
+        lets _update_game_number_banner() run right after with a
+        guaranteed-fresh self._ds.game_index instead of racing an in-flight
+        HTTP call on a third thread.
+        """
         try:
             self._init_player_bar()
             if self._ds is not None:
-                self._ds.on_match_start_async(self._player_names)
+                self._ds.on_match_start(self._player_names)
                 self._ds.event("match_start", elapsed_ms=0, slots=[n or None for n in self._player_names])
+                self._update_game_number_banner()
         except Exception as e:
             logger.warning("Player bar init/roster push failed: %s", e)
+
+    def _update_game_number_banner(self) -> None:
+        """Push "Game N" to an OBS text source so viewers know which game in
+        the set is currently being played (2026-09-11). self._ds.game_index
+        is the freshest signal available at this point: DraftLifecycle's
+        on_match_start() just above re-opens the draft with this match's
+        roster, and that reply's next_game_index (see game/ds_lifecycle.py)
+        re-seeds it every single match start, not just at /custom — so this
+        reflects the server's own bookkeeping, not a locally-guessed count.
+        No "of 4" suffix: a tournament lobby's set can be capped at fewer
+        games server-side, and the bot has no reliable way to know that
+        limit, so claiming a total would risk being wrong. No-ops if
+        obs_stream_enabled is false or there's no draft lifecycle at all.
+        """
+        if self._ds is None:
+            return
+        from game import obs_control
+        if not obs_control.is_enabled():
+            return
+        obs_control.set_source_text(self._game_number_source, f"Game {self._ds.game_index}")
 
     def _init_player_bar(self):
         """

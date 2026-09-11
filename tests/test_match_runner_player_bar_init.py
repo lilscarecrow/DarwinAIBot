@@ -17,6 +17,7 @@ from session.state import SessionState
 
 class FakeDraftLifecycle:
     roster_size = 0
+    game_index = 1
 
     def __init__(self):
         self.events = []
@@ -28,7 +29,7 @@ class FakeDraftLifecycle:
     def resolve_alias(self, name):
         return None
 
-    def on_match_start_async(self, names):
+    def on_match_start(self, names):
         self.match_start_calls.append(list(names))
 
 
@@ -62,7 +63,7 @@ def test_worker_detects_then_pushes_the_resulting_roster_to_the_ladder():
 
 def test_worker_never_raises_even_if_the_ladder_push_fails():
     runner, ds = make_runner()
-    ds.on_match_start_async = lambda names: (_ for _ in ()).throw(RuntimeError("boom"))
+    ds.on_match_start = lambda names: (_ for _ in ()).throw(RuntimeError("boom"))
     with patch("game.screen_detection.take_screenshot", return_value=None), \
          patch("game.player_cards_v2.detect_cards", return_value=[]):
         runner._init_player_bar_and_push()  # must not raise
@@ -73,3 +74,36 @@ def test_worker_skips_the_ladder_push_when_no_lifecycle_is_wired():
     with patch("game.screen_detection.take_screenshot", return_value=None), \
          patch("game.player_cards_v2.detect_cards", return_value=[]):
         runner._init_player_bar_and_push()  # must not raise with no self._ds
+
+
+# ---- OBS "Game N" banner (2026-09-11) --------------------------------------
+
+def test_updates_the_obs_banner_with_the_current_game_number():
+    runner, ds = make_runner()
+    ds.game_index = 3
+    with patch("game.screen_detection.take_screenshot", return_value=None), \
+         patch("game.player_cards_v2.detect_cards", return_value=[]), \
+         patch("game.obs_control.is_enabled", return_value=True), \
+         patch("game.obs_control.set_source_text") as set_text:
+        runner._init_player_bar_and_push()
+    set_text.assert_called_once_with(runner._game_number_source, "Game 3")
+
+
+def test_does_not_touch_obs_when_streaming_is_disabled():
+    runner, ds = make_runner()
+    with patch("game.screen_detection.take_screenshot", return_value=None), \
+         patch("game.player_cards_v2.detect_cards", return_value=[]), \
+         patch("game.obs_control.is_enabled", return_value=False), \
+         patch("game.obs_control.set_source_text") as set_text:
+        runner._init_player_bar_and_push()
+    set_text.assert_not_called()
+
+
+def test_no_obs_call_when_no_lifecycle_is_wired():
+    runner = MatchRunner({}, SessionState(), lambda *a: None, draft_lifecycle=None)
+    with patch("game.screen_detection.take_screenshot", return_value=None), \
+         patch("game.player_cards_v2.detect_cards", return_value=[]), \
+         patch("game.obs_control.is_enabled", return_value=True), \
+         patch("game.obs_control.set_source_text") as set_text:
+        runner._init_player_bar_and_push()  # must not raise, no self._ds to read game_index from
+    set_text.assert_not_called()
