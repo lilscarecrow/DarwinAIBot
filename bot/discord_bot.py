@@ -2957,13 +2957,24 @@ class ScrimCog(commands.Cog):
 
         await interaction.followup.send("\n".join(lines))
 
-    @role_group.command(name="remove", description="Remove one lobby's scrim player role and its reactions")
-    @app_commands.describe(lobby="Which lobby to clear — 1 (scrim_player_role) or 2 (scrim_player_role_2)")
+    @role_group.command(name="remove", description="Remove one or both lobbies' scrim player role(s) and their reactions")
+    @app_commands.describe(lobby="Which lobby to clear — 1 (scrim_player_role), 2 (scrim_player_role_2), or Both")
     @app_commands.choices(lobby=[
         app_commands.Choice(name="1", value=1),
         app_commands.Choice(name="2", value=2),
+        app_commands.Choice(name="Both", value=3),
     ])
     async def role_remove(self, interaction: discord.Interaction, lobby: app_commands.Choice[int]):
+        """`lobby=3` ("Both") removes scrim_player_role AND scrim_player_role_2
+        in one call (2026-09-10) — added specifically so clearing both lobbies
+        at once only pays for one _delete_and_repost_signup_message() instead
+        of two. That reset already clears BOTH lobbies' reactions regardless
+        of which single role a `1`/`2` call targets (see that method's
+        docstring) — so running `/role remove 1` then `/role remove 2` back
+        to back reset the queue twice for no reason, the second repost
+        wiping out reactions that had only just re-accumulated after the
+        first. `1`/`2` are unchanged; this only adds the combined path.
+        """
         if not self._has_scrim_admin(interaction):
             await interaction.response.send_message(
                 "You don't have permission to use this command.", ephemeral=True
@@ -2971,55 +2982,67 @@ class ScrimCog(commands.Cog):
             return
 
         await interaction.response.defer()
-
-        role_key = "scrim_player_role" if lobby.value == 1 else "scrim_player_role_2"
-        other_key = "scrim_player_role_2" if lobby.value == 1 else "scrim_player_role"
-        role_name = self._cfg(role_key, "")
-        if not role_name:
-            await interaction.followup.send(f"No `{role_key}` set in config.json.")
-            return
-
         guild = interaction.guild
-        role = discord.utils.get(guild.roles, name=role_name)
-        if role is None:
-            await interaction.followup.send(f"Role **{role_name}** not found in this server.")
+
+        if lobby.value == 3:
+            role_keys = ["scrim_player_role", "scrim_player_role_2"]
+        else:
+            role_keys = ["scrim_player_role" if lobby.value == 1 else "scrim_player_role_2"]
+
+        lines = []
+        any_removed = False
+        for role_key in role_keys:
+            role_name = self._cfg(role_key, "")
+            if not role_name:
+                lines.append(f"No `{role_key}` set in config.json.")
+                continue
+            role = discord.utils.get(guild.roles, name=role_name)
+            if role is None:
+                lines.append(f"Role **{role_name}** not found in this server.")
+                continue
+            # Snapshot before mutating — role.members would shrink as we remove the role below.
+            members = list(role.members)
+            if not members:
+                lines.append(f"Nobody currently has the **{role_name}** role.")
+                continue
+            removed, failed = [], []
+            for member in members:
+                try:
+                    await member.remove_roles(role, reason="Scrim cleanup")
+                    removed.append(member.display_name)
+                except Exception as e:
+                    logger.warning("Could not remove scrim role from %s: %s", member, e)
+                    failed.append(member.display_name)
+            any_removed = True
+            lines.append(f"Removed **{role_name}** from {len(removed)} member(s).")
+            if failed:
+                lines.append(f"Could not remove from: {', '.join(failed)}")
+
+        if not any_removed:
+            # Nothing actually changed — same as the old single-lobby early
+            # return, don't reset the queue for no reason.
+            await interaction.followup.send("\n".join(lines))
             return
 
-        # Snapshot before mutating — role.members would shrink as we remove the role below.
-        members = list(role.members)
-        if not members:
-            await interaction.followup.send(f"Nobody currently has the **{role_name}** role.")
-            return
-
-        # The delete-and-repost below (_delete_and_repost_signup_message) clears BOTH
-        # lobbies' signups at once — check now, before anything changes, whether the
-        # other lobby still has active players so we can warn the admin their
-        # reactions are about to go too.
-        other_role_name = self._cfg(other_key, "")
-        other_role = discord.utils.get(guild.roles, name=other_role_name) if other_role_name else None
-        other_lobby_active = bool(other_role and other_role.members)
-
-        removed, failed = [], []
-        for member in members:
-            try:
-                await member.remove_roles(role, reason="Scrim cleanup")
-                removed.append(member.display_name)
-            except Exception as e:
-                logger.warning("Could not remove scrim role from %s: %s", member, e)
-                failed.append(member.display_name)
+        # Only relevant when a single lobby was explicitly targeted — clearing
+        # both makes this warning moot, since the untargeted lobby isn't
+        # untargeted anymore.
+        if lobby.value != 3:
+            other_key = "scrim_player_role_2" if lobby.value == 1 else "scrim_player_role"
+            other_role_name = self._cfg(other_key, "")
+            other_role = discord.utils.get(guild.roles, name=other_role_name) if other_role_name else None
+            if other_role and other_role.members:
+                lines.append(
+                    f"⚠️ **{other_role_name}** still has active players — their reactions were cleared too, "
+                    f"so they'll need to react again as well."
+                )
 
         # Delete and repost the signup message rather than clearing its reaction in
         # place — see _delete_and_repost_signup_message() for why (avoids both the old
         # per-user race and bulk-clear's stale client-side "who reacted" display).
+        # Exactly one call regardless of how many role_keys were processed above —
+        # this already resets BOTH lobbies' reactions at once, see the docstring note.
         await self._delete_and_repost_signup_message()
 
-        lines = [f"Removed **{role_name}** from {len(removed)} member(s)."]
-        if failed:
-            lines.append(f"Could not remove from: {', '.join(failed)}")
         lines.append("All signup reactions were reset — everyone will need to react again to rejoin the queue.")
-        if other_lobby_active:
-            lines.append(
-                f"⚠️ **{other_role_name}** still has active players — their reactions were cleared too, "
-                f"so they'll need to react again as well."
-            )
         await interaction.followup.send("\n".join(lines))
