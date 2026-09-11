@@ -104,6 +104,13 @@ class DraftLifecycle:
         # session on the same draft, so open_lobby only restarts the count
         # when the server hands back a different draft (see open_lobby).
         self._game_index: int = 0
+        # The server's own view of which game is next (open-draft's
+        # `next_game_index`, 2026-09-11) — set by _take_reply() on every
+        # open-draft reply that carries it, read once by open_lobby() when it
+        # decides whether to reset self._game_index. None for an older server
+        # reply, a bare-id transport result (older tests), or before any open
+        # has happened yet.
+        self._server_next_game_index: Optional[int] = None
         # Background sender for live events + relayed log lines. Created here,
         # started on first use (only when enabled). Shares an injected transport
         # when it offers post_events/post_log, so tests see every call.
@@ -229,15 +236,49 @@ class DraftLifecycle:
             logger.debug("name snap failed: %s", e)
             return list(reads)
 
+    def resolve_alias(self, name: str) -> Optional[str]:
+        """A single raw name -> the ladder's canonical player name, if `name`
+        is one of that player's KNOWN registered handles (canonical name,
+        persona, or any alias in `names`) — an exact fold match, never the
+        fuzzy multi-round pass `snap_all()` uses. None if it doesn't match
+        any single player's known aliases.
+
+        Added 2026-09-11 for MatchRunner's damage-feed killer/victim
+        resolution: a live incident showed a clean, correctly-OCR'd read
+        ("CONNOR") that wasn't this match's already-resolved slot name for
+        that player (their nameplate had snapped to a different display
+        name, "Mojo") — but "connor" WAS one of their other known aliases on
+        the ladder the whole time. Scoring the raw read against slot_map's
+        single already-decided name per slot (find_winning_slot(), a fuzzy
+        comparison) can't see that; checking it against every alias a
+        player's actually registered under is a stronger, non-fuzzy check
+        that should run first. Deliberately reuses NameSnapper.snap()'s
+        single-read exact-or-glued-substring logic rather than snap_all()'s
+        fuzzy multi-round pass — that pass exists for "claim each of many
+        reads across a whole bar," not a one-off lookup, and a fuzzy score
+        against an unrelated player is exactly the failure this method
+        exists to avoid.
+        """
+        try:
+            snapped = self._snapper.snap(name)
+        except Exception as e:
+            logger.debug("alias resolve failed: %s", e)
+            return None
+        return snapped if snapped != name else None
+
     def _take_reply(self, result) -> Optional[int]:
         """open_set_draft's result → draft id; remember the lobby view if the
         reply carried one. Accepts a bare id (older transports, tests)."""
+        self._server_next_game_index = None
         if result is None:
             return None
         if isinstance(result, dict):
             draft_id = result.get("draft_id")
             if draft_id is None:
                 return None
+            ngi = result.get("next_game_index")
+            if isinstance(ngi, (int, float)) and not isinstance(ngi, bool) and ngi >= 1:
+                self._server_next_game_index = int(ngi)
             if "lobby" in result or "unlinked" in result:
                 self._lobby = [m for m in (result.get("lobby") or []) if isinstance(m, dict)]
                 self._expected_names = [str(n) for n in (result.get("expected_names") or [])]
@@ -375,7 +416,15 @@ class DraftLifecycle:
             )
             return None
         if new_id != self._draft_id:
-            self._game_index = 1
+            # Seed from the server's own view of which game is next
+            # (`next_game_index`, 2026-09-11) when the reply carried one,
+            # rather than always assuming 1 — a bot restart reconnecting into
+            # a draft that already has games recorded (e.g. crash mid-set)
+            # would otherwise start the local counter wrong, mistagging the
+            # very next batch of live events as "game 1" even though the
+            # server itself already knows better. Falls back to 1 for an
+            # older server reply or a bare-id transport result (tests).
+            self._game_index = self._server_next_game_index or 1
         self._draft_id = new_id
         self._relay_started()
         if not self._twitch_channel():

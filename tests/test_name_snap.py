@@ -126,3 +126,20 @@ def test_find_winning_slot_refuses_a_genuine_tie():
     # Two slots close enough in name that a garbled read can't be called cleanly.
     tied = {"1": "abcde", "2": "abcdf"}
     assert find_winning_slot("abcd_", tied) is None
+
+
+def test_find_winning_slot_refuses_a_clean_read_that_matches_no_one():
+    """Real live incident (2026-09-11): the damage feed clearly read
+    "CONNOR" as a first-blood killer — not OCR noise — but the real
+    "Connor" wasn't in this match's slot_map under that name at all (their
+    nameplate had been ladder-linked to a different display name, "Mojo").
+    The old floor (0.6) still let an unrelated player, "Coen", win at
+    exactly 0.600, and the give_wood reward went to the wrong player. This
+    is the exact roster from that match; 0.65 must refuse it rather than
+    guess."""
+    slot_map = {
+        "0": "Lmk esky", "1": "GZ", "2": "cqrson", "3": "Andi Weimann",
+        "4": "Mojo", "5": "Nice Pina Bro", "6": "Numb", "7": "Coen",
+        "8": "Lucree", "9": "BenHone",
+    }
+    assert find_winning_slot("CONNOR", slot_map) is None

@@ -24,6 +24,9 @@ class FakeDraftLifecycle:
     def event(self, kind, **fields):
         self.events.append((kind, fields))
 
+    def resolve_alias(self, name):
+        return None
+
 
 def make_runner(names=None, deck_layout=None, ds=None, config=None):
     runner = MatchRunner(config or {}, SessionState(), lambda *a: None, draft_lifecycle=ds)

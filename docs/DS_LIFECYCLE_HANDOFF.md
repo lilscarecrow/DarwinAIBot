@@ -95,6 +95,43 @@ exactly one of the lobby's players. The reply carries:
   snap anchor" below.
 - `skipped_unresolved` (2026-09-10): sent names the server did not add
   because the draft already has game data and they matched no row.
+- `next_game_index` (2026-09-11, added specifically for this): the game
+  (1-4) the server's own bookkeeping says is next on this draft — the same
+  "floor at the next unrecorded slot" computation the events endpoint
+  already used internally, now exposed at open time. `DraftLifecycle`
+  (`_take_reply()`) stashes it as `self._server_next_game_index`;
+  `open_lobby()` seeds `self._game_index` from it instead of always
+  assuming `1` whenever the draft id actually changed — see "The bot's own
+  game counter" below for why this mattered.
+- `bracket_lobby` (found in the darwin-stalker source 2026-09-11, **not
+  currently read by the bot**): when this open carried a `tournament_slug`
+  and the roster's Discord IDs match the checked-in seats of one open
+  tournament-bracket lobby, the server transparently binds this draft to
+  that lobby's own set (switching `draft_id` to it, or creating/binding a
+  fresh one) and reports `{lobby_id, lobby_num, round_num}` here; `null`
+  when the roster doesn't match any open bracket lobby. Since the server
+  does the binding itself — the bot's `draft_id` is already correct by the
+  time the reply arrives — there's currently nothing for the bot to act on;
+  this is purely informational unless a future feature (e.g. announcing
+  "you're playing round N, lobby M" from this field) wants it.
+
+**The bot's own game counter used to just guess (2026-09-11 fix).**
+`DraftLifecycle._game_index` is purely local bookkeeping — 1 when a draft is
+first opened, +1 after every results upload, 0 when nothing is open — used
+only to tag outgoing live events with which game they belong to. It has
+never been reconciled against what the server actually has recorded. The
+server's own events handler already had to defend against exactly this: its
+`event_game_index()` floors whatever the bot sends (or omits) at the
+draft's real "next unrecorded slot," specifically because *"the bot
+restarts its counter at 1 every time it opens a lobby, one per game — which
+stamped a whole set 'Game 1 in progress' on the LIVE card"* (their comment,
+citing draft 252, 2026-09-07). That flooring protects what viewers see on
+the LIVE card, but the bot's own local value stayed wrong regardless — a
+restart mid-set (crash, power loss) would still open into a *different*
+draft id than whatever it remembered (since the remembered id is gone too),
+hit the `new_id != self._draft_id` branch, and reset to `1` even if the
+server's draft already had 2 or 3 games recorded. `next_game_index` (above)
+closes that gap by telling the bot the truth instead of leaving it to guess.
 
 `DraftLifecycle` keeps these (`lobby`, `expected_names`, `unlinked`) and
 exposes `snap_names(reads)` — `game/name_snap.py` folds the player-bar OCR the
@@ -121,13 +158,16 @@ so a read that's a contiguous chunk of the true (longer) name still scores
 well. Resolution runs in rounds — each round claims only the single
 highest-confidence read/player pair among those left, skipping any read whose
 top two candidate players are too close to call (`_AMBIGUITY_MARGIN`) or
-whose best score is below the floor (`_MIN_FUZZY_CONFIDENCE = 0.6`) — so
-claiming one player can un-stick a rival candidate for another read next
-round, and a read with no real signal is left verbatim rather than guessed.
-Covered in `tests/test_name_snap.py` (a one-typo miss `snap()` alone refuses
-but `snap_all()` relaxes, a scrolled/cut-off name, an unrecognizable read
-staying verbatim, the existing shared-fold ambiguity case surviving the fuzzy
-pass too, and confidence-ordering across two competing reads).
+whose best score is below the floor (`_MIN_FUZZY_CONFIDENCE = 0.65`, raised
+from `0.6` on 2026-09-11 — see below) — so claiming one player can un-stick a
+rival candidate for another read next round, and a read with no real signal
+is left verbatim rather than guessed. Covered in `tests/test_name_snap.py` (a
+one-typo miss `snap()` alone refuses but `snap_all()` relaxes, a
+scrolled/cut-off name, an unrecognizable read staying verbatim, the existing
+shared-fold ambiguity case surviving the fuzzy pass too, and
+confidence-ordering across two competing reads).
+
+**A clean, correct OCR read still isn't necessarily this match's roster (2026-09-11):** a live incident had the damage feed read a first-blood killer's name perfectly — no OCR error at all — but that player's slot had resolved to a *different* display name for this particular match (their nameplate had snapped to a ladder alias, not the name the feed itself used), and the fuzzy pass matched a completely unrelated player at exactly `0.600` instead of refusing. Two fixes: the confidence floor moved to `0.65` (every genuine fuzzy match in this project's tests scores `0.714`-`0.903`, comfortably clear); and `MatchRunner._resolve_feed_name()` now tries `DraftLifecycle.resolve_alias(name)` — a single-read, exact-fold-only lookup against a player's *entire* known alias set (canonical name, persona, every registered handle), not just their one already-decided slot name — before ever falling back to the fuzzy match at all. See CLAUDE.md's Match Runner section for the full incident.
 
 **The draft's own rows are the snap anchor (2026-09-10).** Found live on
 draft 287: the ladder showed 14 rows for a 10-player lobby. Three players
@@ -215,10 +255,27 @@ them in `lobby` with real aliases to match against.
   published/rejected; harmless.
 - `404` — no such draft, or not owned by this token.
 
-### POST /api/ingest/screenshot (unchanged)
+### POST /api/ingest/screenshot
 
 Multipart form: `screenshot` (PNG), `platform`, optional `roster` (JSON string
-of Discord ids), optional `draft_id`. `200 {"draft_id", "game_index", "ocr_error"}`.
+of Discord ids), optional `draft_id`.
+
+`200 {"draft_id", "game_index", "rows_merged", "ocr_error", "placements"}` —
+`placements` (confirmed live on the server side, `src/api/drafts.rs`, and
+already flowing through the bot's own code unchanged since
+`post_results_screenshot()`/`_post_results_to_ingest()` return the whole
+parsed body) is this game's finish order, 1st first: `[{rank, name,
+player_id}, ...]`, `name` already through the ladder's own alias+fold
+resolver (canonical spelling + `player_id` when it resolved, the raw OCR read
+with `player_id: null` when it didn't). Always present as a key; empty
+(`[]`) whenever OCR failed or the ladder can't vouch for an ordering — a rank
+two rows both claim is dropped from both rather than guessed, and a
+screen with no readable rank-1 badge means no `rank: 1` entry, not that
+first place was skipped for some other reason. This is what
+`DirectorCog._resolve_prediction(placements)` resolves the "who wins" Twitch
+prediction against (see CLAUDE.md's Twitch "Who Wins?" Prediction section) —
+**previously documented here as a field the server still needed to add; it
+already exists as of this writing (2026-09-11).**
 
 ### GET /api/live?platform=pc (public, what the LIVE tab polls)
 

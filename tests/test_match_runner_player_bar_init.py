@@ -25,6 +25,9 @@ class FakeDraftLifecycle:
     def event(self, kind, **fields):
         self.events.append((kind, fields))
 
+    def resolve_alias(self, name):
+        return None
+
     def on_match_start_async(self, names):
         self.match_start_calls.append(list(names))
 

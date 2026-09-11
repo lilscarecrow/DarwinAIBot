@@ -22,6 +22,13 @@ class FakeDraftLifecycle:
     def event(self, kind, **fields):
         self.events.append((kind, fields))
 
+    def resolve_alias(self, name):
+        """No ladder alias data in this fake — always falls through to
+        find_winning_slot()'s fuzzy match, same as before resolve_alias()
+        existed. See tests/test_ds_lifecycle.py for the real method's own
+        coverage; this fake just needs to satisfy the interface."""
+        return None
+
 
 def make_runner(names):
     ds = FakeDraftLifecycle()
@@ -39,6 +46,43 @@ def run_worker(runner, feed_text):
     with patch("game.screen_detection.take_screenshot", return_value=None), \
          patch("game.ocr.ocr_feed_text", return_value=feed_text):
         runner._poll_damage_feed_worker()
+
+
+# ---- alias-first resolution via DraftLifecycle.resolve_alias (2026-09-11) --
+#
+# Real live incident: the feed clearly read "CONNOR" as a first-blood killer
+# — a clean, correct OCR read — but that player's slot had resolved to a
+# different display name ("Mojo") for this match. find_winning_slot()'s
+# fuzzy score against slot_map alone matched an unrelated player ("Coen")
+# instead, and the reward went to the wrong person. _resolve_feed_name() now
+# tries DraftLifecycle.resolve_alias() (an exact match against every known
+# alias for a player, not just their one already-decided slot name) first.
+
+class AliasFakeDraftLifecycle(FakeDraftLifecycle):
+    """resolve_alias() actually resolves one specific raw name to a
+    canonical one, to prove that result wins over find_winning_slot()'s
+    fuzzy match against slot_map."""
+    def __init__(self, aliases):
+        super().__init__()
+        self._aliases = aliases
+
+    def resolve_alias(self, name):
+        return self._aliases.get(name)
+
+
+def test_alias_resolution_wins_over_the_fuzzy_fallback():
+    runner, _ = make_runner(["SteffKnight", "Hellcrying", "Guts"])
+    runner._ds = AliasFakeDraftLifecycle({"CONNOR": "Guts"})
+    run_worker(runner, "CONNOR DREW FIRST BLOOD FROM HELLCRYING")
+    kind, fields = runner._ds.events[0]
+    assert fields["killer_slot"] == "2"  # Guts, via the alias — not a fuzzy guess
+
+
+def test_falls_back_to_fuzzy_matching_when_no_alias_resolves():
+    runner, ds = make_runner(["SteffKnight", "Hellcrying", "Guts"])
+    run_worker(runner, "STEFFKNIGHT DREW FIRST BLOOD FROM HELLCRYING")
+    kind, fields = ds.events[0]
+    assert fields["killer_slot"] == "0"  # unchanged behavior — the fake never resolves an alias
 
 
 def test_resolves_killer_and_victim_from_a_clean_line():

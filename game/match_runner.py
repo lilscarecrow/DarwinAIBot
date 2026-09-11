@@ -876,7 +876,6 @@ class MatchRunner:
             from game.screen_detection import take_screenshot
             from game.video_recorder import _CROP_REGION
             from game.ocr import ocr_feed_text
-            from game.name_snap import find_winning_slot
 
             screenshot = take_screenshot()
             text = ocr_feed_text(screenshot, _CROP_REGION)
@@ -902,7 +901,7 @@ class MatchRunner:
                         if role in groups:
                             raw_name = groups[role].strip()
                             fields[f"{role}_raw"] = raw_name
-                            fields[f"{role}_slot"] = find_winning_slot(raw_name, slot_map)
+                            fields[f"{role}_slot"] = self._resolve_feed_name(raw_name, slot_map)
                     if groups.get("method"):
                         fields["method"] = groups["method"].strip()
                     logger.info("Feed match [%s]: %r -> %s", kind, line, fields)
@@ -914,6 +913,37 @@ class MatchRunner:
             logger.debug("Damage feed poll failed: %s", e)
         finally:
             self._feed_poll_busy = False
+
+    def _resolve_feed_name(self, raw_name: str, slot_map: dict[str, str]) -> Optional[str]:
+        """Resolve a damage-feed killer/victim OCR read to a slot index.
+
+        Tries the ladder's own known-alias data first, via
+        DraftLifecycle.resolve_alias() — an exact match against a specific
+        player's registered handles (canonical name, persona, any alias)
+        catches something find_winning_slot()'s fuzzy score against
+        slot_map can't: the read can be a clean, correctly-OCR'd name that
+        just isn't this match's already-decided display name for that
+        player. Found live 2026-09-11 — the feed read "CONNOR" plainly and
+        correctly, but that player's slot had resolved to a different
+        display name ("Mojo") for this match, and find_winning_slot() still
+        matched an unrelated player ("Coen") by fuzzy score alone, giving
+        them the first-blood reward instead. "connor" was one of that
+        player's other known ladder aliases the whole time — resolve_alias()
+        finds that directly, with no scoring involved.
+
+        Falls back to find_winning_slot()'s fuzzy match against slot_map
+        when no alias resolves (self._ds is None, an unlinked player with no
+        registered aliases, or genuine OCR noise) — same as before this
+        method existed.
+        """
+        if self._ds is not None:
+            canonical = self._ds.resolve_alias(raw_name)
+            if canonical is not None:
+                for slot, name in slot_map.items():
+                    if name == canonical:
+                        return slot
+        from game.name_snap import find_winning_slot
+        return find_winning_slot(raw_name, slot_map)
 
     def _save_feed_debug_images(self, screenshot, kind: str) -> None:
         """Saves the raw-color feed crop (plus the processed image OCR

@@ -27,7 +27,19 @@ _FOLD = {"1": "l", "i": "l", "0": "o", "y": "v", "5": "s", "8": "b", "q": "g"}
 # snap_all()'s fuzzy pass: a read/player pair scoring below this is never
 # snapped, no matter how few unclaimed players are left — a wrong guess is
 # worse than leaving the read verbatim (see module docstring).
-_MIN_FUZZY_CONFIDENCE = 0.6
+#
+# Raised from 0.6 to 0.65 (2026-09-11, found live): the damage feed clearly
+# read a real first-blood killer as "CONNOR" — not OCR noise, a clean read —
+# but the real "Connor" wasn't in that match's slot_map under that name at
+# all (their nameplate had been ladder-linked to a different display name).
+# find_winning_slot("CONNOR", slot_map) still scored an unrelated player,
+# "Coen", at exactly 0.600 — precisely the old floor — with the next-best
+# candidate at only 0.5, so the ambiguity-margin check never caught it
+# either. The give_wood reward went to the wrong player as a result. Every
+# legitimate match in this project's own tests (a genuinely truncated or
+# lightly-misread name) scores 0.714-0.903 — comfortably clear of 0.65 — so
+# this closes the "Connor"/"Coen" gap without touching real matches.
+_MIN_FUZZY_CONFIDENCE = 0.65
 
 # If the best and second-best candidate PLAYER for a read score within this
 # of each other, the read is treated as ambiguous for this round rather than

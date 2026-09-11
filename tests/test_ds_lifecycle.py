@@ -268,6 +268,52 @@ def test_full_set_then_new_lobby_replaces_id_without_close():
     assert not any(c[0] == "close" for c in t.calls)
 
 
+# ---- game_index seeded from the server's next_game_index (2026-09-11) -----
+#
+# A bot restart reconnecting into a draft that already has games recorded
+# (e.g. a crash mid-set) used to always reset game_index to 1 — wrong if the
+# server's draft already has games 1-2 recorded, mistagging the next batch
+# of live events. open-draft's reply can now carry next_game_index (the
+# server's own "next unrecorded slot" computation); open_lobby() seeds from
+# it instead of assuming 1 whenever the draft id actually changed.
+
+def test_game_index_seeded_from_next_game_index_on_a_new_draft():
+    reply = {"draft_id": 12, "created": True, "rows": 0, "lobby": [], "expected_names": [], "unlinked": [], "next_game_index": 3}
+    ds, t = make(open_result=reply)
+    ds.open_lobby()
+    assert ds.game_index == 3
+
+
+def test_game_index_defaults_to_1_when_next_game_index_is_absent():
+    """An older server reply (or one with no game data yet) doesn't carry
+    next_game_index at all — falls back to the old behavior."""
+    reply = {"draft_id": 12, "created": True, "rows": 0, "lobby": [], "expected_names": [], "unlinked": []}
+    ds, t = make(open_result=reply)
+    ds.open_lobby()
+    assert ds.game_index == 1
+
+
+def test_game_index_defaults_to_1_for_a_bare_id_result():
+    """Older transports/tests return a plain int, not a dict — no
+    next_game_index to read, same fallback."""
+    ds, t = make(open_result=11)
+    ds.open_lobby()
+    assert ds.game_index == 1
+
+
+def test_next_game_index_does_not_affect_reopening_the_same_draft():
+    """Only a genuinely NEW draft id resets game_index at all — reopening the
+    same one (e.g. /start after /custom) must not let a stale
+    next_game_index clobber a count post_results() has already advanced."""
+    reply_1 = {"draft_id": 12, "created": True, "rows": 0, "lobby": [], "expected_names": [], "unlinked": [], "next_game_index": 1}
+    ds, t = make(open_result=lambda: reply_1)
+    ds.open_lobby()
+    ds.post_results("/tmp/g1.png")
+    assert ds.game_index == 2
+    ds.open_lobby()  # same draft_id — even a (deliberately stale) next_game_index of 1 must be ignored
+    assert ds.game_index == 2, "same draft id — must not reset"
+
+
 class RaisingTransport(FakeTransport):
     def open_set_draft(self, *a, **k):
         raise RuntimeError("boom")
@@ -544,3 +590,45 @@ def test_older_server_reply_without_draft_players_still_snaps_from_lobby():
     ds.open_lobby(roster=["d1"])
     assert ds.draft_players == []
     assert ds.snap_names(["Rob0cop"]) == ["Caution"]
+
+
+# ---- resolve_alias() — single-name exact lookup (2026-09-11) --------------
+#
+# Added for MatchRunner's damage-feed killer/victim resolution: a live
+# incident showed a clean, correctly-OCR'd read ("CONNOR") that wasn't this
+# match's already-resolved slot display name for that player ("Mojo") — but
+# "connor" WAS one of that player's other known ladder aliases the whole
+# time. resolve_alias() finds that directly (exact fold match), unlike
+# find_winning_slot()'s fuzzy score against slot_map, which matched an
+# unrelated player instead.
+
+def test_resolve_alias_finds_a_known_alias_not_the_display_name():
+    reply = {
+        "draft_id": 11, "created": True, "rows": 1, "roster_resolved": 1,
+        "lobby": [{"discord_id": "d1", "player": "Mojo", "persona": "connor", "names": ["Mojo", "connor"]}],
+        "expected_names": ["Mojo"], "unlinked": [],
+    }
+    ds, t = make(open_result=reply)
+    ds.open_lobby(roster=["d1"])
+    assert ds.resolve_alias("CONNOR") == "Mojo"
+
+
+def test_resolve_alias_returns_none_for_an_unknown_name():
+    ds, t = make(open_result={"draft_id": 11, "created": True, "rows": 0, "lobby": [], "expected_names": [], "unlinked": []})
+    ds.open_lobby(roster=[])
+    assert ds.resolve_alias("totallyunknown") is None
+
+
+def test_resolve_alias_never_uses_the_fuzzy_pass():
+    """Unlike find_winning_slot(), a clean read that merely resembles a
+    player's name (rather than matching a registered alias exactly) must
+    stay unresolved here — that's find_winning_slot()'s job, with its own
+    confidence floor, not this method's."""
+    reply = {
+        "draft_id": 11, "created": True, "rows": 1, "roster_resolved": 1,
+        "lobby": [{"discord_id": "d1", "player": "Coen", "persona": None, "names": ["Coen"]}],
+        "expected_names": ["Coen"], "unlinked": [],
+    }
+    ds, t = make(open_result=reply)
+    ds.open_lobby(roster=["d1"])
+    assert ds.resolve_alias("CONNOR") is None
