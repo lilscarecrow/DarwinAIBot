@@ -232,29 +232,25 @@ def test_a_second_merged_kill_line_also_resolves():
     assert fields["method"] == "COLD"
 
 
-# ---- feed debug image capture (2026-09-10) ---------------------------------
+# ---- feed debug image capture (2026-09-10, call site removed 2026-09-14) ---
+#
+# save_feed_debug_images() (game/ocr.py) existed to chase the colored-name OCR
+# gap (player names render orange/red, not white) by saving a raw-color crop
+# on every live first-blood/kill match to inspect. That gap is fixed now (the
+# outline-detection rewrite in ocr_feed_text()'s preprocessing) — left wired
+# in, it was quietly filling screenshots/errors/ with debug captures nobody
+# needed anymore (1,320 of 1,325 files there, 109MB, found live) since
+# feed_kill alone matches on the order of hundreds of times a match. The call
+# site in _poll_damage_feed_worker() was removed; _save_feed_debug_images()
+# itself is kept (not deleted) in case a similar OCR-tuning need comes up
+# again — see its own docstring.
 
-def test_a_matched_line_triggers_a_debug_image_save():
-    """save_feed_debug_images() (game/ocr.py) is called whenever a pattern
-    matches, so the next live occurrence leaves behind a raw-color crop to
-    inspect — this is how the still-open colored-name OCR gap (player names
-    render orange/red, not white; the current preprocessing can't separate
-    them from a colored background) gets fixed with real pixel data instead
-    of another guess."""
+def test_a_matched_line_no_longer_triggers_a_debug_image_save():
     runner, ds = make_runner(ROSTER)
     with patch("game.ocr.save_feed_debug_images") as save_debug:
         run_worker(runner, "STEFFKNIGHT DREW FIRST BLOOD FROM HELLCRYING")
-    save_debug.assert_called_once()
-    args = save_debug.call_args[0]
-    assert args[0] is None  # the (patched) screenshot, passed straight through
-    assert "feed_first_blood" in args[3]  # label embeds the matched kind
-
-
-def test_a_debug_save_failure_does_not_break_event_emission():
-    runner, ds = make_runner(ROSTER)
-    with patch("game.ocr.save_feed_debug_images", side_effect=RuntimeError("disk full")):
-        run_worker(runner, "STEFFKNIGHT DREW FIRST BLOOD FROM HELLCRYING")
-    assert len(ds.events) == 1
+    save_debug.assert_not_called()
+    assert len(ds.events) == 1  # the match itself still fires normally
 
 
 def test_no_debug_save_when_nothing_matches():
@@ -262,6 +258,18 @@ def test_no_debug_save_when_nothing_matches():
     with patch("game.ocr.save_feed_debug_images") as save_debug:
         run_worker(runner, "ZONE CLOSING IN 30 SECONDS")
     save_debug.assert_not_called()
+
+
+def test_save_feed_debug_images_still_works_as_a_kept_but_disconnected_utility():
+    """Confirms the helper itself wasn't broken by disconnecting it — callable
+    directly if a similar OCR-tuning need comes up again."""
+    runner, ds = make_runner(ROSTER)
+    with patch("game.ocr.save_feed_debug_images") as save_debug:
+        runner._save_feed_debug_images(None, "feed_first_blood")
+    save_debug.assert_called_once()
+    args = save_debug.call_args[0]
+    assert args[0] is None
+    assert "feed_first_blood" in args[3]
 
 
 def test_worker_clears_the_busy_flag_even_on_failure():

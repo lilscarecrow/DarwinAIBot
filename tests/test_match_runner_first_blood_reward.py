@@ -1,20 +1,22 @@
 """First-blood reward (give_wood) — queued when a killer is confirmed via
 the damage feed, fired by the main loop once it's safe to (2026-09-10).
+
+_give_first_blood_reward() itself was rewritten 2026-09-14: it used to
+switch POV to the target and drop the card at screen-center, resting on the
+unverified assumption the spectate switch had already landed by drop time —
+found live to occasionally miss, with verify_card_plays: false hiding it
+completely. It now drops the card directly on the target's own portrait via
+_player_portrait_target() (game/player_cards_v2.py's live geometry, the
+same data already used for name/alive polling) — no POV switch, no POV
+lock, no settle wait; see game/match_runner.py's docstring on
+_give_reward_card() for the full reasoning.
 """
 from unittest.mock import patch
 
 import pytest
 
-from game.match_runner import MatchRunner, CardEvent
+from game.match_runner import MatchRunner, CardEvent, _PLAYER_PORTRAIT_TARGET_Y
 from session.state import SessionState
-
-
-@pytest.fixture(autouse=True)
-def _no_pov_settle_delay(monkeypatch):
-    """_give_reward_card() waits _POV_SWITCH_SETTLE_SECONDS (real time,
-    2026-09-10) after the POV switch before dragging the card — zeroed here
-    so these tests stay fast; the delay itself isn't what's under test."""
-    monkeypatch.setattr("game.match_runner._POV_SWITCH_SETTLE_SECONDS", 0)
 
 
 class FakeDraftLifecycle:
@@ -39,6 +41,10 @@ def make_runner(names=None, deck_layout=None, ds=None, config=None):
     runner._session.unlock_pov()
     runner._player_names = list(names or ["SteffKnight", "Hellcrying", "Guts"])
     runner._player_alive = [True] * len(runner._player_names)
+    # Arbitrary but distinct x's — enough for _player_portrait_target() to
+    # resolve a real coordinate per player, same shape v2.detect_cards()
+    # would actually produce.
+    runner._player_slot_xs = [100 * (i + 1) for i in range(len(runner._player_names))]
     runner._deck_layout = list(deck_layout if deck_layout is not None else ["give_wood"])
     runner._last_confirmed_points = 10  # plenty — give_wood costs 1
     return runner
@@ -214,48 +220,34 @@ def test_claims_the_reward_before_calling_give_so_it_cannot_double_fire():
 
 # ---- _give_first_blood_reward -----------------------------------------------
 
-def test_give_locks_pov_only_for_the_duration_of_this_action():
-    """POV must be unlocked before the call (nothing else should have left
-    it locked), actively locked WHILE the POV-switch + card play are
-    happening (the actual risky window — a viewer's own /pov during this
-    exact moment is what corrupts the reward), and unlocked again right
-    after — not locked for the rest of the match."""
-    runner = make_runner()
-    assert runner._session.is_pov_locked() is False  # nothing else locked it beforehand
-
-    locked_during_press = None
-    locked_during_play = None
-
-    def check_locked_during_press(*a, **k):
-        nonlocal locked_during_press
-        locked_during_press = runner._session.is_pov_locked()
-
-    def check_locked_during_play(*a, **k):
-        nonlocal locked_during_play
-        locked_during_play = runner._session.is_pov_locked()
-
-    with patch.object(runner, "_press", side_effect=check_locked_during_press), \
-         patch.object(runner, "_play_tray_card", side_effect=check_locked_during_play):
-        runner._give_first_blood_reward(killer_index=1, deck_pos=0)
-
-    assert locked_during_press is True
-    assert locked_during_play is True
-    assert runner._session.is_pov_locked() is False  # unlocked again once the action is done
-
-
-def test_give_locks_pov_switches_camera_and_plays_the_card_at_center():
+def test_give_plays_the_card_directly_on_the_targets_portrait():
+    """No POV switch involved (2026-09-14) — the card drags straight to the
+    target's own portrait coordinate, computed from self._player_slot_xs
+    (the same live geometry used for name/alive polling)."""
     ds = FakeDraftLifecycle()
     runner = make_runner(ds=ds)
     with patch.object(runner, "_press") as press, \
          patch.object(runner, "_play_tray_card") as play:
         runner._give_first_blood_reward(killer_index=1, deck_pos=0)
-    press.assert_called_once_with("2")  # slot_number_for_index(1) == "2"
+    press.assert_not_called()  # no camera switch anymore
     play.assert_called_once()
     event, target, *_ = play.call_args[0]
-    assert target == (960, 540)
+    assert target == (runner._player_slot_xs[1], _PLAYER_PORTRAIT_TARGET_Y)
     assert event.card_type == "give_wood"
     assert event.deck_position == 0
-    assert runner._session.is_pov_locked() is False  # unlocked again afterward
+    assert event.drop_target == target
+
+
+def test_give_never_touches_the_pov_lock():
+    """The old mechanism locked POV for the duration of the switch+drag to
+    stop a viewer's own /pov racing it; with no camera switch left to race,
+    this reward must not touch the lock at all — locking and immediately
+    unlocking around a no-op window would just be needless churn."""
+    runner = make_runner()
+    assert runner._session.is_pov_locked() is False
+    with patch.object(runner, "_press"), patch.object(runner, "_play_tray_card"):
+        runner._give_first_blood_reward(killer_index=1, deck_pos=0)
+    assert runner._session.is_pov_locked() is False
 
 
 def test_give_emits_a_card_play_event_like_any_other_card():
@@ -264,29 +256,19 @@ def test_give_emits_a_card_play_event_like_any_other_card():
     it itself, or this reward would be invisible on the ladder's live feed."""
     ds = FakeDraftLifecycle()
     runner = make_runner(ds=ds)
-    with patch.object(runner, "_press"), patch.object(runner, "_play_tray_card"):
+    with patch.object(runner, "_play_tray_card"):
         runner._give_first_blood_reward(killer_index=1, deck_pos=0)
     assert ("card_play", {"card": "give_wood", "name": "First Blood Reward (Give wood)", "elapsed_ms": 0}) in ds.events
 
 
-def test_give_unlocks_pov_even_if_the_card_play_raises():
+def test_give_skips_without_playing_when_no_portrait_coordinate_is_tracked():
+    """If the player-bar snapshot never ran (or failed), self._player_slot_xs
+    is empty — _player_portrait_target() can't resolve a coordinate for
+    anyone, so the reward must skip cleanly rather than drop blind (e.g. at
+    a hardcoded screen-center, which would land wherever the camera happens
+    to already be — exactly the failure mode this rewrite exists to avoid)."""
     runner = make_runner()
-    with patch.object(runner, "_press"), \
-         patch.object(runner, "_play_tray_card", side_effect=RuntimeError("boom")):
-        with pytest.raises(RuntimeError):
-            runner._give_first_blood_reward(killer_index=1, deck_pos=0)
-    assert runner._session.is_pov_locked() is False
-
-
-def test_give_aborts_without_playing_if_force_stopped_during_the_settle_wait():
-    """A force-stop landing during the POV-switch settle wait (see
-    _POV_SWITCH_SETTLE_SECONDS) must skip the card drag entirely rather than
-    dragging into a match that's being torn down — and still release the
-    POV lock via the finally block."""
-    runner = make_runner()
-    runner._stop.set()  # Event.wait() returns immediately (True) once set
-    with patch.object(runner, "_press"), \
-         patch.object(runner, "_play_tray_card") as play:
+    runner._player_slot_xs = []
+    with patch.object(runner, "_play_tray_card") as play:
         runner._give_first_blood_reward(killer_index=1, deck_pos=0)
     play.assert_not_called()
-    assert runner._session.is_pov_locked() is False

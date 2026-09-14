@@ -58,7 +58,7 @@ _OAUTH_SCOPES = (
     "user:bot+user:read:chat+user:write:chat+channel:bot"
     "+channel:edit:commercial+channel:read:subscriptions+bits:read"
     "+channel:read:redemptions+channel:manage:redemptions+moderation:read"
-    "+channel:manage:predictions"
+    "+channel:manage:predictions+channel:manage:broadcast"
 )
 _OAUTH_URL = f"http://localhost:4343/oauth?scopes={_OAUTH_SCOPES}"
 
@@ -365,6 +365,31 @@ class DarwinTwitchBot(commands.Bot):
             return True
         except Exception as e:
             logger.warning("Twitch ad break failed: %s", e)
+            return False
+
+    async def set_stream_title(self, title: str) -> bool:
+        """Best-effort: set the broadcaster's stream title via the Modify Channel
+        Information API. Requires the channel:manage:broadcast scope (part of
+        _OAUTH_SCOPES above — visit _OAUTH_URL to authorize). Works whether or
+        not the channel is currently live. Never raises — same fire-and-forget
+        convention as announce()/start_ad_break() above.
+
+        No token_for kwarg here (2026-09-12 fix, found live: every call raised
+        "PartialUser.modify_channel() got an unexpected keyword argument
+        'token_for'") — unlike fetch_channel_info() below, modify_channel()
+        doesn't take one at all; it always uses the PartialUser's own id
+        internally (see its source: patch_channel_info(broadcaster_id=self.id,
+        token_for=self.id, ...)). Since `broadcaster` here is already the
+        PartialUser for self._owner_id, that's exactly the token it needs —
+        nothing to pass explicitly.
+        """
+        try:
+            broadcaster = self.create_partialuser(user_id=self._owner_id)
+            await broadcaster.modify_channel(title=title)
+            logger.info("Twitch stream title set to: %s", title)
+            return True
+        except Exception as e:
+            logger.warning("Twitch set stream title failed: %s", e)
             return False
 
     async def create_prediction(self, title: str, outcomes: list[str], prediction_window: int):

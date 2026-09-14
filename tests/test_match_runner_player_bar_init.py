@@ -33,9 +33,9 @@ class FakeDraftLifecycle:
         self.match_start_calls.append(list(names))
 
 
-def make_runner():
+def make_runner(config=None):
     ds = FakeDraftLifecycle()
-    runner = MatchRunner({}, SessionState(), lambda *a: None, draft_lifecycle=ds)
+    runner = MatchRunner(config or {}, SessionState(), lambda *a: None, draft_lifecycle=ds)
     return runner, ds
 
 
@@ -106,4 +106,33 @@ def test_no_obs_call_when_no_lifecycle_is_wired():
          patch("game.obs_control.is_enabled", return_value=True), \
          patch("game.obs_control.set_source_text") as set_text:
         runner._init_player_bar_and_push()  # must not raise, no self._ds to read game_index from
+    set_text.assert_not_called()
+
+
+# ---- tournament_mode skips the ds/banner block entirely (2026-09-12) -------
+#
+# discord_bot.py's _open_ds_draft() deliberately never opens a draft for a
+# tournament match — but DraftLifecycle.on_match_start() opens a fresh
+# (untagged) one on its own the instant it sees no draft id yet, so calling
+# it here unconditionally would silently defeat that. Detection itself
+# (_init_player_bar()) must still run — the player bar / first-blood /
+# elimination tracking has nothing to do with the ladder.
+
+def test_tournament_mode_skips_on_match_start_and_the_event():
+    runner, ds = make_runner(config={"tournament_mode": True})
+    with patch("game.screen_detection.take_screenshot", return_value=None), \
+         patch("game.player_cards_v2.detect_cards", return_value=[]):
+        runner._init_player_bar_and_push()
+    assert ds.match_start_calls == []
+    assert ds.events == []
+
+
+def test_tournament_mode_skips_the_obs_banner_update_too():
+    runner, ds = make_runner(config={"tournament_mode": True})
+    ds.game_index = 3
+    with patch("game.screen_detection.take_screenshot", return_value=None), \
+         patch("game.player_cards_v2.detect_cards", return_value=[]), \
+         patch("game.obs_control.is_enabled", return_value=True), \
+         patch("game.obs_control.set_source_text") as set_text:
+        runner._init_player_bar_and_push()
     set_text.assert_not_called()

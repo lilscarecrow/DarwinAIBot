@@ -125,7 +125,11 @@ def read_director_points(screenshot: np.ndarray, region: tuple[int, int, int, in
     try:
         digits = "".join(filter(str.isdigit, text))
         if digits:
-            return int(digits)
+            value = int(digits)
+            if value > 10:
+                logger.debug("Director points OCR read %d exceeds the 0-10 max — disregarding as a misread (raw text: %r)", value, text)
+                return None
+            return value
     except ValueError:
         pass
     logger.debug("Could not parse director points from OCR text: %r", text)

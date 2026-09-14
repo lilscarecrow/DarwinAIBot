@@ -9,18 +9,8 @@ a permanent one-shot latch.
 """
 from unittest.mock import patch
 
-import pytest
-
-from game.match_runner import MatchRunner, CardEvent
+from game.match_runner import MatchRunner, CardEvent, _PLAYER_PORTRAIT_TARGET_Y
 from session.state import SessionState
-
-
-@pytest.fixture(autouse=True)
-def _no_pov_settle_delay(monkeypatch):
-    """_give_reward_card() waits _POV_SWITCH_SETTLE_SECONDS (real time,
-    2026-09-10) after the POV switch before dragging the card — zeroed here
-    so these tests stay fast; the delay itself isn't what's under test."""
-    monkeypatch.setattr("game.match_runner._POV_SWITCH_SETTLE_SECONDS", 0)
 
 
 def make_runner(names=None, alive=None, deck_layout=None, config=None):
@@ -28,6 +18,10 @@ def make_runner(names=None, alive=None, deck_layout=None, config=None):
     runner._session.unlock_pov()  # see test_match_runner_first_blood_reward.py's make_runner
     runner._player_names = list(names or ["SteffKnight", "Hellcrying", "Guts"])
     runner._player_alive = list(alive) if alive is not None else [True] * len(runner._player_names)
+    # Arbitrary but distinct x's — enough for _player_portrait_target() to
+    # resolve a real coordinate per player, same shape v2.detect_cards()
+    # would actually produce.
+    runner._player_slot_xs = [100 * (i + 1) for i in range(len(runner._player_names))]
     runner._deck_layout = list(deck_layout if deck_layout is not None else ["favorite_player"])
     return runner
 
@@ -224,15 +218,25 @@ def test_releases_the_slot_before_firing_so_a_new_redemption_can_queue_immediate
 
 # ---- _give_favorite_reward (thin wrapper around _give_reward_card) ---------
 
-def test_give_favorite_reward_plays_favorite_player_at_center():
+def test_give_favorite_reward_plays_directly_on_the_targets_portrait():
+    """No POV switch involved (2026-09-14) — see the matching test in
+    test_match_runner_first_blood_reward.py for the full reasoning."""
     runner = make_runner()
     with patch.object(runner, "_press") as press, \
          patch.object(runner, "_play_tray_card") as play:
         runner._give_favorite_reward(player_index=1, deck_pos=0)
-    press.assert_called_once_with("2")
+    press.assert_not_called()
     play.assert_called_once()
     event, target, *_ = play.call_args[0]
-    assert target == (960, 540)
+    assert target == (runner._player_slot_xs[1], _PLAYER_PORTRAIT_TARGET_Y)
     assert event.card_type == "favorite_player"
     assert event.deck_position == 0
     assert runner._session.is_pov_locked() is False
+
+
+def test_give_favorite_reward_skips_without_playing_when_no_portrait_coordinate_is_tracked():
+    runner = make_runner()
+    runner._player_slot_xs = []
+    with patch.object(runner, "_play_tray_card") as play:
+        runner._give_favorite_reward(player_index=1, deck_pos=0)
+    play.assert_not_called()

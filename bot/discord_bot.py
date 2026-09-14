@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import discord
@@ -197,9 +198,9 @@ _DISCORD_API_TIMEOUT_SECONDS = 15.0
 _LOBBY_PING_CHANNEL_ID = 1520520910006779915
 _LOBBY_PING_ROLE_ID = 1520526014600577134
 
-# Tournament mode (toggled via /tournament, persisted in config.json as tournament_mode):
-# delays /custom's OBS stream start by this long instead of going live instantly.
-_TOURNAMENT_STREAM_DELAY_SECONDS = 120
+# Twitch stream title shown while tournament mode is on (config: twitch_tournament_stream_title,
+# defaults to this) — see DirectorCog.tournament()'s Twitch-title toggle.
+_DEFAULT_TOURNAMENT_STREAM_TITLE = "$1000 Hotdog Hoedown Tournament"
 
 # "Who wins?" Twitch prediction (config: twitch_predictions_enabled). Betting window —
 # Twitch auto-locks the prediction once this elapses; chosen short since the winner
@@ -232,6 +233,12 @@ _COLOR_FAIL    = 0xE74C3C  # red     — failure / error
 _COLOR_ACTIVE  = 0x3498DB  # blue    — launching / in-progress
 _COLOR_WARN    = 0xE67E22  # orange  — active match / warning
 _COLOR_NEUTRAL = 0x95A5A6  # gray    — idle / neutral
+
+# Region breakdown: flag an account whose creation date OR join date to this
+# guild is under this many days old — a cheap, zero-extra-permission signal
+# an admin can eyeball before running /role add (see CLAUDE.md's Scrim
+# Signup System section for the moderation context this supports).
+_NEW_ACCOUNT_FLAG_DAYS = 7
 
 
 class _EndConfirmView(discord.ui.View):
@@ -530,11 +537,19 @@ class DirectorCog(commands.Cog):
         longer for the snapshot than the prediction would even stay open) then
         requires is_lobby_captured() — a partial capture means no prediction
         this match, not a guess. No-ops entirely if twitch_predictions_enabled
-        (config) is false or the Twitch bot isn't running. Never raises.
+        (config) is false, the Twitch bot isn't running, or tournament_mode
+        is on (2026-09-12) — with no ladder draft opened for a tournament
+        match (see _open_ds_draft()), self._ds.known_players/unlinked/
+        roster_size all stay empty, so is_lobby_captured()'s slot-name
+        resolution has nothing server-confirmed to check names against;
+        rather than open a prediction on a lobby capture we can't actually
+        vouch for, this mode just doesn't run one at all. Never raises.
         """
         if not self.bot.config.get("twitch_predictions_enabled", False):
             return
         if self.bot.twitch_bot is None:
+            return
+        if self.bot.config.get("tournament_mode", False):
             return
         try:
             loop = asyncio.get_running_loop()
@@ -612,6 +627,38 @@ class DirectorCog(commands.Cog):
         if self.bot.twitch_bot is not None:
             await self.bot.twitch_bot.announce(text)
 
+    async def _push_tournament_stream_title(self, tournament_mode: bool) -> Optional[str]:
+        """Push the config-driven stream title matching tournament_mode (2026-09-14) —
+        twitch_tournament_stream_title when True, twitch_default_stream_title when
+        False. Just two fixed config values, no fetching/stashing — see /tournament's
+        Commands section in CLAUDE.md for why the earlier fetch-and-restore design
+        was replaced.
+
+        Called from two places: /tournament's toggle handler (the obvious one), and
+        /custom's stream-start success path (found live, 2026-09-14: a stream went
+        live still showing stale tournament-era title text, because nothing had
+        actually toggled /tournament since the config-driven fix landed — the title
+        was only ever re-pushed reactively, never when a stream actually went live).
+        Calling this at both points means a stale title self-corrects the moment the
+        next stream starts, not only on an explicit toggle.
+
+        No-ops (returns None) if self.bot.twitch_bot is None (twitch_enabled: false).
+        Returns a short status string for the caller's embed/response.
+        """
+        if self.bot.twitch_bot is None:
+            return None
+        if tournament_mode:
+            key, target_title = "twitch_tournament_stream_title", self.bot.config.get(
+                "twitch_tournament_stream_title", _DEFAULT_TOURNAMENT_STREAM_TITLE
+            )
+        else:
+            key, target_title = "twitch_default_stream_title", self.bot.config.get("twitch_default_stream_title", "")
+        if not target_title:
+            return f"- ⚠️ No {key} configured — stream title left as-is."
+        if await self.bot.twitch_bot.set_stream_title(target_title):
+            return f"- Twitch stream title set to **{target_title}**."
+        return "- ⚠️ Could not update the Twitch stream title."
+
     async def _set_streaming_presence(self):
         """Switch the Discord bot's own presence to the special purple 'Streaming'
         status, linking to the Twitch channel. Discord only shows that indicator
@@ -652,10 +699,24 @@ class DirectorCog(commands.Cog):
         next match can be started. The whole point of firing here (at match end,
         not later) is to give the ad the maximum runway to play out during the
         downtime before /custom starts the next match.
+
+        Skipped entirely under tournament_mode (2026-09-12) — with the OBS
+        broadcast running several minutes behind real time in that mode (a
+        manually-configured OBS Stream Delay, since the bot has no API path
+        to set one itself — see the /tournament note in CLAUDE.md), firing
+        an ad break "at match end" by wall-clock time would actually land on
+        whatever moment the *delayed* broadcast is showing right then — most
+        likely mid-match action for viewers, cutting into the finish rather
+        than covering genuine downtime. Nothing about the ad's own timing is
+        adjustable to compensate (Twitch's Start Commercial API takes no
+        schedule, only "start now"), so the simplest correct fix is to not
+        run one at all for tournament matches.
         """
         if not self.bot.config.get("twitch_ads_enabled", False):
             return
         if self.bot.twitch_bot is None:
+            return
+        if self.bot.config.get("tournament_mode", False):
             return
         length = int(self.bot.config.get("twitch_ad_break_seconds", 180))
         asyncio.ensure_future(self.bot.twitch_bot.start_ad_break(length))
@@ -683,19 +744,6 @@ class DirectorCog(commands.Cog):
             None, obs_control.set_source_text,
             self.bot.config.get("obs_game_number_source", "Game Number"), "",
         )
-
-    async def _delayed_stream_start(self):
-        """Tournament mode: start the OBS stream _TOURNAMENT_STREAM_DELAY_SECONDS after
-        /custom creates the lobby, instead of instantly. Fire-and-forget — scheduled via
-        asyncio.ensure_future, not awaited by the caller, so this never blocks /custom's
-        response or the rest of its success-path work (announce, minimap cover, ping)."""
-        await asyncio.sleep(_TOURNAMENT_STREAM_DELAY_SECONDS)
-        from game import obs_control
-        loop = asyncio.get_running_loop()
-        started = await loop.run_in_executor(None, obs_control.start_stream)
-        logger.info("Tournament mode: delayed stream start %s", "succeeded" if started else "failed")
-        if started:
-            await self._set_streaming_presence()
 
     async def _mirror_results(self, results_text: str):
         """Post match results to the secondary guild channel."""
@@ -839,14 +887,31 @@ class DirectorCog(commands.Cog):
 
         Passes the scrim signup roster (Discord IDs captured just above in
         /custom) so the ladder can pre-seed linked players by canonical name.
+
+        **Skipped entirely under tournament_mode (2026-09-12, reversed from
+        the 2026-09-04 tagged-draft design):** a tournament match shouldn't
+        touch the ladder's draft system at all — not even as a
+        tournament-tagged one. `self._ds` is simply never given a draft id
+        this lobby, so `_ds.game_index` stays at its untouched default (the
+        "Game N" banner is hidden while tournament mode is on anyway — see
+        game/obs_control.py's set_source_visible call in /tournament — so a
+        meaningless game_index has no visible effect), and `_close_ds_draft`
+        already no-ops cleanly when there's no draft id to close.
+
+        MatchRunner must not fall back to self-opening one either —
+        `DraftLifecycle.on_match_start()` opens a fresh (untagged) draft on
+        its own the moment it sees no draft id yet, so
+        `_init_player_bar_and_push()` in game/match_runner.py skips calling
+        it at all while `self._tournament_mode` is set, for the same reason.
         """
+        if self.bot.config.get("tournament_mode", False):
+            logger.info("darwinstalker: skipped opening a draft (tournament_mode)")
+            return
         loop = asyncio.get_running_loop()
         roster = self._resolved_roster
-        # Tag the draft with the ladder tournament only while tournament mode is on.
-        slug = self.bot.config.get("ds_ingest_tournament_slug") if self.bot.config.get("tournament_mode") else None
         try:
             await loop.run_in_executor(
-                None, lambda: self._ds.open_lobby(roster=roster, tournament_slug=slug)
+                None, lambda: self._ds.open_lobby(roster=roster)
             )
         except Exception as e:
             logger.warning("darwinstalker open_lobby failed: %s", e)
@@ -1022,6 +1087,9 @@ class DirectorCog(commands.Cog):
         elif splash_center:
             logger.info("Splash screen detected — clicking Continue at %s", splash_center)
             try:
+                from game.card_actions import focus_darwin_window
+                if not focus_darwin_window():
+                    logger.warning("Launch: focus_darwin_window failed — clicking Continue anyway, may miss")
                 pyautogui.moveTo(*splash_center)
                 _time.sleep(1.0)
                 pyautogui.click()
@@ -1201,18 +1269,25 @@ class DirectorCog(commands.Cog):
             stream_started = False
             stream_status_text = None
             if obs_control.is_enabled():
-                if tournament_mode:
-                    # Fire-and-forget: don't block /custom's response or anything else in
-                    # this flow on a 2-minute sleep. Whether the delayed start actually
-                    # succeeds isn't known yet at response time, hence the different
-                    # embed wording below (no "Live"/"Could not start" claim).
-                    asyncio.ensure_future(self._delayed_stream_start())
-                    stream_status_text = f"🕐 Starting in {_TOURNAMENT_STREAM_DELAY_SECONDS // 60} min (tournament mode)"
-                else:
-                    stream_started = await loop.run_in_executor(None, obs_control.start_stream)
-                    stream_status_text = "🔴 Live" if stream_started else "⚠️ Could not start (check OBS/websocket connection)"
-                    if stream_started:
-                        await self._set_streaming_presence()
+                # No delayed start under tournament_mode (2026-09-12, reversed —
+                # see CLAUDE.md's /tournament note): delaying when the stream goes
+                # live only ever hid the first couple minutes of a match — it did
+                # nothing for the other 90%+ of it, so it never actually stopped
+                # someone watching live from relaying real-time positions to a
+                # player. A real fix needs a continuous broadcast delay (Twitch's
+                # own channel.delay, which requires Partner status this account
+                # doesn't have; OBS's local Advanced "Stream Delay" isn't
+                # controllable via obs-websocket at all) — see CLAUDE.md for the
+                # manual OBS setup that's the actual mitigation now. Tournament
+                # matches just start the stream immediately like everything else.
+                stream_started = await loop.run_in_executor(None, obs_control.start_stream)
+                stream_status_text = "🔴 Live" if stream_started else "⚠️ Could not start (check OBS/websocket connection)"
+                if stream_started:
+                    await self._set_streaming_presence()
+                    # Keeps the title correct even if tournament_mode hasn't been
+                    # toggled recently — see _push_tournament_stream_title()'s
+                    # docstring for the live incident this covers.
+                    await self._push_tournament_stream_title(tournament_mode)
 
             await self._twitch_announce(
                 "This is an automated Darwin Project scrim, run by the AI Director. "
@@ -1310,6 +1385,7 @@ class DirectorCog(commands.Cog):
         import pyautogui
         import pyperclip
         from game.screen_detection import wait_for_template_center, save_error_screenshot, take_screenshot, find_template
+        from game.card_actions import focus_darwin_window
 
         # All coordinates calibrated for 1920×1080.
         # Sequence: PLAY → set region → BACK → CUSTOM → Create New → set PRIVATE → SOLO CLASSIC → START → DIRECTOR → copy password
@@ -1360,6 +1436,17 @@ class DirectorCog(commands.Cog):
             return None
 
         try:
+            # Mouse clicks throughout this flow only register if Darwin is the
+            # OS-focused window — same requirement as the post-match MAIN MENU
+            # click. /custom is run on-demand from Discord, so whatever the admin
+            # was last clicked into (Discord itself, the console) may still hold
+            # focus when this starts.
+            if not focus_darwin_window():
+                logger.warning("Custom: focus_darwin_window failed — retrying once before starting the flow")
+                time.sleep(0.3)
+                if not focus_darwin_window():
+                    logger.warning("Custom: focus_darwin_window failed again — proceeding anyway, clicks may miss")
+
             # 0. Verify/set the region — skipped entirely (no PLAY screen visit at
             # all) when last_selected_region (config, persisted below) already
             # matches what was requested. This is the common case — the region
@@ -1619,7 +1706,7 @@ class DirectorCog(commands.Cog):
             detect_current_screen, wait_for_template_center,
             find_template, take_screenshot, save_error_screenshot,
         )
-        from game.card_actions import press_key
+        from game.card_actions import press_key, focus_darwin_window
 
         def stopped() -> bool:
             return self._stop_event.is_set()
@@ -1634,6 +1721,16 @@ class DirectorCog(commands.Cog):
             return not stopped()
 
         try:
+            # Mouse clicks below only register if Darwin is the OS-focused window
+            # (same requirement _do_post_match_return has for its MAIN MENU click) —
+            # something else (Discord, the console) may well have focus by the time
+            # this runs, since it's triggered on-demand via /menu or a reset path.
+            if not focus_darwin_window():
+                logger.warning("Menu: focus_darwin_window failed — retrying once before navigating")
+                time.sleep(0.3)
+                if not focus_darwin_window():
+                    logger.warning("Menu: focus_darwin_window failed again — navigating anyway, clicks may miss")
+
             for step in range(8):
                 if stopped():
                     return False
@@ -1729,7 +1826,17 @@ class DirectorCog(commands.Cog):
         from game.card_actions import focus_darwin_window
 
         try:
-            focus_darwin_window()
+            if not focus_darwin_window():
+                # SetForegroundWindow can silently no-op (Windows' foreground-lock
+                # timeout, hwnd not found yet, etc.) — retry once rather than
+                # blindly clicking wherever the cursor lands with no idea whether
+                # Darwin is actually the focused window. Found live: the click
+                # missed entirely when something else (Discord, the console) had
+                # focus at match end.
+                logger.warning("Post-match: focus_darwin_window failed — retrying once before clicking MAIN MENU")
+                time.sleep(0.3)
+                if not focus_darwin_window():
+                    logger.warning("Post-match: focus_darwin_window failed again — clicking anyway, may miss")
             time.sleep(0.3)
 
             screenshot = take_screenshot()
@@ -2218,11 +2325,10 @@ class DirectorCog(commands.Cog):
 
     @app_commands.command(
         name="tournament",
-        description="Toggle tournament mode: delayed stream start + minimap stays covered all match",
+        description="Toggle tournament mode: no ladder draft/prediction, minimap stays covered all match",
     )
     @app_commands.describe(
         enabled="Turn tournament mode on or off",
-        slug="darwinstalker.com tournament slug to tag this session's sets with (e.g. hotdog-hoedown)",
     )
     @app_commands.choices(enabled=[
         app_commands.Choice(name="On", value=1),
@@ -2232,41 +2338,91 @@ class DirectorCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         enabled: app_commands.Choice[int],
-        slug: Optional[str] = None,
     ):
         if not await self._role_check(interaction):
             return
 
+        # Deferred (2026-09-11): suspend_signup()/resume_signup() below do real
+        # Discord API deletes/posts (same class of work /role add and /role
+        # remove already defer for), which can run past the 3s window a plain
+        # response.send_message() needs.
+        await interaction.response.defer(thinking=True)
+
+        from game import obs_control
+        loop = asyncio.get_running_loop()
+
         value = bool(enabled.value)
         self._persist_config_value("tournament_mode", value)
-        if value and slug and slug.strip():
-            # The ladder tags every draft opened while tournament mode is on with
-            # this slug (name resolution then uses the tournament's checked-in
-            # roster). The key survives "Off" so the next "On" reuses it.
-            self._persist_config_value("ds_ingest_tournament_slug", slug.strip().lower())
-        slug_in_effect = (self.bot.config.get("ds_ingest_tournament_slug") or "").strip()
+
+        # No open scrim signup queue while a tournament lobby is running (2026-09-11) —
+        # suspend_signup()/resume_signup() delete/repost the signup + region-breakdown
+        # messages; see ScrimCog for why this doesn't just clear reactions in place.
+        scrim_cog = self.bot.get_cog("ScrimCog")
+        if scrim_cog is not None:
+            if value:
+                await scrim_cog.suspend_signup()
+            else:
+                await scrim_cog.resume_signup()
+
+        # Twitch stream title mirrors tournament mode (2026-09-12, simplified
+        # 2026-09-14): just two fixed config values, one per state — no fetching
+        # or stashing whatever the title happened to be beforehand. The earlier
+        # stash-and-restore design could restore a title that was itself already
+        # stale (e.g. leftover tournament-signup promo text from before the
+        # bracket even started) — found live, see CLAUDE.md. Picking the target
+        # title straight from config for both directions makes that class of bug
+        # impossible: there's nothing to restore, only two known-good values to
+        # set. See _push_tournament_stream_title() — also called from /custom's
+        # stream-start path, so a title left stale from a previous session gets
+        # corrected the moment the next stream goes live, not just on an
+        # explicit /tournament toggle (found live, 2026-09-14: a stream went
+        # live still showing tournament-era title text because nothing had
+        # toggled /tournament since the config-driven fix landed).
+        title_note = await self._push_tournament_stream_title(value)
+
+        # "Game N" banner hidden while tournament mode is on (2026-09-12) — the
+        # number comes from DraftLifecycle.game_index, which counts games within
+        # a real ladder set; a tournament lobby isn't that (see the docstring on
+        # MatchRunner._update_game_number_banner()), so the banner just wouldn't
+        # track reality here. Rather than let it show a stale/wrong number,
+        # hide the source outright; unhide on /tournament off. Same
+        # obs_control.set_source_visible() call the minimap cover uses, wrapped
+        # in run_in_executor since it's a blocking websocket call. No-ops if
+        # obs_stream_enabled is false.
+        if obs_control.is_enabled():
+            await loop.run_in_executor(
+                None, obs_control.set_source_visible,
+                self.bot.config.get("obs_game_number_source", "Game Number"), not value,
+            )
 
         if value:
             description = (
                 f"Tournament mode is now **ON**.\n"
-                f"- `/custom`'s stream start is delayed {_TOURNAMENT_STREAM_DELAY_SECONDS // 60} minutes "
-                f"instead of going live instantly.\n"
                 f"- The minimap cover stays up for the entire match instead of revealing "
                 f"{self.bot.config.get('obs_minimap_cover_seconds', 120)}s in.\n"
+                f"- The scrim signup queue is taken down until tournament mode is turned off.\n"
+                f"- The OBS \"Game N\" banner is hidden (not a real ladder set here).\n"
+                f"- No draft is opened on the darwinstalker ladder for these matches at all.\n"
+                f"- The \"Who wins?\" Twitch prediction is disabled (nothing server-confirmed to check names against).\n"
+                f"- The end-of-match Twitch ad break is skipped (it would land mid-match for viewers if you're "
+                f"running an OBS broadcast delay).\n"
+                f"- ⚠️ This bot does **not** delay the broadcast — if you want viewers seeing a "
+                f"real-time-info-leak-proof delay, enable OBS's own Settings → Advanced → "
+                f"Stream Delay yourself (not controllable via this bot's OBS connection)."
             )
-            if slug_in_effect:
-                description += f"- Ladder drafts are tagged with tournament **`{slug_in_effect}`**."
-            else:
-                description += (
-                    "- ⚠️ No ladder tournament slug set — drafts will NOT be tagged. "
-                    "Run `/tournament on slug:<slug>` with the darwinstalker.com tournament slug."
-                )
+            if title_note:
+                description += f"\n{title_note}"
         else:
-            description = "Tournament mode is now **OFF** — normal instant stream start and timed minimap reveal."
-            if slug_in_effect:
-                description += f"\nLadder tournament slug `{slug_in_effect}` is kept for the next time it is turned on."
+            description = (
+                "Tournament mode is now **OFF** — normal timed minimap reveal is back.\n"
+                "- The scrim signup queue is back up.\n"
+                "- The OBS \"Game N\" banner is unhidden.\n"
+                "- Ladder drafts, the \"Who wins?\" Twitch prediction, and the end-of-match ad break are back to normal."
+            )
+            if title_note:
+                description += f"\n{title_note}"
 
-        await interaction.response.send_message(embed=self._ok("Tournament Mode", description))
+        await interaction.followup.send(embed=self._ok("Tournament Mode", description))
 
     # ------------------------------------------------------------------
     # /quit
@@ -2306,6 +2462,10 @@ class DirectorCog(commands.Cog):
 
 _AI_DIRECTOR_CHANNEL_ID = 1520518111089000548
 
+# Minimum time between "queue is full" pings to scrim_admin_role (2026-09-12) —
+# see ScrimCog.on_raw_reaction_add()'s cooldown check for why.
+_QUEUE_FULL_PING_COOLDOWN_SECONDS = 10
+
 
 class ScrimCog(commands.Cog):
     """
@@ -2342,6 +2502,9 @@ class ScrimCog(commands.Cog):
         # Serializes _ensure_region_message()'s check-then-create sequence (2026-09-10
         # fix, found live) — see that method's docstring for the race it closes.
         self._region_message_lock = asyncio.Lock()
+        # monotonic timestamp of the last "queue is full" ping to scrim_admin_role —
+        # see on_raw_reaction_add()'s cooldown check, gated by _QUEUE_FULL_PING_COOLDOWN_SECONDS.
+        self._last_queue_full_ping_at: float = 0.0
 
     # ------------------------------------------------------------------
     # Startup — ensure a static signup message exists
@@ -2349,6 +2512,13 @@ class ScrimCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
+        if self.bot.config.get("tournament_mode", False):
+            # suspend_signup() (see /tournament's DirectorCog handler) already
+            # deleted these and cleared their persisted ids before this restart —
+            # don't let a normal startup recreate them out from under tournament
+            # mode. resume_signup() (on /tournament off) is the only path back.
+            logger.info("ScrimCog: tournament_mode is on — signup/region messages stay suspended")
+            return
         await self._ensure_signup_message()
         await self._ensure_region_message()
         # Refresh its content on every startup too — reactions can happen while
@@ -2357,6 +2527,47 @@ class ScrimCog(commands.Cog):
         if signup_message is not None:
             await self._update_region_message(signup_message.guild, await self._ordered_reactors(signup_message))
         await self._resume_reset_timer_if_needed()
+
+    async def suspend_signup(self) -> None:
+        """Delete the signup + region messages for the duration of tournament
+        mode (2026-09-11) — called from DirectorCog's /tournament handler when
+        it's turned on. A tournament lobby isn't part of the normal open-signup
+        scrim queue, so there should be nothing left to react to while it's
+        running. Unlike _delete_and_repost_signup_message() (used by /role
+        remove), this does NOT repost — the messages simply don't exist again
+        until resume_signup() is called (the matching /tournament off path).
+        Persisted ids are cleared to None so on_ready()'s tournament_mode
+        check above (a restart while tournament mode is still on) has nothing
+        stale to skip past — there's no tracked message left to accidentally
+        resurrect.
+        """
+        message = await self._get_signup_message()
+        if message is not None:
+            try:
+                await asyncio.wait_for(message.delete(), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+            except Exception as e:
+                logger.warning("ScrimCog: could not delete signup message for tournament mode: %s", e)
+
+        region_message = await self._get_region_message()
+        if region_message is not None:
+            try:
+                await asyncio.wait_for(region_message.delete(), timeout=_DISCORD_API_TIMEOUT_SECONDS)
+            except Exception as e:
+                logger.warning("ScrimCog: could not delete region message for tournament mode: %s", e)
+
+        self._signup_order.clear()
+        self._cancel_reset_timer()
+        self._save_message_id("scrim_signup_message_id", None)
+        self._save_message_id("scrim_region_message_id", None)
+
+    async def resume_signup(self) -> None:
+        """Repost the signup + region messages once tournament mode is turned
+        back off — the matching half of suspend_signup() above. Both ids were
+        cleared to None by suspend_signup(), so _ensure_signup_message()/
+        _ensure_region_message() take their normal "no tracked message yet"
+        path and post fresh ones, same as a first-ever run."""
+        await self._ensure_signup_message()
+        await self._ensure_region_message()
 
     async def _resume_reset_timer_if_needed(self):
         """If the bot restarted mid-queue, restart the 1-hour countdown from now.
@@ -2513,20 +2724,43 @@ class ScrimCog(commands.Cog):
         except Exception as e:
             logger.warning("ScrimCog: could not update region breakdown message: %s", e)
 
+    @staticmethod
+    def _is_new_account_or_member(member: discord.Member) -> bool:
+        """True if this account was created OR joined this guild less than
+        _NEW_ACCOUNT_FLAG_DAYS ago — a signal for the region breakdown to
+        flag, not a verdict (a brand new but legitimate player looks
+        identical to a ban-evading alt on this signal alone; see CLAUDE.md's
+        Scrim Signup System section)."""
+        now = datetime.now(timezone.utc)
+        age = now - member.created_at
+        if age.days < _NEW_ACCOUNT_FLAG_DAYS:
+            return True
+        if member.joined_at is not None and (now - member.joined_at).days < _NEW_ACCOUNT_FLAG_DAYS:
+            return True
+        return False
+
     def _region_list_lines(self, guild: discord.Guild, members: list[discord.Member]) -> Optional[list[str]]:
-        """Numbered-list lines (2026-09-11, replacing the old Player/NA/EU
-        monospace table) — `f"{i}. {name} — {tags}"` for each member, in
-        whatever order `members` is already given in. None if neither
-        region_role_na nor region_role_eu exists in this guild — there's
-        nothing meaningful to show in that case regardless of who's signed up.
-        Role names come from region_role_na/region_role_eu (config, default
-        'NA'/'EU').
+        """Monospace table rows — `#` / `Player` / `NA` / `EU` columns, `X`/`-`
+        per region cell, same as the original table (2026-09-11: brought back
+        after the numbered-list-only version above lost the at-a-glance X
+        marker; kept the numbering and signup order that version added) —
+        or None if neither region_role_na nor region_role_eu exists in this
+        guild, in which case there's nothing meaningful to show regardless of
+        who's signed up. Role names come from region_role_na/region_role_eu
+        (config, default 'NA'/'EU').
 
         `members` should already be in signup order (`_ordered_reactors()`,
         not the plain `_reactors()`) — this only numbers them 1..N as given,
         it does not reorder anything itself. Signup order is what /role add's
-        first-10/next-10 split is based on, so the numbering here doubles as
+        first-10/next-10 split is based on, so the `#` column doubles as
         "which lobby a player is headed for" at a glance.
+
+        A row for a member flagged by _is_new_account_or_member() (account
+        created OR joined this guild under _NEW_ACCOUNT_FLAG_DAYS days ago)
+        gets a trailing ` *` marker and is wrapped in an ANSI color escape —
+        rendered by Discord's ```ansi code-block support (_region_breakdown_embed
+        uses that fence language specifically so this renders as color, not
+        literal escape characters).
         """
         na_role_name = self._cfg("region_role_na", "NA")
         eu_role_name = self._cfg("region_role_eu", "EU")
@@ -2535,28 +2769,46 @@ class ScrimCog(commands.Cog):
         if na_role is None and eu_role is None:
             return None
 
-        lines = []
+        num_width = max(2, len(str(len(members))))
+        name_width = max([len("Player")] + [len(m.display_name) for m in members])
+        header = f"{'#'.rjust(num_width)}  {'Player'.ljust(name_width)}  NA  EU"
+        rows = [header, "-" * len(header)]
+        any_flagged = False
         for i, m in enumerate(members, start=1):
-            tags = []
-            if na_role and na_role in m.roles:
-                tags.append("NA")
-            if eu_role and eu_role in m.roles:
-                tags.append("EU")
-            suffix = f" — {', '.join(tags)}" if tags else ""
-            lines.append(f"{i}. {m.display_name}{suffix}")
-        return lines
+            has_na = "X" if na_role and na_role in m.roles else "-"
+            has_eu = "X" if eu_role and eu_role in m.roles else "-"
+            line = (
+                f"{str(i).rjust(num_width)}  {m.display_name.ljust(name_width)}  "
+                f"{has_na.center(2)}  {has_eu.center(2)}"
+            )
+            if self._is_new_account_or_member(m):
+                any_flagged = True
+                line = f"[0;31m{line} *[0m"
+            rows.append(line)
+        if any_flagged:
+            rows.append("")
+            rows.append(f"[0;31m* account created or joined this server within {_NEW_ACCOUNT_FLAG_DAYS} days[0m")
+        return rows
 
     def _region_breakdown_embed(self, guild: discord.Guild, members: list[discord.Member]) -> Optional[discord.Embed]:
-        """The live region-breakdown message's content — a numbered list, in
-        signup order, of every current reactor with their region tag(s).
-        None if _region_list_lines() has nothing to show (region roles not
-        configured/found in this guild)."""
-        lines = self._region_list_lines(guild, members)
-        if lines is None:
+        """The live region-breakdown message's content — a numbered (signup
+        order), monospace Player/NA/EU table. None if _region_list_lines()
+        has nothing to show (region roles not configured/found in this
+        guild).
+
+        Fenced as ```ansi rather than a plain ``` block (2026-09-11) so the
+        ANSI color escapes _region_list_lines() puts around a flagged row
+        render as actual color in Discord's desktop/web clients instead of
+        literal escape characters — a plain code fence has no other way to
+        color a single row, since the embed's own `color` field only ever
+        applies to the whole embed. Clients without ANSI code-block support
+        (some mobile clients) just show the row's ` *` marker instead."""
+        rows = self._region_list_lines(guild, members)
+        if rows is None:
             return None
         return discord.Embed(
             title="Region Breakdown",
-            description="\n".join(lines),
+            description="```ansi\n" + "\n".join(rows) + "\n```",
             color=_COLOR_NEUTRAL,
         )
 
@@ -2621,9 +2873,10 @@ class ScrimCog(commands.Cog):
         except Exception as e:
             logger.warning("ScrimCog reaction reset: could not post notify message: %s", e)
 
-    def _save_message_id(self, key: str, message_id: int):
+    def _save_message_id(self, key: str, message_id: int | None):
         """Persist a tracked message id (scrim_signup_message_id or
-        scrim_region_message_id) to config.json so it survives a restart."""
+        scrim_region_message_id) to config.json so it survives a restart.
+        Pass None to clear a previously tracked id (see suspend_signup())."""
         self.bot.config[key] = message_id
         import json as _json
         try:
@@ -2827,6 +3080,18 @@ class ScrimCog(commands.Cog):
             self._start_reset_timer()
 
         if count == self._min_players():
+            # Cooldown (2026-09-12) — a player spam-reacting (un-react then react again)
+            # can bounce the count off exactly self._min_players() several times in
+            # quick succession, re-triggering this "queue full" branch every time it
+            # lands back on that exact value and paging the admins over and over for
+            # the same full queue. A plain last-fired timestamp, same shape as
+            # DarwinTwitchBot's _POV_REDEMPTION_COOLDOWN_SECONDS, caps how often the
+            # ping can actually go out regardless of how many times the count re-hits
+            # the threshold in that window.
+            now = time.monotonic()
+            if now - self._last_queue_full_ping_at < _QUEUE_FULL_PING_COOLDOWN_SECONDS:
+                return
+
             guild = self.bot.get_guild(payload.guild_id)
             if guild is None:
                 return
@@ -2841,6 +3106,7 @@ class ScrimCog(commands.Cog):
                     logger.warning("ScrimCog: could not fetch ai-director channel: %s", e)
                     notify_ch = message.channel
 
+            self._last_queue_full_ping_at = now
             await notify_ch.send(
                 f"{mention} Queue is full — **{count} players** signed up! "
                 f"Use `/role add` to assign the scrim player role and get the match going."

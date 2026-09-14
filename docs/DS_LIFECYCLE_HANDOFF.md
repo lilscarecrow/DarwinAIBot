@@ -331,14 +331,27 @@ not become another relay POST).
 
 ## 3c. Tournament mode
 
-`/tournament on slug:<slug>` stores the darwinstalker.com tournament slug as
-`ds_ingest_tournament_slug` (lower-cased) alongside `tournament_mode: true`;
-every draft opened while tournament mode is on is tagged with it, and the
-ladder then resolves names against that tournament's checked-in roster. The
-reply embed names the slug in effect, or warns when none is set. `/tournament
-off` keeps the slug for next time. An unknown slug is refused by the server
-(`400 unknown tournament`) — the open fails, the bot logs it (relayed too),
-and the draft is not opened until the slug is corrected.
+**Reversed 2026-09-12** — this used to tag every draft opened while
+`tournament_mode` was on with a darwinstalker.com tournament slug
+(`/tournament on slug:<slug>`, persisted as `ds_ingest_tournament_slug`).
+That's gone. **Tournament mode now never opens a draft at all** —
+`DirectorCog._open_ds_draft()` returns immediately whenever `tournament_mode`
+is `true`, before calling `DraftLifecycle.open_lobby()`. `/tournament` no
+longer has a `slug` parameter; `ds_ingest_tournament_slug` in config is
+unused (left in place rather than requiring a migration).
+
+One consequence worth knowing if this is ever revisited:
+`DraftLifecycle.on_match_start()` self-opens a fresh draft the moment it
+sees no draft id yet (a safety net for the normal auto-start path — see its
+own docstring in `game/ds_lifecycle.py`), so `MatchRunner` had to stop
+calling it unconditionally too — `_init_player_bar_and_push()` skips its
+entire `self._ds` block (roster push, the `match_start` event, and the
+"Game N" OBS banner update) under `self._tournament_mode`, not just the
+call that would've re-opened a draft. The Twitch "who wins?" prediction is
+also disabled under tournament mode for the same underlying reason — with
+no draft ever opened, `self._ds.known_players`/`unlinked` stay empty, so
+`is_lobby_captured()`'s name resolution has nothing server-confirmed to
+check against.
 
 ## 4. Config (`config.json`, gitignored)
 
@@ -350,8 +363,7 @@ and the draft is not opened until the slug is corrected.
 "ds_ingest_tournament_slug": ""
 ```
 
-- `ds_ingest_tournament_slug` is written by `/tournament on slug:<slug>`; it
-  only matters while `tournament_mode` is true.
+- `ds_ingest_tournament_slug` is unused (2026-09-12) — see §3c above.
 
 - `ds_ingest_token` empty ⇒ the whole lifecycle is off (no calls at all).
 - `ds_ingest_twitch_channel` **must be non-empty** or there is no embed. The
