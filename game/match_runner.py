@@ -313,6 +313,11 @@ class MatchRunner:
         # _fire_card_event(), since a real decrease is expected right then.
         self._last_confirmed_points: Optional[int] = None
         self._last_points_sample_time: float = 0.0
+        # Most recent non-None points read, regardless of source (background
+        # poll or _wait_for_points()'s loop) or whether it was ever confirmed
+        # — see _update_points_reading()'s "confirmation by agreement" logic.
+        # A failed (None) read never touches this.
+        self._last_valid_points_read: Optional[int] = None
         from game.deck_utils import deck_layout_from_state
         live_layout = deck_layout_from_state()
         self._deck_layout: list[str] = live_layout if live_layout else config.get("deck_layout", [])
@@ -470,14 +475,15 @@ class MatchRunner:
 
                 # Continuously sample director points throughout the match, not just
                 # reactively when a card is about to fire — a small, steady cost (one
-                # screenshot + OCR read every poll_interval, occasionally a second one
-                # too when the read disagrees with the confirmed value and needs an
-                # immediate second opinion — see _update_points_reading()) that means
+                # screenshot + OCR read every poll_interval) that means
                 # _wait_for_points() usually already has a recent confirmed value to
                 # check against instead of needing a fresh, possibly-failed read at the
                 # exact moment a card needs to check affordability. Same
                 # confirm-before-trusting logic as everywhere else (see
-                # _update_points_reading) — a bad read here is disregarded, not trusted.
+                # _update_points_reading) — a bad read here is disregarded, not trusted,
+                # and doesn't cost an extra read either way (see that method's
+                # docstring for why agreement is checked against the last valid read
+                # instead of forcing a fresh confirmation attempt).
                 now_ts = time.monotonic()
                 if now_ts - self._last_points_sample_time >= poll_interval:
                     from game.screen_detection import take_screenshot as _take_ss2
@@ -1470,36 +1476,48 @@ class MatchRunner:
 
     def _update_points_reading(self, current: Optional[int], context: str) -> Optional[int]:
         """Merge a fresh points read into self._last_confirmed_points, requiring
-        a second independent read to agree before trusting any change
-        (2026-09-14, replacing a same-day bounded jump-cap ratchet — see below).
+        agreement with the last VALID read before trusting a change (2026-09-14,
+        revised same day — see below for why a forced immediate re-read was
+        replaced with this).
 
-        - A failed read (None) is noise, same as always — keep the last known value.
+        - A failed read (None) is noise, same as always — keep the last known
+          value, and don't touch self._last_valid_points_read either: a missed
+          OCR frame carries no information and must not compete with (or reset)
+          whatever the last real read actually was.
         - A read that already matches the confirmed value (including the very
           first read of the match, when there's no confirmed value yet to compare
           against) is trusted directly — there's nothing to confirm.
         - A read that DISAGREES with the confirmed value — higher or lower, no
-          asymmetry — is not trusted on its own. An immediate second, independently
-          captured read is taken right away; only if it lands on that exact same
-          value is the change accepted. One frame disagreeing is exactly what a
-          misread looks like; two independent frames landing on the same
-          "surprising" number is real signal, not noise.
+          asymmetry — is only trusted once it matches self._last_valid_points_read,
+          i.e. the previous call's non-None read, from whichever poll (background
+          sampling or _wait_for_points()'s loop) happened to supply it. One frame
+          disagreeing is exactly what a misread looks like; two consecutive real
+          reads landing on the same "surprising" number is real signal, not noise.
+          Either way, self._last_valid_points_read is updated to `current` at the
+          end — a rejected read still becomes the new candidate the NEXT read is
+          checked against, so agreement is found whenever it naturally occurs,
+          not just at the exact instant this method happened to run.
 
-        Replaces a same-day fix that bounded the old one-sided "never go down"
-        ratchet to a flat "+0 to +2" jump cap (with a 30s stuck-timeout escape
-        hatch for when the cap itself blocked a legitimate change). Found live
-        within the hour: real regen over the ~12s background-sampling gap
-        routinely exceeds +2, so a perfectly legitimate jump got rejected, which
-        left the baseline stale, which made the next read's required jump even
-        bigger — in practice nearly every background-poll update was routing
-        through the 30s stuck-timeout instead of ever landing cleanly. A flat
-        cap can't fix this without knowing the true regen rate, which isn't
-        actually constant. Confirmation-by-agreement doesn't need to know it at
-        all — it doesn't care how big a jump is or how long it's been, only
-        whether two independent reads corroborate each other. It's symmetric by
-        construction too (works the same whether a wrong baseline needs to
-        self-correct upward or downward), so the separate stuck-timeout escape
-        hatch is gone along with it — nothing can stay stuck on a wrong value
-        once two consecutive real reads agree on the truth.
+        Revised from a same-day version that, on disagreement, immediately forced
+        a brand-new confirmation read right then (a second take_screenshot() +
+        _read_points() call) rather than waiting for the next naturally-occurring
+        one. Found live: that confirmation attempt is exactly as capable of
+        missing (returning None) as any other OCR read — and a None confirmation
+        was being treated as "doesn't match," rejecting an otherwise perfectly
+        good `current` read for no better reason than the confirmation frame
+        itself happening to whiff. Comparing against the last already-successful
+        read instead means a None never gets a vote at all, on either side.
+
+        This in turn replaced a same-day fix that bounded the old one-sided
+        "never go down" ratchet to a flat "+0 to +2" jump cap (with a 30s
+        stuck-timeout escape hatch for when the cap itself blocked a legitimate
+        change) — found live within the hour to reject nearly every real jump
+        over the ~12s background-sampling gap, since actual regen routinely
+        exceeds +2 over that span. Agreement-based confirmation needs no
+        assumption about the true regen rate at all, in either form — it only
+        cares whether two real reads corroborate each other. It's symmetric by
+        construction too, so nothing can stay stuck on a wrong baseline once two
+        consecutive real reads agree on the truth, in either direction.
 
         Returns the resulting confirmed value (possibly unchanged).
         """
@@ -1508,24 +1526,28 @@ class MatchRunner:
             return self._last_confirmed_points
 
         if current == self._last_confirmed_points:
+            self._last_valid_points_read = current
             return self._last_confirmed_points
 
-        if self._last_confirmed_points is not None:
-            from game.screen_detection import take_screenshot
-            confirm = self._read_points(take_screenshot())
-            if confirm != current:
-                logger.debug(
-                    "Points read %d (%s) not confirmed by an immediate second read (got %s) — disregarding as noise",
-                    current, context, confirm,
-                )
-                return self._last_confirmed_points
+        if self._last_confirmed_points is None:
+            logger.debug("Points read %d (%s) — first read of the match, trusting it as the baseline", current, context)
+            self._last_confirmed_points = current
+            self._update_points_display()
+        elif self._last_valid_points_read == current:
             logger.info(
-                "Points read %d (%s) confirmed by a second independent read — accepting (was %s)",
+                "Points read %d (%s) confirmed by the previous valid read agreeing — accepting (was %s)",
                 current, context, self._last_confirmed_points,
             )
+            self._last_confirmed_points = current
+            self._update_points_display()
+        else:
+            logger.debug(
+                "Points read %d (%s) disagrees with confirmed %s and doesn't match the last valid read (%s) — "
+                "waiting for a second agreeing read",
+                current, context, self._last_confirmed_points, self._last_valid_points_read,
+            )
 
-        self._last_confirmed_points = current
-        self._update_points_display()
+        self._last_valid_points_read = current
         return self._last_confirmed_points
 
     def _debit_points(self, cost: Optional[int]) -> None:

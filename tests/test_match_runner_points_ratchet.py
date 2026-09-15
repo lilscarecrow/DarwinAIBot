@@ -1,24 +1,28 @@
-"""Director points confirmation-by-agreement (_update_points_reading), 2026-09-14.
+"""Director points confirmation-by-agreement (_update_points_reading), revised
+2026-09-14.
 
-Replaces a same-day fix that bounded the ratchet to a flat "+0 to +2" jump cap
-(with a 30s stuck-timeout escape hatch). Found live within the hour of shipping
-that fix: real regen over the ~12s background-sampling gap routinely exceeds
-+2, so a legitimate jump got rejected, which left the baseline stale, which
-made the next read's required jump even bigger -- in practice nearly every
-background-poll update was routing through the 30s stuck-timeout instead of
-ever landing cleanly (five separate stuck-timeout escapes inside 40 minutes of
-one live match).
+A read that disagrees with the confirmed value is only trusted once it
+matches self._last_valid_points_read -- the previous call's non-None read,
+from whichever poll (background sampling or _wait_for_points()'s loop)
+supplied it. A failed (None) read never touches _last_valid_points_read and
+never counts as a "vote" on either side of the agreement check.
 
-A flat cap can't fix this without knowing the true regen rate, which isn't
-actually constant. Confirmation-by-agreement doesn't need to know it at all --
-a read that disagrees with the confirmed value (higher OR lower) is only
-trusted once an immediate second, independently-captured read lands on that
-same value. This is symmetric by construction, so it also subsumes the old
-stuck-timeout's job: nothing can stay stuck on a wrong baseline once two
-consecutive real reads agree on the truth.
+This replaced a same-day version that, on disagreement, forced an immediate
+brand-new confirmation read right then. Found live: that confirmation
+attempt could itself return None (an ordinary OCR miss, same as any other
+read) -- and a None confirmation was being treated as "doesn't match",
+rejecting an otherwise perfectly good `current` read for no reason other
+than the confirmation attempt itself happening to whiff. Comparing against
+the last already-successful read instead means a None never gets a vote at
+all, on either side -- see test_a_null_confirmation_attempt_no_longer_causes_
+a_false_rejection below for the exact scenario this fixes.
+
+That in turn replaced an even earlier same-day fix that bounded the ratchet
+to a flat "+0 to +2" jump cap (with a 30s stuck-timeout escape hatch) --
+found live to reject nearly every real jump over the ~12s
+background-sampling gap, since actual regen routinely exceeds +2 over that
+span.
 """
-from unittest.mock import patch
-
 from game.match_runner import MatchRunner
 from session.state import SessionState
 
@@ -29,94 +33,103 @@ def make_runner(confirmed=None):
     return runner
 
 
-def _update_with_confirm(runner, current, confirm_value, context="test"):
-    """Call _update_points_reading(current, ...) with the immediate second
-    read (self._read_points(take_screenshot())) mocked to return confirm_value."""
-    with patch.object(runner, "_read_points", return_value=confirm_value), \
-         patch("game.screen_detection.take_screenshot", return_value=None):
-        return runner._update_points_reading(current, context)
-
-
 # ---- basic shape --------------------------------------------------------------
 
-def test_first_ever_read_is_trusted_with_no_confirmation_needed():
+def test_first_ever_read_is_trusted_with_no_agreement_needed():
     runner = make_runner(confirmed=None)
-    with patch.object(runner, "_read_points") as read_points:
-        result = runner._update_points_reading(3, "test")
-    read_points.assert_not_called()  # nothing to confirm against yet
+    result = runner._update_points_reading(3, "test")
     assert result == 3
 
 
 def test_a_failed_read_keeps_the_last_known_value():
     runner = make_runner(confirmed=5)
-    with patch.object(runner, "_read_points") as read_points:
-        result = runner._update_points_reading(None, "test")
-    read_points.assert_not_called()
+    result = runner._update_points_reading(None, "test")
     assert result == 5
 
 
-def test_a_read_matching_the_confirmed_value_needs_no_confirmation():
+def test_a_read_matching_the_confirmed_value_needs_no_agreement():
     runner = make_runner(confirmed=5)
-    with patch.object(runner, "_read_points") as read_points:
-        result = runner._update_points_reading(5, "test")
-    read_points.assert_not_called()  # already agrees with what we believe -- nothing to check
+    result = runner._update_points_reading(5, "test")
     assert result == 5
 
 
-# ---- disagreement requires a confirming second read ----------------------------
+# ---- disagreement requires the PREVIOUS valid read to agree --------------------
 
-def test_a_higher_read_is_accepted_once_a_second_read_confirms_it():
+def test_a_lone_disagreeing_read_is_not_trusted_yet():
     runner = make_runner(confirmed=2)
-    result = _update_with_confirm(runner, current=7, confirm_value=7)
+    result = runner._update_points_reading(7, "test")
+    assert result == 2  # unchanged -- nothing to agree with yet
+
+
+def test_two_consecutive_agreeing_reads_are_accepted():
+    """The live incident this whole mechanism is for: a single-frame jump
+    isn't trusted, but the same value read twice in a row is."""
+    runner = make_runner(confirmed=2)
+    runner._update_points_reading(7, "test")   # first look — not yet trusted
+    result = runner._update_points_reading(7, "test")  # agrees with the previous read
     assert result == 7
 
 
-def test_a_higher_read_is_rejected_if_the_second_read_disagrees():
-    """The live incident this fix is for: a single-frame jump that a second,
-    independent read does not reproduce."""
-    runner = make_runner(confirmed=2)
-    result = _update_with_confirm(runner, current=7, confirm_value=2)
-    assert result == 2  # unchanged
-
-
-def test_a_lower_read_is_accepted_once_a_second_read_confirms_it():
-    """Symmetric by construction -- a confirmed baseline that was itself
-    wrong (too high) can now self-correct downward, unlike the old
-    one-sided ratchet-up guard."""
+def test_symmetric_for_a_lower_read_too():
+    """A confirmed baseline that was itself wrong (too high) can now
+    self-correct downward, unlike the old one-sided ratchet-up guard."""
     runner = make_runner(confirmed=9)
-    result = _update_with_confirm(runner, current=2, confirm_value=2)
+    runner._update_points_reading(2, "test")
+    result = runner._update_points_reading(2, "test")
     assert result == 2
 
 
-def test_a_lower_read_is_rejected_if_the_second_read_disagrees():
-    runner = make_runner(confirmed=9)
-    result = _update_with_confirm(runner, current=2, confirm_value=9)
-    assert result == 9
-
-
-def test_the_second_read_must_match_exactly_not_just_be_close():
-    """A near-miss (e.g. the second read landing one tick further along from
-    real regen) is not treated as agreement -- exact match only."""
+def test_two_different_disagreeing_reads_in_a_row_confirm_nothing():
+    """Pure noise -- neither read matches the other, so nothing is trusted;
+    the second becomes the new candidate for whatever comes next."""
     runner = make_runner(confirmed=2)
-    result = _update_with_confirm(runner, current=7, confirm_value=8)
-    assert result == 2
+    runner._update_points_reading(7, "test")
+    result = runner._update_points_reading(8, "test")
+    assert result == 2  # still unchanged
 
 
-def test_a_failed_second_read_does_not_confirm_anything():
+def test_agreement_can_come_from_a_read_several_calls_later():
+    """The candidate persists across intervening failed reads -- it doesn't
+    need to be the VERY next call, just the next VALID one."""
     runner = make_runner(confirmed=2)
-    result = _update_with_confirm(runner, current=7, confirm_value=None)
-    assert result == 2
+    runner._update_points_reading(7, "test")
+    runner._update_points_reading(None, "test")  # OCR miss in between
+    result = runner._update_points_reading(7, "test")
+    assert result == 7
 
 
-# ---- a confirmed change actually takes effect (not just returned) --------------
+# ---- the actual fix: a None confirmation no longer poisons agreement ----------
 
-def test_an_accepted_change_updates_last_confirmed_points():
+def test_a_null_confirmation_attempt_no_longer_causes_a_false_rejection():
+    """The bug in the previous same-day version: forcing an immediate second
+    read meant that read could itself return None (an ordinary OCR miss) and
+    get treated as "doesn't match", falsely rejecting a perfectly good
+    `current` read. Now a None read simply doesn't participate at all -- it
+    neither confirms nor denies, and the real read from before it is still
+    what the next real read gets checked against."""
     runner = make_runner(confirmed=2)
-    _update_with_confirm(runner, current=7, confirm_value=7)
-    assert runner._last_confirmed_points == 7
+    runner._update_points_reading(7, "test")   # a real read, not yet trusted
+    runner._update_points_reading(None, "test")  # the "confirmation" that used to whiff
+    result = runner._update_points_reading(7, "test")  # the real second look
+    assert result == 7  # confirmed anyway -- the None never got a vote
 
 
-def test_a_rejected_change_leaves_last_confirmed_points_untouched():
+# ---- last_valid_points_read bookkeeping ---------------------------------------
+
+def test_last_valid_points_read_updates_even_on_a_rejected_read():
     runner = make_runner(confirmed=2)
-    _update_with_confirm(runner, current=7, confirm_value=3)
-    assert runner._last_confirmed_points == 2
+    runner._update_points_reading(7, "test")
+    assert runner._last_valid_points_read == 7
+
+
+def test_last_valid_points_read_is_untouched_by_a_failed_read():
+    runner = make_runner(confirmed=2)
+    runner._update_points_reading(7, "test")
+    runner._update_points_reading(None, "test")
+    assert runner._last_valid_points_read == 7
+
+
+def test_last_valid_points_read_updates_on_a_read_matching_confirmed_too():
+    runner = make_runner(confirmed=5)
+    runner._update_points_reading(5, "test")
+    assert runner._last_valid_points_read == 5

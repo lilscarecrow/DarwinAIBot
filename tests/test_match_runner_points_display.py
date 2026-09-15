@@ -62,11 +62,10 @@ def test_noops_when_no_source_is_configured():
 
 def test_update_points_reading_pushes_on_a_confirmed_change():
     runner = make_runner(confirmed=2)
+    runner._update_points_reading(3, "test")  # first look — not yet trusted, no push
     with patch("game.obs_control.is_enabled", return_value=True), \
-         patch("game.obs_control.set_source_text") as set_text, \
-         patch.object(runner, "_read_points", return_value=3), \
-         patch("game.screen_detection.take_screenshot", return_value=None):
-        runner._update_points_reading(3, "test")  # disagreement, confirmed by a second read
+         patch("game.obs_control.set_source_text") as set_text:
+        runner._update_points_reading(3, "test")  # a second read agrees — confirmed
     set_text.assert_called_once_with("Director Points", "3/10")
 
 
@@ -81,10 +80,8 @@ def test_update_points_reading_does_not_push_when_the_value_is_unchanged():
 def test_update_points_reading_does_not_push_on_an_unconfirmed_read():
     runner = make_runner(confirmed=2)
     with patch("game.obs_control.is_enabled", return_value=True), \
-         patch("game.obs_control.set_source_text") as set_text, \
-         patch.object(runner, "_read_points", return_value=2), \
-         patch("game.screen_detection.take_screenshot", return_value=None):
-        runner._update_points_reading(7, "test")  # a second read disagrees — rejected as noise
+         patch("game.obs_control.set_source_text") as set_text:
+        runner._update_points_reading(7, "test")  # a lone disagreeing read — not yet trusted
     set_text.assert_not_called()
 
 
