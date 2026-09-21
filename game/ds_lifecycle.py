@@ -123,6 +123,7 @@ class DraftLifecycle:
             get_draft_id=lambda: self._draft_id,
             get_args=self._args,
             transport=relay_transport,
+            on_next_game_index=self._set_game_index_from_server,
         )
 
     # ---- config -----------------------------------------------------------
@@ -306,6 +307,20 @@ class DraftLifecycle:
     @property
     def game_index(self) -> int:
         return self._game_index
+
+    def _set_game_index_from_server(self, next_game_index: int) -> None:
+        """Reseed the local game counter from the ladder's own
+        `next_game_index` (2026-09-21) — called by DsRelay after every
+        successful /api/ingest/events POST and by post_results() after every
+        successful screenshot/game upload, so the bot stays in sync with the
+        server even if a slot was cleared or re-used out of band (moderator
+        `POST /api/clear-game`, etc.). Runs on the relay thread for events;
+        a draft that's been closed meanwhile (self._draft_id is None) is
+        left alone rather than reopening game bookkeeping on a dead draft.
+        """
+        if self._draft_id is None:
+            return
+        self._game_index = int(next_game_index)
 
     @property
     def relay(self) -> DsRelay:
@@ -527,6 +542,13 @@ class DraftLifecycle:
         except Exception as e:
             logger.warning("ds post_results: transport raised %s", e)
         self._game_index = (self._game_index or 1) + 1
+        if isinstance(result, dict):
+            ngi = result.get("next_game_index")
+            if isinstance(ngi, (int, float)) and not isinstance(ngi, bool) and ngi >= 1:
+                # Re-seed from the ladder's own bookkeeping (2026-09-21) rather
+                # than trust the local +1 above — a slot cleared/reused out of
+                # band (moderator POST /api/clear-game) makes the +1 wrong.
+                self._set_game_index_from_server(int(ngi))
         if isinstance(result, dict) and isinstance(result.get("placements"), list):
             # The scorecard's names are now the roster: the next match's
             # player-bar reads snap to THESE before anything else.

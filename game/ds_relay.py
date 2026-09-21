@@ -50,11 +50,18 @@ class DsRelay:
         get_args: Callable[[], dict],
         transport=None,
         flush_interval: float = FLUSH_INTERVAL,
+        on_next_game_index: Optional[Callable[[int], None]] = None,
     ):
         self._get_draft_id = get_draft_id
         self._get_args = get_args
         self._transport = transport if transport is not None else _default_transport()
         self._interval = flush_interval
+        # Called (from the flush thread) with the server's next_game_index
+        # whenever a /api/ingest/events POST answers with one (2026-09-21) —
+        # lets DraftLifecycle keep its local counter in sync with the ladder
+        # even if a game slot was cleared/reused out of band. Never raises;
+        # any exception from the callback is swallowed like everything else here.
+        self._on_next_game_index = on_next_game_index
         self._events: collections.deque = collections.deque()
         self._logs: collections.deque = collections.deque()
         self._qlock = threading.Lock()      # guards the deques
@@ -186,10 +193,18 @@ class DsRelay:
         args = self._safe_args()
         for gi, events in groups.items():
             try:
-                ok = self._transport.post_events(draft_id, gi or None, events, **args)
+                result = self._transport.post_events(draft_id, gi or None, events, **args)
             except Exception:
-                ok = False
-            if ok:
+                result = None
+            if isinstance(result, dict):
+                self.posted_events += len(events)
+                ngi = result.get("next_game_index")
+                if isinstance(ngi, (int, float)) and not isinstance(ngi, bool) and ngi >= 1 and self._on_next_game_index:
+                    try:
+                        self._on_next_game_index(int(ngi))
+                    except Exception:
+                        pass
+            elif result:  # legacy bool True from an older/fake transport
                 self.posted_events += len(events)
             else:
                 self.dropped_events += len(events)

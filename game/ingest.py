@@ -252,7 +252,7 @@ def post_events(
     events: list[dict],
     base_url: str,
     token: str,
-) -> bool:
+) -> Optional[dict]:
     """
     POST a batch (≤100) of live match events to /api/ingest/events.
 
@@ -260,7 +260,13 @@ def post_events(
     (see docs/DS_LIFECYCLE_HANDOFF.md "Live match events" for the kinds).
     draft_id / game_index are omitted when None (the server then targets this
     token's open draft / the next game). Called only by DsRelay's thread.
-    Returns True on 200. Never raises.
+
+    Returns the server's parsed JSON body (draft_id, game_index, recorded,
+    and since 2026-09-21 next_game_index — the next empty game slot on the
+    draft, so the caller can re-seed its own counter) on a 200, or None on
+    any failure. Never raises. A dict return is the new "ok" signal (an
+    empty dict `{}` for an old server that answered 200 with a non-dict
+    body still counts as ok, just without next_game_index).
     """
     url = f"{base_url.rstrip('/')}/api/ingest/events"
     headers = {"Authorization": f"Bearer {token}"}
@@ -272,14 +278,15 @@ def post_events(
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=_RELAY_TIMEOUT_SECONDS)
         if resp.status_code == 200:
-            return True
+            body = resp.json()
+            return body if isinstance(body, dict) else {}
         _relay_logger.warning(
             "darwinstalker events failed: HTTP %d — %s", resp.status_code, resp.text[:300]
         )
-        return False
+        return None
     except Exception as e:
         _relay_logger.warning("darwinstalker events request failed: %s", e)
-        return False
+        return None
 
 
 def post_log(entries: list[dict], base_url: str, token: str) -> bool:
