@@ -115,12 +115,20 @@ exactly one of the lobby's players. The reply carries:
   this is purely informational unless a future feature (e.g. announcing
   "you're playing round N, lobby M" from this field) wants it.
 
-**The bot's own game counter used to just guess (2026-09-11 fix).**
+**The bot's own game counter used to just guess (2026-09-11 fix, extended 2026-09-21).**
 `DraftLifecycle._game_index` is purely local bookkeeping — 1 when a draft is
 first opened, +1 after every results upload, 0 when nothing is open — used
-only to tag outgoing live events with which game they belong to. It has
-never been reconciled against what the server actually has recorded. The
-server's own events handler already had to defend against exactly this: its
+only to tag outgoing live events with which game they belong to. It used to
+be reconciled against the server's truth (`next_game_index`) only at
+open-draft time. Since 2026-09-21, `next_game_index` also rides back on every
+successful `/api/ingest/events` POST (`game/ds_relay.py`'s flush thread calls
+`DraftLifecycle._set_game_index_from_server()`) and on every successful
+results upload (`post_results()`, if the response carries the field) — so a
+game slot cleared or re-used out of band (a moderator's `POST
+/api/clear-game`, which also now deletes that slot's `match_events`) is
+picked up on the very next ingest instead of the bot silently climbing past
+it. The server's own events handler already had to defend against exactly
+this: its
 `event_game_index()` floors whatever the bot sends (or omits) at the
 draft's real "next unrecorded slot," specifically because *"the bot
 restarts its counter at 1 every time it opens a lobby, one per game — which
@@ -226,8 +234,12 @@ them in `lobby` with real aliases to match against.
 - Each event: `kind` (`[a-z0-9_]{1,40}`), optional `elapsed_ms` (from match
   start), `at` (epoch seconds), `slot` (0-based), `player` (≤64 chars), `data`
   (any JSON ≤2 KB).
-- `200 {"draft_id": 245, "game_index": 3, "recorded": 1}`. `400` validation,
-  `401` token, `404` no open draft, `422` malformed.
+- `200 {"draft_id": 245, "game_index": 3, "recorded": 1, "next_game_index": 4}`.
+  `next_game_index` (2026-09-21) is the ladder's own "next empty slot"
+  computation, recomputed fresh on every call — `DsRelay` hands it to
+  `DraftLifecycle._set_game_index_from_server()` after every successful POST
+  here so the bot's local counter tracks a slot cleared/re-used out of band.
+  `400` validation, `401` token, `404` no open draft, `422` malformed.
 
 ### POST /api/ingest/log (bot log relay)
 
@@ -254,6 +266,12 @@ them in `lobby` with real aliases to match against.
 - `200 {"draft_id": 245, "closed": false, "status": "approved"}` — was already
   published/rejected; harmless.
 - `404` — no such draft, or not owned by this token.
+
+Moderator `POST /api/clear-game` (darwin-stalker's own admin API, not part of
+the bot's ingest surface) wipes a game slot's row data and — since 2026-09-21
+— its `match_events` too, freeing the slot for reuse. That's exactly the case
+`next_game_index` on `/api/ingest/events` and `/api/ingest/screenshot` exists
+to recover from: see "The bot's own game counter" above.
 
 ### POST /api/ingest/screenshot
 

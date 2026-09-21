@@ -174,7 +174,8 @@ def test_events_wire_shape(requests_mock):
     m = requests_mock.post(f"{BASE}/api/ingest/events", json={"draft_id": 9, "game_index": 2, "recorded": 2})
     evs = [{"kind": "eliminated", "slot": 1, "player": "A", "elapsed_ms": 10, "data": {"alive": 8}},
            {"kind": "match_end", "elapsed_ms": 20}]
-    assert ingest.post_events(9, 2, evs, BASE, TOKEN) is True
+    result = ingest.post_events(9, 2, evs, BASE, TOKEN)
+    assert result == {"draft_id": 9, "game_index": 2, "recorded": 2}
     assert m.last_request.json() == {"draft_id": 9, "game_index": 2, "events": evs}
     assert m.last_request.headers["Authorization"] == f"Bearer {TOKEN}"
 
@@ -187,17 +188,17 @@ def test_events_omit_draft_and_game_when_none_and_cap_100(requests_mock):
 
 
 @pytest.mark.parametrize("status", [400, 401, 404, 422, 500])
-def test_events_failure_returns_false_and_warns_on_relay_logger(requests_mock, caplog, status):
+def test_events_failure_returns_none_and_warns_on_relay_logger(requests_mock, caplog, status):
     requests_mock.post(f"{BASE}/api/ingest/events", status_code=status, json={"error": "no"})
     with caplog.at_level(logging.WARNING):
-        assert ingest.post_events(1, 1, [{"kind": "x"}], BASE, TOKEN) is False
+        assert ingest.post_events(1, 1, [{"kind": "x"}], BASE, TOKEN) is None
     rec = [r for r in caplog.records if f"HTTP {status}" in r.message]
     assert rec and rec[0].name.startswith("game.ds_relay")
 
 
-def test_events_network_error_returns_false(requests_mock):
+def test_events_network_error_returns_none(requests_mock):
     requests_mock.post(f"{BASE}/api/ingest/events", exc=requests.ConnectionError("down"))
-    assert ingest.post_events(1, 1, [{"kind": "x"}], BASE, TOKEN) is False
+    assert ingest.post_events(1, 1, [{"kind": "x"}], BASE, TOKEN) is None
 
 
 def test_log_wire_shape_and_cap_50(requests_mock):
