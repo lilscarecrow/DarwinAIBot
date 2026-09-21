@@ -143,6 +143,34 @@ _FEED_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("feed_kill", re.compile(r"(?P<killer>.+?)\s*KILLED\s*(?P<victim>.+?)(?:\s*BY\s*(?P<method>.+))?$", re.IGNORECASE)),
 ]
 
+# "X KILLED BY <cause>" with no second name (2026-09-20). The feed_kill
+# pattern above splits on KILLED, so this line used to go out as
+# killer="X", victim="BY COLD" — and darwin-stalker credited X with a KILL
+# for freezing to death (42 such rows on prod before the server learned to
+# read them back). A weapon word means a real kill whose victim name the OCR
+# lost (killer stays, no victim); any other cause (COLD, LAVA, QUITTING,
+# DISCO[nnect]…) is X DYING to the environment: X is the victim, there is no
+# killer, and the cause goes out as "cause". Fused reads ("BYARROW") count
+# only for weapon words, so a player actually named "Byron" stays a name.
+# Mirrors darwin-stalker's resolver::feed_sides, which still reads the old
+# shape for events stored before this.
+_WEAPON_CAUSES = ("AXE", "ARROW", "HEADSHOT")
+_BY_CAUSE_RE = re.compile(r"^BY(?P<gap>\s*)(?P<cause>[A-Za-z]+)", re.IGNORECASE)
+
+
+def _split_by_cause(victim_raw: str) -> tuple[Optional[str], bool]:
+    """(cause, is_weapon) if victim_raw is really a "BY <cause>" tail, else
+    (None, False)."""
+    m = _BY_CAUSE_RE.match(victim_raw.strip())
+    if not m:
+        return None, False
+    cause = m.group("cause").upper()
+    is_weapon = any(cause.startswith(w) for w in _WEAPON_CAUSES)
+    if not m.group("gap") and not is_weapon:
+        return None, False
+    return cause, is_weapon
+
+
 # How many recent (kind, matched-line) pairs _poll_damage_feed_worker
 # remembers, to avoid re-emitting the same feed line as a duplicate event if
 # it's still on screen on a later poll (2026-09-10) — first blood's own
@@ -153,7 +181,7 @@ _FEED_PATTERNS: list[tuple[str, re.Pattern]] = [
 # check is O(n), n capped here) rather than a set, since a set would grow
 # unbounded over a long match; a match realistically has at most a few
 # dozen kills, so 50 is comfortably more than enough lookback.
-_RECENT_FEED_MATCHES_MAXLEN = 50
+_RECENT_FEED_MATCHES_MAXLEN = 200  # text keys + the once-per-match keys (2026-09-20)
 
 # Bonus-card reward timing buffer (2026-09-10) — shared by every "queued
 # bonus card" flow (first-blood's give_wood, Crowd Favorite's
@@ -1047,17 +1075,50 @@ class MatchRunner:
                     match_key = f"{kind}|{line}"
                     if match_key in self._recent_feed_matches:
                         continue
-                    self._recent_feed_matches.append(match_key)
 
                     fields: dict = {"text": line}
-                    groups = m.groupdict()
+                    groups = {k: (v or "").strip() for k, v in m.groupdict().items()}
+                    if kind == "feed_kill":
+                        cause, is_weapon = _split_by_cause(groups.get("victim", ""))
+                        if cause and is_weapon:
+                            # A kill whose victim the OCR lost.
+                            groups["method"] = groups["victim"][2:].strip()
+                            groups.pop("victim")
+                        elif cause:
+                            # X died to the environment: X is the victim.
+                            groups = {"victim": groups["killer"]}
+                            fields["cause"] = cause
                     for role in ("killer", "victim"):
-                        if role in groups:
-                            raw_name = groups[role].strip()
+                        if groups.get(role):
+                            raw_name = groups[role]
                             fields[f"{role}_raw"] = raw_name
                             fields[f"{role}_slot"] = self._resolve_feed_name(raw_name, slot_map)
                     if groups.get("method"):
-                        fields["method"] = groups["method"].strip()
+                        fields["method"] = groups["method"]
+
+                    # One feed line is on screen for several polls and OCRs a
+                    # little differently each time, so the exact-text key
+                    # above let 2-4 copies of every kill through (prod
+                    # 2026-09-20: 222 of 867 kills were repeats). The game
+                    # gives a better key: a player dies once per match, and
+                    # first blood is drawn once. It is only recorded for a
+                    # COMPLETE read, so a garbled first frame never blocks
+                    # the good read after it (nor the first-blood reward,
+                    # which needs killer_slot). darwin-stalker dedupes
+                    # whatever still gets through.
+                    once_key = None
+                    if kind == "feed_first_blood" and fields.get("killer_slot") is not None:
+                        once_key = "once|feed_first_blood"
+                    elif kind == "feed_kill" and fields.get("victim_slot") is not None and (
+                        fields.get("killer_slot") is not None or "cause" in fields
+                    ):
+                        once_key = f"once|died|{fields['victim_slot']}"
+                    if once_key is not None:
+                        if once_key in self._recent_feed_matches:
+                            self._recent_feed_matches.append(match_key)
+                            continue
+                        self._recent_feed_matches.append(once_key)
+                    self._recent_feed_matches.append(match_key)
                     logger.info("Feed match [%s]: %r -> %s", kind, line, fields)
                     self._emit(kind, **fields)
                     if kind == "feed_first_blood":
