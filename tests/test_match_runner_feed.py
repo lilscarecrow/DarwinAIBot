@@ -311,3 +311,55 @@ def test_dispatch_noops_without_a_roster():
         runner._poll_damage_feed()
     MockThread.assert_not_called()
     assert runner._feed_poll_busy is False
+
+
+# ---- once-per-match dedupe + environmental deaths (2026-09-20) -------------
+#
+# Found auditing darwin-stalker's prod match_events: the same feed line was
+# emitted 2-4 times (it OCRs slightly differently on each poll, defeating the
+# exact-text key), and "X KILLED BY COLD" went out as a kill BY X.
+
+def test_same_kill_read_differently_on_a_later_poll_is_emitted_once():
+    runner, ds = make_runner(ROSTER)
+    run_worker(runner, "STEFFKNIGHT KILLED HELLCRYING BY AXE")
+    run_worker(runner, "STEFFKNIGHT KILLED HELLCRYING BY AXE,")
+    run_worker(runner, ". STEFFKNIGHT KILLED HELLCRYING BY AXE :")
+    assert [k for k, _ in ds.events] == ["feed_kill"]
+
+
+def test_a_garbled_first_read_does_not_block_the_complete_one():
+    runner, ds = make_runner(ROSTER)
+    run_worker(runner, "~~ KILLED HELLCRYING BY AXE")          # killer unreadable
+    run_worker(runner, "STEFFKNIGHT KILLED HELLCRYING BY AXE")  # the good read
+    run_worker(runner, "STEFFKNIGHT KILLED HELLCRYING BY AXE.")
+    assert len(ds.events) == 2
+    assert ds.events[1][1]["killer_slot"] == "0"
+
+
+def test_first_blood_is_emitted_once_per_match():
+    runner, ds = make_runner(ROSTER)
+    run_worker(runner, "STEFFKNIGHT DREW FIRST BLOOD FROM HELLCRYING")
+    run_worker(runner, "| STEFFKNIGHT DREW FIRST BLOOD FROM HELLCRYING.")
+    assert [k for k, _ in ds.events] == ["feed_first_blood"]
+
+
+def test_environmental_death_is_the_victims_line_not_a_kill():
+    runner, ds = make_runner(ROSTER)
+    run_worker(runner, "STEFFKNIGHT KILLED BY COLD")
+    kind, fields = ds.events[0]
+    assert kind == "feed_kill"
+    assert fields["victim_raw"] == "STEFFKNIGHT" and fields["victim_slot"] == "0"
+    assert fields["cause"] == "COLD"
+    assert "killer_raw" not in fields and "killer_slot" not in fields
+    # …and the same death re-read is not emitted again.
+    run_worker(runner, "STEFFKNIGHT KILLED BY COLD f")
+    assert len(ds.events) == 1
+
+
+def test_weapon_with_no_second_name_is_a_kill_with_an_unread_victim():
+    runner, ds = make_runner(ROSTER)
+    run_worker(runner, "GUTS KILLED BYARROW y 2")
+    _, fields = ds.events[0]
+    assert fields["killer_slot"] == "2"
+    assert "victim_raw" not in fields and "cause" not in fields
+    assert fields["method"].upper().startswith("ARROW")
