@@ -40,6 +40,20 @@ def test_accepts_a_valid_redemption():
     runner = make_runner()
     assert runner.try_queue_favorite_reward(1) is True
     assert runner._favorite_reward_target == 1
+    assert runner._favorite_reward_redeemer is None  # no name given — fine, not required
+
+
+def test_stashes_the_redeemers_name_alongside_the_target():
+    runner = make_runner()
+    assert runner.try_queue_favorite_reward(1, redeemer_name="SomeViewer") is True
+    assert runner._favorite_reward_target == 1
+    assert runner._favorite_reward_redeemer == "SomeViewer"
+
+
+def test_a_rejected_redemption_does_not_stash_a_redeemer_name():
+    runner = make_runner(config={"advanced_cards": False})
+    assert runner.try_queue_favorite_reward(1, redeemer_name="SomeViewer") is False
+    assert runner._favorite_reward_redeemer is None
 
 
 def test_advanced_cards_off_rejects_every_redemption():
@@ -220,8 +234,21 @@ def test_fires_once_a_scheduled_card_is_far_enough_away():
     runner._favorite_reward_target = 1
     with patch.object(runner, "_give_favorite_reward") as give:
         runner._maybe_fire_favorite_reward(elapsed=100.0, card_schedule=make_schedule(110))
-    give.assert_called_once_with(1, 0)
+    give.assert_called_once_with(1, 0, redeemer_name=None)
     assert runner._favorite_reward_target is None
+
+
+def test_fires_with_the_redeemers_name_threaded_through():
+    """2026-09-21: the Twitch redeemer's display name (stashed at queue time)
+    rides along to _give_favorite_reward() so the TTS announcement can name
+    who actually gave the reward."""
+    runner = make_runner()
+    runner._favorite_reward_target = 1
+    runner._favorite_reward_redeemer = "SomeViewer"
+    with patch.object(runner, "_give_favorite_reward") as give:
+        runner._maybe_fire_favorite_reward(elapsed=100.0, card_schedule=make_schedule(110))
+    give.assert_called_once_with(1, 0, redeemer_name="SomeViewer")
+    assert runner._favorite_reward_redeemer is None  # reset alongside the target
 
 
 def test_fires_with_no_points_check_at_all():
@@ -288,3 +315,43 @@ def test_give_favorite_reward_skips_without_playing_when_no_portrait_coordinate_
     with patch.object(runner, "_play_tray_card") as play:
         runner._give_favorite_reward(player_index=1, deck_pos=0)
     play.assert_not_called()
+
+
+def test_give_favorite_reward_names_the_redeemer_in_the_tts_line():
+    """2026-09-21: so the in-game player knows who on Twitch gave them the
+    reward, not just what they got."""
+    runner = make_runner()
+    with patch("game.tts.speak_cable") as speak, \
+         patch.object(runner, "_play_tray_card"):
+        runner._give_favorite_reward(player_index=1, deck_pos=0, redeemer_name="SomeViewer")
+    speak.assert_called_once_with("Crowd favorite from SomeViewer! Rewarding Hellcrying with Favorite player.")
+
+
+def test_give_favorite_reward_omits_the_redeemer_clause_when_no_name_is_known():
+    runner = make_runner()
+    with patch("game.tts.speak_cable") as speak, \
+         patch.object(runner, "_play_tray_card"):
+        runner._give_favorite_reward(player_index=1, deck_pos=0)
+    speak.assert_called_once_with("Crowd favorite! Rewarding Hellcrying with Favorite player.")
+
+
+def test_give_favorite_reward_withholds_a_profane_redeemer_name_from_tts():
+    """2026-09-21: a Twitch display name isn't something the streamer
+    controls -- run it through the same better_profanity filter /say already
+    uses (bot/discord_bot.py) so an inappropriate username is never spoken
+    in-game. The reward itself still goes through -- only the spoken name is
+    affected, falling back to the no-name phrasing."""
+    runner = make_runner()
+    with patch("game.tts.speak_cable") as speak, \
+         patch.object(runner, "_play_tray_card") as play:
+        runner._give_favorite_reward(player_index=1, deck_pos=0, redeemer_name="fuckface")
+    speak.assert_called_once_with("Crowd favorite! Rewarding Hellcrying with Favorite player.")
+    play.assert_called_once()  # the card is still given -- only the announcement is affected
+
+
+def test_give_favorite_reward_speaks_a_clean_redeemer_name_normally():
+    runner = make_runner()
+    with patch("game.tts.speak_cable") as speak, \
+         patch.object(runner, "_play_tray_card"):
+        runner._give_favorite_reward(player_index=1, deck_pos=0, redeemer_name="CoolStreamFan42")
+    speak.assert_called_once_with("Crowd favorite from CoolStreamFan42! Rewarding Hellcrying with Favorite player.")

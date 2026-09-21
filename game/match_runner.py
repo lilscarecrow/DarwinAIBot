@@ -360,6 +360,13 @@ class MatchRunner:
         # when nothing is pending; the main loop's own
         # _maybe_fire_favorite_reward() is what actually consumes this.
         self._favorite_reward_target: Optional[int] = None
+        # The Twitch display name of whoever redeemed the currently-queued Crowd
+        # Favorite reward (2026-09-21), if any — announced in the TTS line so the
+        # in-game player knows who gave it to them. None for a reward queued with
+        # no redeemer name (not a real case today, only tests do this), and
+        # always reset alongside self._favorite_reward_target above so a stale
+        # name can never carry over into a later, unrelated redemption.
+        self._favorite_reward_redeemer: Optional[str] = None
         # Populated by run() once the match's card schedule is built (see
         # _past_last_scheduled_card()) — stays [] beforehand/in tests that
         # never call run(), which _past_last_scheduled_card() treats as "not
@@ -1266,6 +1273,7 @@ class MatchRunner:
 
     def _give_reward_card(
         self, card_type: str, player_index: int, deck_pos: int, tts_prefix: str, event_label: str,
+        redeemer_name: Optional[str] = None,
     ) -> None:
         """Shared by every "queued bonus card" reward (first-blood's
         give_wood, Crowd Favorite's favorite_player — see
@@ -1294,8 +1302,22 @@ class MatchRunner:
         drag/verify/announce logic every scheduled card goes through) rather
         than duplicating it — trigger_seconds/play_time_seconds are unused
         outside the schedule so they're left at 0. tts_prefix is spoken as
-        "{tts_prefix}! Rewarding X with Y."; event_label names the emitted
-        card_play event as "{event_label} (Y)".
+        "{tts_prefix}! Rewarding X with Y." — or, when redeemer_name is given
+        and clears the profanity filter (2026-09-21, Crowd Favorite only —
+        first blood has no Twitch redeemer to name), "{tts_prefix} from
+        {redeemer_name}! Rewarding X with Y.", so the in-game player hears
+        who on Twitch actually gave it to them.
+
+        redeemer_name is a Twitch display name the streamer doesn't control
+        — the same `better_profanity` filter /say already gates on (see
+        bot/discord_bot.py's say(), tuned via tts_profanity_whitelist/
+        tts_profanity_extra_words in config.json) is checked here too, so an
+        inappropriate username is never spoken on stream. This omits the
+        name from the announcement rather than blocking the reward itself —
+        the redemption already fulfilled and the card still gets given; only
+        what gets said out loud is affected.
+
+        event_label names the emitted card_play event as "{event_label} (Y)".
         """
         from game.deck_utils import CARD_POINT_COSTS
         from game import tts
@@ -1314,7 +1336,20 @@ class MatchRunner:
             card_label, target_label, target,
         )
 
-        tts.speak_cable(f"{tts_prefix}! Rewarding {target_label} with {card_label}.")
+        announced_redeemer = redeemer_name
+        if announced_redeemer:
+            from better_profanity import profanity
+            if profanity.contains_profanity(announced_redeemer):
+                logger.info(
+                    "Reward: redeemer name %r withheld from TTS — flagged by the profanity filter",
+                    announced_redeemer,
+                )
+                announced_redeemer = None
+
+        if announced_redeemer:
+            tts.speak_cable(f"{tts_prefix} from {announced_redeemer}! Rewarding {target_label} with {card_label}.")
+        else:
+            tts.speak_cable(f"{tts_prefix}! Rewarding {target_label} with {card_label}.")
         event = CardEvent(
             name=f"{event_label} ({card_label})",
             card_type=card_type,
@@ -1337,11 +1372,15 @@ class MatchRunner:
         self._give_reward_card("give_wood", killer_index, deck_pos,
                                 tts_prefix="First blood", event_label="First Blood Reward")
 
-    def _give_favorite_reward(self, player_index: int, deck_pos: int) -> None:
+    def _give_favorite_reward(self, player_index: int, deck_pos: int,
+                               redeemer_name: Optional[str] = None) -> None:
         """See _give_reward_card() — the Crowd Favorite channel-points
-        reward's favorite_player card."""
+        reward's favorite_player card. redeemer_name (2026-09-21) is the
+        Twitch display name of whoever redeemed it, if known — announced in
+        the TTS line."""
         self._give_reward_card("favorite_player", player_index, deck_pos,
-                                tts_prefix="Crowd favorite", event_label="Crowd Favorite Reward")
+                                tts_prefix="Crowd favorite", event_label="Crowd Favorite Reward",
+                                redeemer_name=redeemer_name)
 
     def _past_last_scheduled_card(self) -> bool:
         """True once every card in self._card_schedule has fired (or if it's
@@ -1366,7 +1405,7 @@ class MatchRunner:
         """
         return bool(self._card_schedule) and all(e.done for e in self._card_schedule)
 
-    def try_queue_favorite_reward(self, player_index: int) -> bool:
+    def try_queue_favorite_reward(self, player_index: int, redeemer_name: Optional[str] = None) -> bool:
         """Reserves the Crowd Favorite reward for player_index, if — and
         only if — nothing is already pending, player_index is a real,
         currently-alive card index in this match's roster, and at least one
@@ -1377,6 +1416,11 @@ class MatchRunner:
         remain, but a second redemption while one is already queued is
         rejected here rather than queued behind it; the caller (Twitch bot)
         refunds on a False return.
+
+        redeemer_name (2026-09-21) is the Twitch display name of whoever
+        redeemed it, if known — stashed alongside player_index purely for
+        the eventual TTS announcement (see _give_reward_card()), not used in
+        any eligibility check here.
 
         Deliberately does NOT require self._player_names[player_index] to be
         non-empty (2026-09-10 fix, found in review) — unlike first blood,
@@ -1404,6 +1448,7 @@ class MatchRunner:
         if self.favorite_reward_rejection_reason(player_index) is not None:
             return False
         self._favorite_reward_target = player_index
+        self._favorite_reward_redeemer = redeemer_name
         logger.info("Crowd Favorite reward queued for %s", self._slot_name(player_index))
         return True
 
@@ -1471,6 +1516,7 @@ class MatchRunner:
         if self._favorite_reward_target is None:
             return
         target = self._favorite_reward_target
+        redeemer = self._favorite_reward_redeemer
 
         if target < len(self._player_alive) and not self._player_alive[target]:
             logger.info(
@@ -1478,6 +1524,7 @@ class MatchRunner:
                 self._slot_name(target),
             )
             self._favorite_reward_target = None
+            self._favorite_reward_redeemer = None
             return
 
         if self._past_last_scheduled_card():
@@ -1485,6 +1532,7 @@ class MatchRunner:
                 "Crowd Favorite reward canceled — the card schedule is already exhausted",
             )
             self._favorite_reward_target = None
+            self._favorite_reward_redeemer = None
             return
 
         pending_times = [e.trigger_seconds - elapsed for e in card_schedule if not e.done]
@@ -1495,10 +1543,12 @@ class MatchRunner:
         if deck_pos is None:
             logger.warning("Crowd Favorite reward: no 'favorite_player' card available in the deck — canceling")
             self._favorite_reward_target = None
+            self._favorite_reward_redeemer = None
             return
 
         self._favorite_reward_target = None
-        self._give_favorite_reward(target, deck_pos)
+        self._favorite_reward_redeemer = None
+        self._give_favorite_reward(target, deck_pos, redeemer_name=redeemer)
 
     def _slot_name(self, i: int) -> str:
         if self._player_names and i < len(self._player_names) and self._player_names[i]:

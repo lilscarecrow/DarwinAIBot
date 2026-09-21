@@ -615,6 +615,10 @@ class DarwinTwitchBot(commands.Bot):
         moment, potentially anywhere from instant to several minutes) is a
         bot implementation detail, not something that should leave a valid
         redemption sitting in the dashboard's queue.
+
+        payload.user.display_name is passed through as redeemer_name
+        (2026-09-21) so the eventual in-game TTS announcement names who on
+        Twitch actually gave the reward, not just who received it.
         """
         key = _extract_pov_key(payload.user_input)
         if key is None:
@@ -627,7 +631,9 @@ class DarwinTwitchBot(commands.Bot):
         from game.player_cards_v2 import index_for_slot_number
 
         player_index = index_for_slot_number(key)
-        accepted = self.active_runner.try_queue_favorite_reward(player_index)
+        accepted = self.active_runner.try_queue_favorite_reward(
+            player_index, redeemer_name=payload.user.display_name,
+        )
         if accepted:
             try:
                 await payload.fulfill(token_for=self._owner_id)

@@ -119,7 +119,7 @@ def test_queues_and_fulfills_on_acceptance():
     payload = make_payload("Crowd Favorite", "5")
     run(bot._handle_favorite_redemption(payload))
     # key "5" -> index_for_slot_number("5") == 4
-    bot.active_runner.try_queue_favorite_reward.assert_called_once_with(4)
+    bot.active_runner.try_queue_favorite_reward.assert_called_once_with(4, redeemer_name="viewer")
     payload.fulfill.assert_called_once()
     payload.refund.assert_not_called()
 
@@ -151,7 +151,7 @@ def test_accepts_pov_style_prefixed_input_too():
     bot.active_runner.try_queue_favorite_reward.return_value = True
     payload = make_payload("Crowd Favorite", "!pov 3")
     run(bot._handle_favorite_redemption(payload))
-    bot.active_runner.try_queue_favorite_reward.assert_called_once_with(2)  # "3" -> index 2
+    bot.active_runner.try_queue_favorite_reward.assert_called_once_with(2, redeemer_name="viewer")  # "3" -> index 2
 
 
 def test_slot_zero_maps_to_index_nine():
@@ -160,7 +160,18 @@ def test_slot_zero_maps_to_index_nine():
     bot.active_runner.try_queue_favorite_reward.return_value = True
     payload = make_payload("Crowd Favorite", "0")
     run(bot._handle_favorite_redemption(payload))
-    bot.active_runner.try_queue_favorite_reward.assert_called_once_with(9)
+    bot.active_runner.try_queue_favorite_reward.assert_called_once_with(9, redeemer_name="viewer")
+
+
+def test_passes_the_actual_redeemers_display_name_through():
+    """2026-09-21: so the in-game TTS announcement can name who on Twitch
+    actually gave the reward -- not just a hardcoded/default value."""
+    bot = make_bot()
+    bot.active_runner = MagicMock()
+    bot.active_runner.try_queue_favorite_reward.return_value = True
+    payload = make_payload("Crowd Favorite", "5", display_name="CoolStreamFan42")
+    run(bot._handle_favorite_redemption(payload))
+    bot.active_runner.try_queue_favorite_reward.assert_called_once_with(4, redeemer_name="CoolStreamFan42")
 
 
 # ---- _ensure_custom_reward / _ensure_favorite_reward ------------------------
