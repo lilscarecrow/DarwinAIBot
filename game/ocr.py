@@ -90,6 +90,18 @@ def count_director_point_pips(screenshot: np.ndarray, pips_cfg: dict) -> int | N
     pips_cfg: {"x_start": int, "y": int, "spacing": int, "count": int}
     A pip is filled when its pixel is bright (max channel > 130).
     Returns the number of filled pips (0–10), or None if config is invalid.
+
+    SUPERSEDED (2026-09-15) by read_director_point_pips() below — single-pixel
+    brightness sampling overcounts whenever a same-colored background element
+    sits at that exact coordinate (a same-sized, same-colored decorative ring
+    surrounds every pip regardless of fill state, which this function's single
+    sample point can land directly on), and has no way to distinguish a
+    partially-filled pip (the meter fills via a radial wipe, not an instant
+    color swap) from filled/empty at all. Left in place, unused everywhere,
+    same "disconnected, not deleted" precedent as this codebase's other
+    superseded-but-possibly-useful-again code — delete outright once
+    read_director_point_pips() has proven solid in production (that was the
+    explicit plan when it was built, not a maybe).
     """
     try:
         x0 = int(pips_cfg["x_start"])
@@ -109,19 +121,295 @@ def count_director_point_pips(screenshot: np.ndarray, pips_cfg: dict) -> int | N
     return filled
 
 
+# Inner-mask radius for _pip_fill_fraction() below — measured live (2026-09-15)
+# against a real pip: the fill disc itself extends to about radius 11 from
+# center, with a decorative ring (bright regardless of fill state) sitting at
+# roughly radius 12-15, and background/gap beyond that. 9 sits safely inside
+# the disc, clear of the ring, so the ring's always-bright pixels never bias
+# the reading toward "filled" the way a same-colored ring easily could.
+_PIP_INNER_RADIUS = 9
+
+# A pixel counts as "lit" above this brightness (max of B/G/R) — same idea as
+# count_director_point_pips' single-pixel check, just applied per-pixel across
+# a whole masked area instead of to one point, and only ever used as an
+# ingredient in a per-pip AREA fraction (see _pip_fill_fraction), never as a
+# standalone filled/empty verdict on its own.
+_PIP_BRIGHT_THRESHOLD = 150
+
+# A pip whose measured fill fraction sits below this can't be mistaken for
+# filled, and above this can't be mistaken for empty — measured live: real
+# filled pips read ~0.92, empty ~0.07, a pip mid-radial-fill ~0.30-0.51. Used
+# only for the whole-row "all filled" / "all empty" special cases below, where
+# there's no second group to compare against (see their own comments for why
+# that needs a different check than the interior split search).
+_PIP_ALL_HIGH_FLOOR = 0.6
+_PIP_ALL_LOW_CEILING = 0.15
+
+# The winning interior split must beat the next-best candidate by at least
+# this big a margin (best_sse / runner_up_sse must fall below this ratio) to
+# be trusted at all. Measured live: a genuine filled/empty boundary won by
+# ~39x (ratio ~0.026); a uniformly-pulsing row with no real boundary (the
+# whole meter capped at 10/10, idling) still "won" some arbitrary split by
+# only ~1.1-1.5x (ratio ~0.67-0.94) purely from ripple/gradient noise across
+# nominally-identical pips — nowhere near a real boundary's margin. 0.35 sits
+# comfortably below every genuine-noise ratio observed and comfortably above
+# the one real split observed; revisit if production data ever disagrees.
+_PIP_SPLIT_CONFIDENCE_RATIO = 0.35
+
+# The winning split's "filled" group must ALL clear this absolute floor, not
+# just be relatively higher than the "empty" group (2026-09-15 fix, found
+# live: a genuinely half-filled pip, mid-radial-wipe at ~0.61, got grouped
+# into "filled" alongside a truly-filled pip that itself only measured
+# ~0.74). The relative confidence-ratio gate above didn't catch this: the
+# split {0.74, 0.61} vs {0.10, ...} is a clean, well-separated two-group fit
+# by SSE alone — the SSE metric has no opinion on whether the "filled"
+# group's own values are anywhere near what a real filled pip reads, only on
+# how tightly each group clusters internally.
+#
+# Raised 0.65 -> 0.80 (2026-09-17), after a ~4-minute live cross-signal
+# monitor (74 sampled frames, OCR vs. pips side by side) caught the same
+# failure mode again at the ORIGINAL 0.65 floor: a pip mid-radial-wipe at
+# 0.70-0.72 got counted as filled while OCR steadily read one lower for the
+# same span of frames (the pip was still visibly climbing — 0.72 -> 0.83
+# across consecutive polls — not yet actually done). That session's data
+# also showed every genuinely-settled filled pip reading 0.84-0.96, with no
+# recurrence at all of the single ~0.74 dim-state case that originally set
+# the floor this low — so 0.80 was chosen as sitting cleanly above every
+# confirmed still-filling reading observed (0.70, 0.72) and cleanly below
+# every confirmed genuinely-filled reading observed (0.84 and up) in that
+# same session, at the cost of no longer accepting that one historical 0.74
+# outlier if it turns out to be a real, recurring render state rather than a
+# one-off — revisit if it resurfaces.
+#
+# This is an inherently fuzzy boundary, not a clean one: a single frame's
+# fill fraction alone cannot always distinguish "genuinely done, just
+# naturally reading a bit low this frame" from "still filling, about to
+# finish" — both can transiently occupy the same value range. A pip caught
+# at exactly the wrong instant (high 0.70s/low 0.80s) may still occasionally
+# go either way; only comparing consecutive frames for a still-rising trend
+# could resolve that class of case with confidence, which this constant
+# alone does not attempt.
+_PIP_FILLED_GROUP_FLOOR = 0.80
+
+
+def _pip_fill_fraction(screenshot: np.ndarray, x: int, y: int) -> float | None:
+    """Fraction of a pip's inner disc (radius _PIP_INNER_RADIUS, centered at
+    x,y) that reads brighter than _PIP_BRIGHT_THRESHOLD — a per-pip AREA
+    measurement standing in for "how much of this pip's radial fill wipe has
+    completed", not a binary filled/empty verdict. A circular mask (not a
+    square box) matters here: a square's corners reach past the pip's own
+    disc into the decorative ring/background around it, which is exactly the
+    kind of contamination this whole redesign exists to avoid — see
+    read_director_point_pips()'s docstring.
+
+    Returns None if the sample area falls outside the screenshot (a bad
+    coordinate, or a differently-sized/positioned capture).
+    """
+    r = _PIP_INNER_RADIUS
+    h, w = screenshot.shape[:2]
+    if not (r <= x < w - r and r <= y < h - r):
+        return None
+    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+    mask = xx * xx + yy * yy <= r * r
+    box = screenshot[y - r:y + r + 1, x - r:x + r + 1]
+    bmax = box.max(axis=2)
+    return float((bmax[mask] > _PIP_BRIGHT_THRESHOLD).mean())
+
+
+def read_director_point_pips(screenshot: np.ndarray, pips_cfg: dict) -> int | None:
+    """Count filled director point pips via a per-frame, self-referential
+    split search (2026-09-15) — replacing count_director_point_pips()'s
+    single-pixel brightness check, which had two problems live testing
+    confirmed can't be patched with more/bigger samples at the same spot:
+
+    1. A same-colored background element sitting at a pip's exact screen
+       position reads as "filled" regardless of how many pixels you sample
+       there, if the whole sampled area is uniformly contaminated — averaging
+       a bigger patch doesn't help when every pixel in it agrees with the
+       wrong answer.
+    2. Each pip fills via a radial wipe animation, not an instant color swap,
+       and the WHOLE ROW (filled and empty pips alike) also grows/shrinks and
+       shifts color together in a ~1s pulse once points sit banked for a
+       while — so there is no fixed "what does a filled pip look like"
+       reference that stays valid over time. A stored calibration image (the
+       first fix attempted here) would only ever match the exact instant it
+       was captured.
+
+    The fix: don't compare any pip's appearance to a stored reference at all.
+    Compare the row to ITSELF, this frame only. Points fill strictly
+    left-to-right, so the true state is always "first K pips filled, the rest
+    empty" — one of only `count + 1` possibilities. For each candidate K,
+    score how well the two groups it implies (positions 0..K-1 vs K..end)
+    hang together (sum of within-group variance in each group's own fill
+    fraction — see _pip_fill_fraction); the true boundary should produce two
+    tight, well-separated groups whatever the row's current pulse phase
+    happens to be, since a synchronized pulse moves both groups' baseline
+    together without changing the gap between them.
+
+    Two extra guards, both grounded in live measurements (see the module-level
+    comments on the constants used here for the exact numbers):
+
+    - Whole-row extremes (fully capped at `count`, or fully empty) are
+      checked FIRST, via a straightforward "is every pip clearly bright" / "is
+      every pip clearly dim" floor-and-ceiling test — not the split search.
+      A fully uniform row has no second group to meaningfully separate from,
+      so forcing the split search to judge it produces exactly the failure
+      mode a live capture caught: an all-10-filled, mid-pulse row still
+      "won" some arbitrary interior split by a thin margin, from nothing more
+      than ripple noise across nominally-identical pips.
+    - For everything else, the winning interior split must beat the
+      next-best candidate by a wide margin (_PIP_SPLIT_CONFIDENCE_RATIO) to
+      be trusted — the same live capture showed a genuine boundary winning by
+      ~39x while ripple-driven false splits won by only ~1.1-1.5x, so this
+      cleanly tells them apart. A frame that doesn't clear the bar returns
+      None (no read this poll) rather than a guess — the next poll, at a
+      different, uncorrelated point in the ~1s pulse cycle, gets another shot
+      (see MatchRunner._update_points_reading()'s temporal agreement, which
+      this feeds into the same way an OCR read does).
+
+    Returns the filled-pip count (0..count), or None if config is invalid,
+    the sample area is out of bounds, or no reading clears the confidence bar.
+    """
+    try:
+        x0 = int(pips_cfg["x_start"])
+        y = int(pips_cfg["y"])
+        sp = int(pips_cfg["spacing"])
+        n = int(pips_cfg["count"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if n < 2:
+        return None
+
+    fracs = []
+    for i in range(n):
+        f = _pip_fill_fraction(screenshot, x0 + i * sp, y)
+        if f is None:
+            return None
+        fracs.append(f)
+    fracs = np.array(fracs)
+
+    if fracs.min() > _PIP_ALL_HIGH_FLOOR:
+        return n
+    if fracs.max() < _PIP_ALL_LOW_CEILING:
+        return 0
+
+    candidates = []
+    for k in range(1, n):
+        left, right = fracs[:k], fracs[k:]
+        sse = left.var() * len(left) + right.var() * len(right)
+        candidates.append((sse, k))
+    candidates.sort(key=lambda t: t[0])
+
+    best_sse, best_k = candidates[0]
+    runner_up_sse = candidates[1][0] if len(candidates) > 1 else None
+    if not runner_up_sse:  # None, or exactly 0 (can't compute a meaningful ratio)
+        return None
+    if best_sse / runner_up_sse > _PIP_SPLIT_CONFIDENCE_RATIO:
+        return None
+    if fracs[:best_k].min() < _PIP_FILLED_GROUP_FLOOR:
+        return None
+    return best_k
+
+
+# read_director_points()'s preprocessing (2026-09-15, replacing grayscale+Otsu --
+# see the function's docstring): a pixel is "ink" when its color differs from the
+# crop's own background-corner sample by more than this, on whichever channel
+# differs most. Chosen the same way _FEED_TEXT_DARKNESS_THRESHOLD was -- checked
+# against real captured crops across a 30-70 range with identical clean output
+# once paired with _POINTS_TEXT_MIN_COMPONENT_AREA's noise cleanup below.
+_POINTS_TEXT_BG_DISTANCE_THRESHOLD = 60
+
+# Drops connected "ink" blobs smaller than this many pixels (at the 6x upscale
+# read_director_points() uses) before handing the mask to tesseract. Found live:
+# the numerator sits close enough to actual game-world texture (not always a flat
+# UI backing) that a stray pixel or two near the crop's edge can differ from the
+# single background-corner sample enough to register as "ink" -- harmless to the
+# digit shapes themselves, but enough scattered noise confused tesseract's own
+# line/word segmentation into missing a real digit even though the glyphs
+# themselves were perfectly solid. 34 sits well below the smallest real digit
+# stroke's pixel count at this crop's resolution and well above the single-pixel
+# specks actually observed.
+_POINTS_TEXT_MIN_COMPONENT_AREA = 34
+
+# 6x, not 4x -- found live, comparing all three against 20 real captured frames:
+# 4x and 5x both silently DROPPED one digit on some frames instead of failing
+# outright (e.g. a true "07" reading as plain "0", which parses as a plausible
+# but wrong value rather than None), while 6x either read both digits correctly
+# or returned nothing on every one of those same frames -- zero confirmed wrong
+# non-empty reads at 6x across the dataset, versus two at 4x and one at 5x. A
+# lower hit rate that fails safe beats a higher one that occasionally lies.
+_POINTS_TEXT_UPSCALE = 6
+
+
+def _prepare_points_crop(screenshot: np.ndarray, region: tuple[int, int, int, int]):
+    """Shared by read_director_points() (and any future debug dump of the same
+    crop, mirroring _prepare_feed_crop()'s split). Returns (raw_crop, processed)
+    -- both None if `region` is out of bounds.
+
+    Classifies "ink" by distance from the crop's OWN background color (sampled
+    at a corner pixel, (2, 2) rather than (0, 0) to dodge a resize-edge
+    artifact) rather than by absolute darkness or a fixed color -- see
+    read_director_points()'s docstring for why. Then drops small connected
+    components (see _POINTS_TEXT_MIN_COMPONENT_AREA) before returning.
+    """
+    x, y, w, h = (int(v) for v in region)
+    if y + h > screenshot.shape[0] or x + w > screenshot.shape[1]:
+        return None, None
+    crop = _crop(screenshot, x, y, w, h)
+    scaled = cv2.resize(crop, None, fx=_POINTS_TEXT_UPSCALE, fy=_POINTS_TEXT_UPSCALE, interpolation=cv2.INTER_CUBIC)
+    bg_color = scaled[2, 2].astype(np.int16)
+    diff = np.abs(scaled.astype(np.int16) - bg_color).max(axis=2)
+    mask = np.where(diff > _POINTS_TEXT_BG_DISTANCE_THRESHOLD, 0, 255).astype(np.uint8)
+
+    ink = (mask == 0).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    cleaned = np.full_like(mask, 255)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= _POINTS_TEXT_MIN_COMPONENT_AREA:
+            cleaned[labels == i] = 0
+    return crop, cleaned
+
+
 def read_director_points(screenshot: np.ndarray, region: tuple[int, int, int, int]) -> int | None:
     """
     OCR the director points numerator (e.g. '06' from '06/10').
     region: (x, y, w, h) — should cover only the two-digit numerator, not the '/10'.
     Returns the current point count (0-10), or None if OCR fails.
+
+    **Preprocessing detects ink by distance from the crop's own background
+    color, not by absolute darkness or a fixed hue (2026-09-15 rewrite,
+    replacing grayscale+Otsu — found live to fail on a large fraction of
+    otherwise-legible frames).** The numerator digits are part of the same
+    synchronized pulse-idle animation the pip row goes through (see
+    read_director_point_pips()) and render in different fill colors at
+    different times (confirmed live: white in one state, saturated pink in
+    another) over a background that isn't always a flat UI panel either
+    (world texture can show through at the crop's margins). Grayscale
+    conversion's weighted-luminance formula doesn't reliably separate two
+    saturated colors (the same class of problem already solved once for the
+    damage-feed text's colored player names — see the Ladder Ingestion
+    section's Damage feed OCR notes), so a badly fragmented glyph and an
+    empty OCR result followed on a large fraction of live-captured frames
+    regardless of which color state was showing.
+
+    Sampling the crop's own background (a corner pixel, not a fixed
+    constant) and thresholding on color DISTANCE from it works regardless of
+    what color the ink happens to be — verified directly against 9 real
+    live-captured frames spanning both the white and pink states, reading
+    correctly on every one once paired with the small-component cleanup in
+    `_prepare_points_crop()` (without that cleanup, stray noise from the
+    non-flat background confused tesseract's segmentation on frames that
+    otherwise had perfectly solid, legible digits). Uses `--psm 6` (verified
+    to outperform the old `--psm 8` once digits render as solid filled
+    glyphs rather than a grayscale-threshold silhouette) — same PSM as
+    `ocr_feed_text()`'s multi-line block mode, chosen for the same reason:
+    more tolerant of the crop's surrounding noise than `--psm 8` (treat as a
+    single word) turned out to be.
     """
-    x, y, w, h = region
-    crop = _crop(screenshot, x, y, w, h)
-    # 4x upscale + Otsu auto-threshold (adapts to background brightness)
-    scaled = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    text = _ocr_region_img(thresh, config="--psm 8 -c tessedit_char_whitelist=0123456789")
+    _, processed = _prepare_points_crop(screenshot, region)
+    if processed is None:
+        return None
+    text = _ocr_region_img(processed, config="--psm 6 -c tessedit_char_whitelist=0123456789")
     try:
         digits = "".join(filter(str.isdigit, text))
         if digits:

@@ -495,7 +495,18 @@ class DarwinTwitchBot(commands.Bot):
 
     async def _refund(self, payload, reason: str) -> None:
         """Shared by every custom-reward redemption handler below: refunds a
-        redemption that didn't resolve, logging why. Never raises."""
+        redemption that didn't resolve, logging why — and, since 2026-09-20,
+        posting the same reason to chat so the redeemer isn't left guessing.
+
+        Found live: a viewer redeemed Crowd Favorite several times in a row
+        with nothing visibly happening — every attempt was silently refunded
+        (points back, no explanation) because the match's card schedule had
+        already finished, but there was no way to tell that from Twitch
+        alone. `reason` is expected to already be a short, viewer-facing
+        phrase (see the call sites below) — this posts it via announce(),
+        which is best-effort and never raises, so a chat outage here can't
+        break the refund itself.
+        """
         logger.info(
             "Twitch bot: '%s' redemption from %s refunded (%s)",
             payload.reward.title, payload.user.display_name, reason,
@@ -504,6 +515,10 @@ class DarwinTwitchBot(commands.Bot):
             await payload.refund(token_for=self._owner_id)
         except Exception as e:
             logger.warning("Twitch bot: could not refund '%s' redemption: %s", payload.reward.title, e)
+        await self.announce(
+            f"@{payload.user.display_name} your \"{payload.reward.title}\" redemption "
+            f"was refunded — {reason}."
+        )
 
     async def event_custom_redemption_add(self, payload) -> None:
         """channel.channel_points_custom_reward_redemption.add — dispatches by
@@ -548,12 +563,18 @@ class DarwinTwitchBot(commands.Bot):
         is_privileged = await self._is_mod_or_broadcaster(payload.user.id)
 
         if not is_privileged and time.monotonic() < self._pov_redemption_available_at:
-            await self._refund(payload, "cooldown active")
+            await self._refund(payload, "Change POV is on a short cooldown, try again in a few seconds")
             return
 
         key = _extract_pov_key(payload.user_input)
-        if not self.session.is_command_valid("pov") or self.session.is_pov_locked() or key is None:
-            await self._refund(payload, "invalid input or wrong game state")
+        if key is None:
+            await self._refund(payload, "enter a valid player number (1-9, or 0 for the 10th slot)")
+            return
+        if not self.session.is_command_valid("pov"):
+            await self._refund(payload, f"POV can't be changed right now (state: {self.session.state.name})")
+            return
+        if self.session.is_pov_locked():
+            await self._refund(payload, "POV is locked while the match roster is being captured")
             return
 
         from game.card_actions import press_key
@@ -572,7 +593,7 @@ class DarwinTwitchBot(commands.Bot):
             except Exception as e:
                 logger.warning("Twitch bot: could not update POV redemption status: %s", e)
         else:
-            await self._refund(payload, "keystroke send failed")
+            await self._refund(payload, "couldn't reach the game right now, try again")
 
     async def _handle_favorite_redemption(self, payload) -> None:
         """The "Crowd Favorite" reward (500 points by default) — drops a
@@ -597,10 +618,10 @@ class DarwinTwitchBot(commands.Bot):
         """
         key = _extract_pov_key(payload.user_input)
         if key is None:
-            await self._refund(payload, "invalid input")
+            await self._refund(payload, "enter a valid player number (1-9, or 0 for the 10th slot)")
             return
         if self.active_runner is None:
-            await self._refund(payload, "no match in progress")
+            await self._refund(payload, "no match is currently in progress")
             return
 
         from game.player_cards_v2 import index_for_slot_number
@@ -613,7 +634,8 @@ class DarwinTwitchBot(commands.Bot):
             except Exception as e:
                 logger.warning("Twitch bot: could not update Crowd Favorite redemption status: %s", e)
         else:
-            await self._refund(payload, "no eligible player at that slot, one already queued, or no cards left")
+            reason = self.active_runner.favorite_reward_rejection_reason(player_index)
+            await self._refund(payload, reason or "that redemption couldn't be queued")
 
 
 class PovComponent(commands.Component):

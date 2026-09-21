@@ -65,7 +65,21 @@ def _get_darwin_hwnd() -> int | None:
 
 
 def focus_darwin_window() -> bool:
-    """Bring the Darwin Project window to the foreground. Returns True on success."""
+    """Bring the Darwin Project window to the foreground. Returns True on success.
+
+    Falls back to a synthetic Alt key tap before a second SetForegroundWindow
+    attempt (2026-09-20 fix, found live): AttachThreadInput alone stopped being
+    enough right at match end — SetForegroundWindow raised a pywintypes error
+    with winerror 0 ("No error message is available"), a known Windows quirk
+    where the foreground-lock heuristic silently blocks the switch without
+    setting a real extended error. That heuristic effectively requires the
+    calling context to look like it just received real user input; sharing
+    Darwin's input queue via AttachThreadInput doesn't always satisfy it on
+    its own, but a genuine (if synthetic) keyboard event does — a harmless,
+    widely-used trick for exactly this case. Only tried once, only after the
+    first attempt actually failed, so the common case (focus grab succeeds
+    immediately) is unaffected.
+    """
     hwnd = _get_darwin_hwnd()
     if not hwnd:
         logger.warning("Cannot focus Darwin window — hwnd not found")
@@ -84,7 +98,15 @@ def focus_darwin_window() -> bool:
         )
 
         _user32.BringWindowToTop(hwnd)
-        win32gui.SetForegroundWindow(hwnd)
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception as e:
+            logger.debug(
+                "SetForegroundWindow failed once (%s) — nudging with a synthetic Alt tap and retrying", e,
+            )
+            win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+            win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32gui.SetForegroundWindow(hwnd)
         time.sleep(0.15)
 
         if attached:
@@ -163,6 +185,7 @@ def play_card(
     slot_template_path: str | None = None,
     bypass_mode: bool = False,
     keep_shift: bool = False,
+    hold_at_target_seconds: float = 0.0,
 ) -> bool:
     """
     Shift-drag a card from slot_coordinate to target_coordinate.
@@ -172,6 +195,16 @@ def play_card(
 
     keep_shift: if True, skip the trailing shift_up() so the caller can hold shift
     continuously from before-screenshot through play through after-screenshot.
+
+    hold_at_target_seconds: pause with the mouse button still down once the cursor
+    reaches target_coordinate, before releasing (2026-09-15) — a plain dragTo()
+    releases the instant the move animation ends, with no dwell time at all. Found
+    live: a give_wood reward's drop onto a player's portrait missed, and it happened
+    "too fast to tell where it landed" — the same class of problem the hover_click
+    convention elsewhere in this codebase exists to avoid (the game needs a brief
+    hover/settle before it registers where the cursor actually is). Defaults to 0
+    (no behavior change) since only player-portrait drops have shown this symptom so
+    far; see match_runner.py's _PORTRAIT_DROP_HOLD_SECONDS for the caller that sets it.
     """
     sx, sy = slot_coordinate
     tx, ty = target_coordinate
@@ -188,7 +221,13 @@ def play_card(
     time.sleep(0.15)  # let tray appear before moving to card
     pyautogui.moveTo(sx, sy, duration=0.2)
     time.sleep(0.1)
-    pyautogui.dragTo(tx, ty, duration=DRAG_DURATION, button="left")
+    if hold_at_target_seconds > 0:
+        pyautogui.mouseDown()
+        pyautogui.moveTo(tx, ty, duration=DRAG_DURATION)
+        time.sleep(hold_at_target_seconds)
+        pyautogui.mouseUp()
+    else:
+        pyautogui.dragTo(tx, ty, duration=DRAG_DURATION, button="left")
     if not keep_shift:
         shift_up()
     time.sleep(0.3)

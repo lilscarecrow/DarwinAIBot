@@ -10,7 +10,10 @@ one is.
 """
 from unittest.mock import patch
 
-from game.match_runner import MatchRunner, CardEvent, _PLAYER_PORTRAIT_TARGET_Y
+from game.match_runner import (
+    MatchRunner, CardEvent, _PLAYER_PORTRAIT_TARGET_Y, _PLAYER_TARGETED_DRAG_Y_OFFSET,
+    _PORTRAIT_DROP_HOLD_SECONDS,
+)
 from session.state import SessionState
 
 
@@ -34,7 +37,18 @@ def test_targets_the_one_alive_players_own_portrait():
         runner._fire_card_event(make_event(), all_events=[])
     play.assert_called_once()
     event, target, *_ = play.call_args[0]
-    assert target == (runner._player_slot_xs[1], _PLAYER_PORTRAIT_TARGET_Y)
+    assert target == (runner._player_slot_xs[1], _PLAYER_PORTRAIT_TARGET_Y + _PLAYER_TARGETED_DRAG_Y_OFFSET)
+
+
+def test_holds_at_the_portrait_before_releasing():
+    """2026-09-15 fix: portrait drops need a brief hold before release — see
+    test_match_runner_first_blood_reward.py::test_give_holds_at_the_portrait_before_releasing
+    for the live miss that motivated this. This dispatch path must forward
+    the same _PORTRAIT_DROP_HOLD_SECONDS constant."""
+    runner = make_runner(alive=[False, True, False])
+    with patch.object(runner, "_play_tray_card") as play:
+        runner._fire_card_event(make_event(), all_events=[])
+    assert play.call_args.kwargs["hold_at_target_seconds"] == _PORTRAIT_DROP_HOLD_SECONDS
 
 
 def test_skips_when_no_alive_player_is_tracked():

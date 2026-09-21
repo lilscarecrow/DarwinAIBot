@@ -90,6 +90,43 @@ def _try_force_sync() -> bool:
         return False
 
 
+async def _acquire_lock_or_reject(lock: asyncio.Lock, interaction: discord.Interaction, busy_message: str) -> bool:
+    """Atomically claim `lock`, or reject with `busy_message` if it's already
+    held (2026-09-15) — shared by DirectorCog's `_session_lock` (`/launch`,
+    `/custom`, `/menu`, `/start`) and ScrimCog's `_role_lock` (`/role add`,
+    `/role remove`) so both get identical protection without duplicating the
+    reasoning per cog.
+
+    Replaces a check-then-later-acquire sequence that only ever peeked at
+    `lock.locked()` and returned — the real acquire (`async with lock:`)
+    happened several lines later, after at least one genuine `await`
+    (`interaction.response.defer()`, or more work before that). Two commands
+    invoked close together could both pass that early peek during the gap
+    before either had actually claimed the lock, since nothing yet
+    distinguished "checked" from "held": asyncio is cooperative and
+    single-threaded, so whichever task's coroutine the event loop ran first
+    would sail synchronously through every guard, hit its own first real
+    `await`, and only *then* yield — letting the second task run its own
+    guards against the same still-unlocked state.
+
+    Checking and acquiring back-to-back with no `await` in between closes the
+    gap entirely: `asyncio.Lock.acquire()` never actually suspends the calling
+    task when the lock is free, so nothing else can be scheduled between the
+    check and the claim — by the time any other command's own checks run,
+    this one already holds the lock (or has already released it).
+
+    Caller must release the lock itself (`lock.release()`, in a `finally`
+    block) — this deliberately isn't `async with`, since callers need to keep
+    holding the lock across their own first `await` (typically
+    `interaction.response.defer()`) instead of acquiring it only afterward.
+    """
+    if lock.locked():
+        await interaction.response.send_message(busy_message, ephemeral=True)
+        return False
+    await lock.acquire()
+    return True
+
+
 # ------------------------------------------------------------------
 # Deck editor UI components
 # ------------------------------------------------------------------
@@ -969,15 +1006,16 @@ class DirectorCog(commands.Cog):
             return False
         return True
 
-    async def _lock_check(self, interaction: discord.Interaction) -> bool:
-        """Reject if another operation is already in progress."""
-        if self._session_lock.locked():
-            await interaction.response.send_message(
-                f"Another operation is already running. {self.bot.session.status_message()}",
-                ephemeral=True,
-            )
-            return False
-        return True
+    async def _acquire_lock_or_reject(self, interaction: discord.Interaction) -> bool:
+        """Claim `self._session_lock` for /launch, /custom, /menu, and /start,
+        or reject if another such operation is already running. See the
+        module-level `_acquire_lock_or_reject()` for the check-then-later-
+        acquire race this closes and why release is the caller's job.
+        """
+        return await _acquire_lock_or_reject(
+            self._session_lock, interaction,
+            f"Another operation is already running. {self.bot.session.status_message()}",
+        )
 
     # ------------------------------------------------------------------
     # /launch
@@ -989,12 +1027,12 @@ class DirectorCog(commands.Cog):
             return
         if not await self._state_check(interaction, "launch"):
             return
-        if not await self._lock_check(interaction):
+        if not await self._acquire_lock_or_reject(interaction):
             return
 
-        await interaction.response.defer(thinking=True)
+        try:
+            await interaction.response.defer(thinking=True)
 
-        async with self._session_lock:
             self._stop_event.clear()
             self.bot.session.transition(
                 BotState.LAUNCHING,
@@ -1016,6 +1054,8 @@ class DirectorCog(commands.Cog):
                     "Check `darwin_bot.log` for details.",
                 ))
                 return
+        finally:
+            self._session_lock.release()
 
         if success:
             self.bot.session.transition(
@@ -1162,65 +1202,65 @@ class DirectorCog(commands.Cog):
             return
         if not await self._state_check(interaction, "custom"):
             return
-        if not await self._lock_check(interaction):
+        if not await self._acquire_lock_or_reject(interaction):
             return
 
-        from game.profiles import resolve_profile
-        from game.deck_utils import deck_layout_from_state, validate_profile_deck
-        _active_key = self.bot.config.get("active_profile", "standard")
-        self._resolved_profile = resolve_profile(_active_key)
-        if _active_key == "randomizer":
-            logger.info("Profile selected by randomizer: %s", self._resolved_profile["display_name"])
-        else:
-            logger.info("Profile: %s", self._resolved_profile["display_name"])
-
-        _deck_layout = deck_layout_from_state()
-        if _deck_layout:
-            _warnings = validate_profile_deck(self._resolved_profile, _deck_layout)
-            if _warnings:
-                _name = self._resolved_profile["display_name"]
-                self._resolved_profile = None
-                await interaction.response.send_message(embed=self._fail(
-                    "Deck / Profile Mismatch",
-                    f"The **{_name}** profile requires cards not in the deck:\n"
-                    + "\n".join(f"• {w}" for w in _warnings),
-                ))
-                return
-
-        # Capture the scrim signup roster (≤10 Discord IDs of players who reacted
-        # on the signup message) so it can be passed through to the ingest API at
-        # match end for OCR/fuzzy-match narrowing. Best-effort — a missing/failed
-        # ScrimCog just means roster stays None and ingest behaves as before.
-        self._resolved_roster = None
         try:
-            scrim_cog = self.bot.get_cog("ScrimCog")
-            if scrim_cog is not None:
-                signup_message = await scrim_cog._get_signup_message()
-                if signup_message is not None:
-                    reactors = await scrim_cog._reactors(signup_message)
-                    if reactors:
-                        # Ids plus what Discord calls each member (server nick,
-                        # display name, username): the ladder links an unlinked
-                        # id whose name matches one of the lobby's players.
-                        self._resolved_roster = [
-                            {
-                                "id": str(u.id),
-                                "names": [
-                                    n for n in (
-                                        getattr(u, "nick", None),
-                                        getattr(u, "global_name", None),
-                                        getattr(u, "name", None),
-                                    ) if n
-                                ],
-                            }
-                            for u in reactors[:10]
-                        ]
-        except Exception as e:
-            logger.warning("Could not capture scrim roster for ingest: %s", e)
+            from game.profiles import resolve_profile
+            from game.deck_utils import deck_layout_from_state, validate_profile_deck
+            _active_key = self.bot.config.get("active_profile", "standard")
+            self._resolved_profile = resolve_profile(_active_key)
+            if _active_key == "randomizer":
+                logger.info("Profile selected by randomizer: %s", self._resolved_profile["display_name"])
+            else:
+                logger.info("Profile: %s", self._resolved_profile["display_name"])
 
-        await interaction.response.defer(thinking=True)
+            _deck_layout = deck_layout_from_state()
+            if _deck_layout:
+                _warnings = validate_profile_deck(self._resolved_profile, _deck_layout)
+                if _warnings:
+                    _name = self._resolved_profile["display_name"]
+                    self._resolved_profile = None
+                    await interaction.response.send_message(embed=self._fail(
+                        "Deck / Profile Mismatch",
+                        f"The **{_name}** profile requires cards not in the deck:\n"
+                        + "\n".join(f"• {w}" for w in _warnings),
+                    ))
+                    return
 
-        async with self._session_lock:
+            # Capture the scrim signup roster (≤10 Discord IDs of players who reacted
+            # on the signup message) so it can be passed through to the ingest API at
+            # match end for OCR/fuzzy-match narrowing. Best-effort — a missing/failed
+            # ScrimCog just means roster stays None and ingest behaves as before.
+            self._resolved_roster = None
+            try:
+                scrim_cog = self.bot.get_cog("ScrimCog")
+                if scrim_cog is not None:
+                    signup_message = await scrim_cog._get_signup_message()
+                    if signup_message is not None:
+                        reactors = await scrim_cog._reactors(signup_message)
+                        if reactors:
+                            # Ids plus what Discord calls each member (server nick,
+                            # display name, username): the ladder links an unlinked
+                            # id whose name matches one of the lobby's players.
+                            self._resolved_roster = [
+                                {
+                                    "id": str(u.id),
+                                    "names": [
+                                        n for n in (
+                                            getattr(u, "nick", None),
+                                            getattr(u, "global_name", None),
+                                            getattr(u, "name", None),
+                                        ) if n
+                                    ],
+                                }
+                                for u in reactors[:10]
+                            ]
+            except Exception as e:
+                logger.warning("Could not capture scrim roster for ingest: %s", e)
+
+            await interaction.response.defer(thinking=True)
+
             self._stop_event.clear()
             loop = asyncio.get_running_loop()
             try:
@@ -1238,6 +1278,8 @@ class DirectorCog(commands.Cog):
                     "Check `darwin_bot.log` for details.",
                 ))
                 return
+        finally:
+            self._session_lock.release()
 
         if lobby_code:
             self.bot.session.transition(
@@ -1651,12 +1693,12 @@ class DirectorCog(commands.Cog):
             return
         if not await self._state_check(interaction, "menu"):
             return
-        if not await self._lock_check(interaction):
+        if not await self._acquire_lock_or_reject(interaction):
             return
 
-        await interaction.response.defer(thinking=True)
+        try:
+            await interaction.response.defer(thinking=True)
 
-        async with self._session_lock:
             self._stop_event.clear()
             loop = asyncio.get_running_loop()
             try:
@@ -1673,6 +1715,8 @@ class DirectorCog(commands.Cog):
                     "Check `darwin_bot.log` for details.",
                 ))
                 return
+        finally:
+            self._session_lock.release()
 
         if success:
             # /custom locks POV for the lobby (see its success branch); this is
@@ -1876,118 +1920,136 @@ class DirectorCog(commands.Cog):
             return
         if not await self._state_check(interaction, "start"):
             return
-        if not await self._lock_check(interaction):
+        if not await self._acquire_lock_or_reject(interaction):
             return
 
-        # Manual start — cancel any pending auto-start watcher
-        if self._auto_start_task and not self._auto_start_task.done():
-            self._auto_start_task.cancel()
-            self._auto_start_task = None
+        try:
+            # Manual start — cancel any pending auto-start watcher
+            if self._auto_start_task and not self._auto_start_task.done():
+                self._auto_start_task.cancel()
+                self._auto_start_task = None
 
-        from game.profiles import resolve_profile, profile_summary
-        _profile = self._resolved_profile or resolve_profile(self.bot.config.get("active_profile", "standard"))
+            from game.profiles import resolve_profile, profile_summary
+            _profile = self._resolved_profile or resolve_profile(self.bot.config.get("active_profile", "standard"))
 
-        _first = min(_profile["card_plays"], key=lambda p: p["play_time_seconds"])
-        _m, _s = divmod(_first["play_time_seconds"], 60)
-        _first_label = f"{_first['card'].replace('_', ' ').title()} at {_m}:{_s:02d}"
-        self.bot.session.transition(
-            BotState.MATCH_IN_PROGRESS,
-            last_action="Match started",
-            next_action=_first_label,
-        )
-        self.bot.session.start_match_timer()
-
-        def on_action_update(last: str, next_: str):
-            self.bot.session.transition(self.bot.session.state, last_action=last, next_action=next_)
-
-        runner = MatchRunner(
-            config=self.bot.config,
-            session=self.bot.session,
-            on_action_update=on_action_update,
-            profile=self._resolved_profile,
-            draft_lifecycle=self._ds,
-        )
-        self._resolved_profile = None
-        _match_roster = self._resolved_roster
-        self._resolved_roster = None
-        self._set_active_runner(runner)
-        asyncio.ensure_future(self._maybe_open_prediction(runner))
-
-        # Respond immediately — match runs in the background so the interaction
-        # token never expires waiting for results.
-        start_embed = self._info(
-            "Match In Progress",
-            f"Match started. First card: **{_first_label}**\n"
-            "Results will be posted here when the match ends.",
-        )
-        await interaction.response.send_message(embed=start_embed)
-
-        channel = interaction.channel
-
-        async def _run_match():
-            async with self._session_lock:
-                loop = asyncio.get_running_loop()
-                try:
-                    result = await asyncio.wait_for(
-                        loop.run_in_executor(None, runner.run),
-                        timeout=_MATCH_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    if self._active_runner is not None:
-                        self._active_runner.stop()
-                    self._set_active_runner(None)
-                    self._reset_session("aborted: match safety timeout")
-                    await channel.send(embed=self._fail(
-                        "Match Safety Timeout",
-                        f"Match exceeded the {int(_MATCH_TIMEOUT // 60)}-minute safety limit. "
-                        "Bot reset to IDLE.\nCheck `darwin_bot.log` for details.",
-                    ))
-                    return
-
-            results_text, recording_path = result if isinstance(result, tuple) else (result, None)
-
-            self._set_active_runner(None)
+            _first = min(_profile["card_plays"], key=lambda p: p["play_time_seconds"])
+            _m, _s = divmod(_first["play_time_seconds"], 60)
+            _first_label = f"{_first['card'].replace('_', ' ').title()} at {_m}:{_s:02d}"
             self.bot.session.transition(
-                BotState.MATCH_ENDED,
-                last_action="Match ended",
-                next_action="Returning to menu",
+                BotState.MATCH_IN_PROGRESS,
+                last_action="Match started",
+                next_action=_first_label,
             )
+            self.bot.session.start_match_timer()
 
-            # Fire the Twitch ad break as early as possible — see _twitch_start_ad_break()
-            # — so it has the whole post-match/spin-up window to play out.
-            await self._twitch_start_ad_break()
-            await self._clear_game_number_banner()
+            def on_action_update(last: str, next_: str):
+                self.bot.session.transition(self.bot.session.state, last_action=last, next_action=next_)
 
-            # Click MAIN MENU right away — the game doesn't need to sit on the results
-            # screen waiting for the Discord/API work below (mirror, ingest, screenshot
-            # delete) to finish before moving on. The screenshot is already captured
-            # (that happened inside MatchRunner before this point), so nothing here
-            # depends on the results screen still being up.
-            loop = asyncio.get_running_loop()
-            returned = await loop.run_in_executor(None, self._do_post_match_return)
-            if returned:
-                self.bot.session.transition(
-                    BotState.IN_MENU,
-                    last_action="Returned to main menu",
-                    next_action="Await /custom",
-                )
-            else:
-                self._reset_session()
+            runner = MatchRunner(
+                config=self.bot.config,
+                session=self.bot.session,
+                on_action_update=on_action_update,
+                profile=self._resolved_profile,
+                draft_lifecycle=self._ds,
+            )
+            self._resolved_profile = None
+            _match_roster = self._resolved_roster
+            self._resolved_roster = None
+            self._set_active_runner(runner)
+            asyncio.ensure_future(self._maybe_open_prediction(runner))
 
-            if not results_text.endswith(".png"):
-                await channel.send(embed=self._info("Match Complete", results_text))
-            await self._mirror_results(results_text)
-            _ingest_body = await self._post_results_to_ingest(results_text, roster=_match_roster)
-            await self._resolve_prediction(_ingest_body.get("placements") if _ingest_body else None)
-            if results_text.endswith(".png"):
+            # Respond immediately — match runs in the background so the interaction
+            # token never expires waiting for results.
+            start_embed = self._info(
+                "Match In Progress",
+                f"Match started. First card: **{_first_label}**\n"
+                "Results will be posted here when the match ends.",
+            )
+            await interaction.response.send_message(embed=start_embed)
+
+            channel = interaction.channel
+
+            async def _run_match():
+                # The session lock was already claimed by start() above, before
+                # this task was even scheduled (2026-09-15) — not re-acquired
+                # here with `async with`, since the claim has to happen
+                # synchronously in start() itself, immediately after
+                # _acquire_lock_or_reject(), with no `await` in between (see
+                # that method's docstring for why). Released here once the
+                # match — and all of its post-match follow-up below — actually
+                # finishes, since this is the task that's really holding it now.
                 try:
-                    os.remove(results_text)
-                except Exception as e:
-                    logger.warning("Could not delete results screenshot: %s", e)
-            if recording_path:
-                asyncio.ensure_future(self._upload_recording(recording_path))
+                    loop = asyncio.get_running_loop()
+                    try:
+                        result = await asyncio.wait_for(
+                            loop.run_in_executor(None, runner.run),
+                            timeout=_MATCH_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        if self._active_runner is not None:
+                            self._active_runner.stop()
+                        self._set_active_runner(None)
+                        self._reset_session("aborted: match safety timeout")
+                        await channel.send(embed=self._fail(
+                            "Match Safety Timeout",
+                            f"Match exceeded the {int(_MATCH_TIMEOUT // 60)}-minute safety limit. "
+                            "Bot reset to IDLE.\nCheck `darwin_bot.log` for details.",
+                        ))
+                        return
 
-        asyncio.ensure_future(_run_match())
+                    results_text, recording_path = result if isinstance(result, tuple) else (result, None)
+
+                    self._set_active_runner(None)
+                    self.bot.session.transition(
+                        BotState.MATCH_ENDED,
+                        last_action="Match ended",
+                        next_action="Returning to menu",
+                    )
+
+                    # Fire the Twitch ad break as early as possible — see _twitch_start_ad_break()
+                    # — so it has the whole post-match/spin-up window to play out.
+                    await self._twitch_start_ad_break()
+                    await self._clear_game_number_banner()
+
+                    # Click MAIN MENU right away — the game doesn't need to sit on the results
+                    # screen waiting for the Discord/API work below (mirror, ingest, screenshot
+                    # delete) to finish before moving on. The screenshot is already captured
+                    # (that happened inside MatchRunner before this point), so nothing here
+                    # depends on the results screen still being up.
+                    loop = asyncio.get_running_loop()
+                    returned = await loop.run_in_executor(None, self._do_post_match_return)
+                    if returned:
+                        self.bot.session.transition(
+                            BotState.IN_MENU,
+                            last_action="Returned to main menu",
+                            next_action="Await /custom",
+                        )
+                    else:
+                        self._reset_session()
+
+                    if not results_text.endswith(".png"):
+                        await channel.send(embed=self._info("Match Complete", results_text))
+                    await self._mirror_results(results_text)
+                    _ingest_body = await self._post_results_to_ingest(results_text, roster=_match_roster)
+                    await self._resolve_prediction(_ingest_body.get("placements") if _ingest_body else None)
+                    if results_text.endswith(".png"):
+                        try:
+                            os.remove(results_text)
+                        except Exception as e:
+                            logger.warning("Could not delete results screenshot: %s", e)
+                    if recording_path:
+                        asyncio.ensure_future(self._upload_recording(recording_path))
+                finally:
+                    self._session_lock.release()
+
+            asyncio.ensure_future(_run_match())
+        except Exception:
+            # _run_match() never got scheduled to inherit the lock — release it
+            # here instead, or an unexpected failure during setup (before the
+            # handoff above) would leave every future /launch, /custom, /menu,
+            # and /start permanently rejected as "another operation is running".
+            self._session_lock.release()
+            raise
 
     # ------------------------------------------------------------------
     # Auto-start watcher
@@ -2041,51 +2103,60 @@ class DirectorCog(commands.Cog):
             await asyncio.sleep(max(0, countdown))
             self._lobby_expiry = None
 
-            # Re-check — /start may have been called while we were sleeping
+            # Re-check — /start may have been called while we were sleeping.
+            # State check first (cheap, no side effect either way), then claim
+            # the lock atomically — checked and acquired back-to-back with no
+            # `await` in between, same reasoning as _acquire_lock_or_reject()'s
+            # docstring: a manual /start racing this exact moment must not be
+            # able to slip in during the gap between "lock looked free" and
+            # "lock actually held", which the old code left open across the
+            # channel.send() below (a real await) before ever reaching
+            # `async with self._session_lock`.
             if self.bot.session.state != BotState.IN_CUSTOM:
                 logger.info("Auto-start watcher: state is %s — aborting", self.bot.session.state.name)
                 return
             if self._session_lock.locked():
                 logger.info("Auto-start watcher: session lock held — aborting")
                 return
+            await self._session_lock.acquire()
 
-            logger.info("Auto-start watcher: firing match runner")
-            await channel.send(embed=self._info(
-                "Match Auto-Started",
-                "Lobby timer expired — card timers are now running.",
-            ))
+            try:
+                logger.info("Auto-start watcher: firing match runner")
+                await channel.send(embed=self._info(
+                    "Match Auto-Started",
+                    "Lobby timer expired — card timers are now running.",
+                ))
 
-            from game.profiles import resolve_profile
-            _profile = resolve_profile(self.bot.config.get("active_profile", "standard"))
-            _first = min(_profile["card_plays"], key=lambda p: p["play_time_seconds"])
-            _m, _s = divmod(_first["play_time_seconds"], 60)
-            _first_label = f"{_first['card'].replace('_', ' ').title()} at {_m}:{_s:02d}"
+                from game.profiles import resolve_profile
+                _profile = resolve_profile(self.bot.config.get("active_profile", "standard"))
+                _first = min(_profile["card_plays"], key=lambda p: p["play_time_seconds"])
+                _m, _s = divmod(_first["play_time_seconds"], 60)
+                _first_label = f"{_first['card'].replace('_', ' ').title()} at {_m}:{_s:02d}"
 
-            self.bot.session.transition(
-                BotState.MATCH_IN_PROGRESS,
-                last_action="Match auto-started (lobby timer)",
-                next_action=_first_label,
-            )
-            self.bot.session.start_match_timer()
+                self.bot.session.transition(
+                    BotState.MATCH_IN_PROGRESS,
+                    last_action="Match auto-started (lobby timer)",
+                    next_action=_first_label,
+                )
+                self.bot.session.start_match_timer()
 
-            def on_action_update(last: str, next_: str):
-                self.bot.session.transition(self.bot.session.state, last_action=last, next_action=next_)
+                def on_action_update(last: str, next_: str):
+                    self.bot.session.transition(self.bot.session.state, last_action=last, next_action=next_)
 
-            runner = MatchRunner(
-                config=self.bot.config,
-                session=self.bot.session,
-                on_action_update=on_action_update,
-                skip_start=True,
-                profile=self._resolved_profile,
-                draft_lifecycle=self._ds,
-            )
-            self._resolved_profile = None
-            _match_roster = self._resolved_roster
-            self._resolved_roster = None
-            self._set_active_runner(runner)
-            asyncio.ensure_future(self._maybe_open_prediction(runner))
+                runner = MatchRunner(
+                    config=self.bot.config,
+                    session=self.bot.session,
+                    on_action_update=on_action_update,
+                    skip_start=True,
+                    profile=self._resolved_profile,
+                    draft_lifecycle=self._ds,
+                )
+                self._resolved_profile = None
+                _match_roster = self._resolved_roster
+                self._resolved_roster = None
+                self._set_active_runner(runner)
+                asyncio.ensure_future(self._maybe_open_prediction(runner))
 
-            async with self._session_lock:
                 loop = asyncio.get_running_loop()
                 try:
                     result = await asyncio.wait_for(
@@ -2104,48 +2175,50 @@ class DirectorCog(commands.Cog):
                     ))
                     return
 
-            results_text, recording_path = result if isinstance(result, tuple) else (result, None)
+                results_text, recording_path = result if isinstance(result, tuple) else (result, None)
 
-            self._set_active_runner(None)
-            self.bot.session.transition(
-                BotState.MATCH_ENDED,
-                last_action="Match ended",
-                next_action="Returning to menu",
-            )
-
-            # Fire the Twitch ad break as early as possible — see _twitch_start_ad_break()
-            # — so it has the whole post-match/spin-up window to play out.
-            await self._twitch_start_ad_break()
-            await self._clear_game_number_banner()
-
-            # Click MAIN MENU right away — the game doesn't need to sit on the results
-            # screen waiting for the Discord/API work below (mirror, ingest, screenshot
-            # delete) to finish before moving on. The screenshot is already captured
-            # (that happened inside MatchRunner before this point), so nothing here
-            # depends on the results screen still being up.
-            loop = asyncio.get_running_loop()
-            returned = await loop.run_in_executor(None, self._do_post_match_return)
-            if returned:
+                self._set_active_runner(None)
                 self.bot.session.transition(
-                    BotState.IN_MENU,
-                    last_action="Returned to main menu",
-                    next_action="Await /custom",
+                    BotState.MATCH_ENDED,
+                    last_action="Match ended",
+                    next_action="Returning to menu",
                 )
-            else:
-                self._reset_session()
 
-            if not results_text.endswith(".png"):
-                await channel.send(embed=self._info("Match Complete", results_text))
-            await self._mirror_results(results_text)
-            _ingest_body = await self._post_results_to_ingest(results_text, roster=_match_roster)
-            await self._resolve_prediction(_ingest_body.get("placements") if _ingest_body else None)
-            if results_text.endswith(".png"):
-                try:
-                    os.remove(results_text)
-                except Exception as e:
-                    logger.warning("Could not delete results screenshot: %s", e)
-            if recording_path:
-                asyncio.ensure_future(self._upload_recording(recording_path))
+                # Fire the Twitch ad break as early as possible — see _twitch_start_ad_break()
+                # — so it has the whole post-match/spin-up window to play out.
+                await self._twitch_start_ad_break()
+                await self._clear_game_number_banner()
+
+                # Click MAIN MENU right away — the game doesn't need to sit on the results
+                # screen waiting for the Discord/API work below (mirror, ingest, screenshot
+                # delete) to finish before moving on. The screenshot is already captured
+                # (that happened inside MatchRunner before this point), so nothing here
+                # depends on the results screen still being up.
+                loop = asyncio.get_running_loop()
+                returned = await loop.run_in_executor(None, self._do_post_match_return)
+                if returned:
+                    self.bot.session.transition(
+                        BotState.IN_MENU,
+                        last_action="Returned to main menu",
+                        next_action="Await /custom",
+                    )
+                else:
+                    self._reset_session()
+
+                if not results_text.endswith(".png"):
+                    await channel.send(embed=self._info("Match Complete", results_text))
+                await self._mirror_results(results_text)
+                _ingest_body = await self._post_results_to_ingest(results_text, roster=_match_roster)
+                await self._resolve_prediction(_ingest_body.get("placements") if _ingest_body else None)
+                if results_text.endswith(".png"):
+                    try:
+                        os.remove(results_text)
+                    except Exception as e:
+                        logger.warning("Could not delete results screenshot: %s", e)
+                if recording_path:
+                    asyncio.ensure_future(self._upload_recording(recording_path))
+            finally:
+                self._session_lock.release()
 
         except asyncio.CancelledError:
             self._lobby_expiry = None
@@ -2502,6 +2575,12 @@ class ScrimCog(commands.Cog):
         # Serializes _ensure_region_message()'s check-then-create sequence (2026-09-10
         # fix, found live) — see that method's docstring for the race it closes.
         self._region_message_lock = asyncio.Lock()
+        # Serializes /role add and /role remove against each other (2026-09-15) —
+        # both mutate the same roles/reactions/signup message, so two admins
+        # running either command close together could otherwise race the same
+        # way /launch, /custom, /menu, and /start could — see
+        # _acquire_lock_or_reject() (module-level) for the mechanism.
+        self._role_lock = asyncio.Lock()
         # monotonic timestamp of the last "queue is full" ping to scrim_admin_role —
         # see on_raw_reaction_add()'s cooldown check, gated by _QUEUE_FULL_PING_COOLDOWN_SECONDS.
         self._last_queue_full_ping_at: float = 0.0
@@ -2915,6 +2994,17 @@ class ScrimCog(commands.Cog):
         role_name = self._cfg("scrim_admin_role", "")
         return any(r.name == role_name for r in interaction.user.roles)
 
+    async def _acquire_role_lock_or_reject(self, interaction: discord.Interaction) -> bool:
+        """Claim `self._role_lock` for /role add and /role remove, or reject
+        if the other one is already running. See the module-level
+        `_acquire_lock_or_reject()` for the check-then-later-acquire race
+        this closes and why release is the caller's job.
+        """
+        return await _acquire_lock_or_reject(
+            self._role_lock, interaction,
+            "Another `/role` operation is already running — try again in a moment.",
+        )
+
     def _match_in_progress(self, guild: discord.Guild | None) -> bool:
         """True if anyone currently holds scrim_player_role or scrim_player_role_2 (i.e. a scrim is underway)."""
         if guild is None:
@@ -3156,123 +3246,128 @@ class ScrimCog(commands.Cog):
                 "You don't have permission to use this command.", ephemeral=True
             )
             return
-
-        await interaction.response.defer()
-        region_value = region.value if region else "MIX"
-
-        player_role_name = self._cfg("scrim_player_role", "")
-        if not player_role_name:
-            await interaction.followup.send("No `scrim_player_role` set in config.json.")
+        if not await self._acquire_role_lock_or_reject(interaction):
             return
 
-        guild = interaction.guild
-        player_role = discord.utils.get(guild.roles, name=player_role_name)
-        if player_role is None:
-            await interaction.followup.send(f"Role **{player_role_name}** not found in this server.")
-            return
+        try:
+            await interaction.response.defer()
+            region_value = region.value if region else "MIX"
 
-        # Second lobby role is optional — if unset, overflow past the first 10 is
-        # simply left unassigned (same behavior as before this role existed).
-        player_role_2_name = self._cfg("scrim_player_role_2", "")
-        player_role_2 = discord.utils.get(guild.roles, name=player_role_2_name) if player_role_2_name else None
-        if player_role_2_name and player_role_2 is None:
-            await interaction.followup.send(f"Role **{player_role_2_name}** not found in this server.")
-            return
-
-        message = await self._get_signup_message()
-        if message is None:
-            await interaction.followup.send("Signup message not found. Check `scrim_signup_channel_id` in config.json.")
-            return
-
-        reactors = await self._ordered_reactors(message)
-        if not reactors:
-            await interaction.followup.send("Nobody has signed up yet.")
-            return
-
-        # Region filter (2026-09-07): MIX takes the first 10 reactors in actual signup
-        # order exactly as before. NA/EU instead take the first 10 reactors THAT HOLD
-        # that region role, still in signup order — a region-mismatched player never
-        # jumps the queue, they're just skipped for lobby-1 purposes. Only lobby 1 is
-        # filtered; lobby 2 (and any overflow beyond it) still draws from whoever is
-        # left, in original signup order, regardless of region — the same as MIX.
-        region_role_name = None
-        if region_value != "MIX":
-            region_role_name = self._cfg(f"region_role_{region_value.lower()}", region_value)
-            region_role = discord.utils.get(guild.roles, name=region_role_name) if region_role_name else None
-            if region_role is None:
-                await interaction.followup.send(
-                    f"Role **{region_role_name}** not found in this server — cannot filter by {region_value}."
-                )
+            player_role_name = self._cfg("scrim_player_role", "")
+            if not player_role_name:
+                await interaction.followup.send("No `scrim_player_role` set in config.json.")
                 return
-            first_pool = [u for u in reactors if region_role in u.roles]
-            if not first_pool:
-                await interaction.followup.send(f"No signed-up players hold the **{region_role_name}** role.")
+
+            guild = interaction.guild
+            player_role = discord.utils.get(guild.roles, name=player_role_name)
+            if player_role is None:
+                await interaction.followup.send(f"Role **{player_role_name}** not found in this server.")
                 return
-        else:
-            first_pool = reactors
 
-        # First 10 reactors in actual signup order (tracked live in _signup_order —
-        # see _ordered_reactors()) get the primary lobby role; the next 10 (11-20 of
-        # whoever's left, not just the raw list) get the second lobby role.
-        first_lobby = first_pool[:10]
-        first_lobby_ids = {u.id for u in first_lobby}
-        remaining = [u for u in reactors if u.id not in first_lobby_ids]
-        second_lobby = remaining[:10] if player_role_2 else []
-        overflow_count = len(remaining) - len(second_lobby)
+            # Second lobby role is optional — if unset, overflow past the first 10 is
+            # simply left unassigned (same behavior as before this role existed).
+            player_role_2_name = self._cfg("scrim_player_role_2", "")
+            player_role_2 = discord.utils.get(guild.roles, name=player_role_2_name) if player_role_2_name else None
+            if player_role_2_name and player_role_2 is None:
+                await interaction.followup.send(f"Role **{player_role_2_name}** not found in this server.")
+                return
 
-        async def _assign(users: list, role: discord.Role) -> tuple[list[discord.Member], list[str]]:
-            assigned, skipped = [], []
-            for user in users:
-                member = guild.get_member(user.id)
-                if member is None:
-                    try:
-                        member = await guild.fetch_member(user.id)
-                    except Exception:
-                        skipped.append(str(user))
-                        continue
-                if role not in member.roles:
-                    try:
-                        await member.add_roles(role, reason="Scrim signup")
-                        assigned.append(member)
-                    except Exception as e:
-                        logger.warning("Could not assign scrim role to %s: %s", member, e)
-                        skipped.append(member.display_name)
-                else:
-                    assigned.append(member)  # already has it, count as success
-            return assigned, skipped
+            message = await self._get_signup_message()
+            if message is None:
+                await interaction.followup.send("Signup message not found. Check `scrim_signup_channel_id` in config.json.")
+                return
 
-        lines = []
-        if region_value != "MIX":
-            lines.append(
-                f"Region filter: **{region_value}** — {len(first_pool)} of {len(reactors)} "
-                f"signup(s) hold the **{region_role_name}** role."
-            )
+            reactors = await self._ordered_reactors(message)
+            if not reactors:
+                await interaction.followup.send("Nobody has signed up yet.")
+                return
 
-        assigned, skipped = await _assign(first_lobby, player_role)
-        lines.append(f"Assigned **{player_role_name}** to {len(assigned)} player(s).")
-        if assigned:
-            lines.append(", ".join(m.display_name for m in assigned))
-        if skipped:
-            lines.append(f"Could not assign to: {', '.join(skipped)}")
-
-        if second_lobby:
-            assigned_2, skipped_2 = await _assign(second_lobby, player_role_2)
-            lines.append(f"Assigned **{player_role_2_name}** to {len(assigned_2)} player(s).")
-            if assigned_2:
-                lines.append(", ".join(m.display_name for m in assigned_2))
-            if skipped_2:
-                lines.append(f"Could not assign to: {', '.join(skipped_2)}")
-
-        if overflow_count > 0:
-            if player_role_2 is None:
-                lines.append(
-                    f"{overflow_count} additional signup(s) beyond the first 10 were not assigned — "
-                    f"set `scrim_player_role_2` in config.json to enable a second lobby."
-                )
+            # Region filter (2026-09-07): MIX takes the first 10 reactors in actual signup
+            # order exactly as before. NA/EU instead take the first 10 reactors THAT HOLD
+            # that region role, still in signup order — a region-mismatched player never
+            # jumps the queue, they're just skipped for lobby-1 purposes. Only lobby 1 is
+            # filtered; lobby 2 (and any overflow beyond it) still draws from whoever is
+            # left, in original signup order, regardless of region — the same as MIX.
+            region_role_name = None
+            if region_value != "MIX":
+                region_role_name = self._cfg(f"region_role_{region_value.lower()}", region_value)
+                region_role = discord.utils.get(guild.roles, name=region_role_name) if region_role_name else None
+                if region_role is None:
+                    await interaction.followup.send(
+                        f"Role **{region_role_name}** not found in this server — cannot filter by {region_value}."
+                    )
+                    return
+                first_pool = [u for u in reactors if region_role in u.roles]
+                if not first_pool:
+                    await interaction.followup.send(f"No signed-up players hold the **{region_role_name}** role.")
+                    return
             else:
-                lines.append(f"{overflow_count} additional signup(s) beyond 20 were not assigned.")
+                first_pool = reactors
 
-        await interaction.followup.send("\n".join(lines))
+            # First 10 reactors in actual signup order (tracked live in _signup_order —
+            # see _ordered_reactors()) get the primary lobby role; the next 10 (11-20 of
+            # whoever's left, not just the raw list) get the second lobby role.
+            first_lobby = first_pool[:10]
+            first_lobby_ids = {u.id for u in first_lobby}
+            remaining = [u for u in reactors if u.id not in first_lobby_ids]
+            second_lobby = remaining[:10] if player_role_2 else []
+            overflow_count = len(remaining) - len(second_lobby)
+
+            async def _assign(users: list, role: discord.Role) -> tuple[list[discord.Member], list[str]]:
+                assigned, skipped = [], []
+                for user in users:
+                    member = guild.get_member(user.id)
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(user.id)
+                        except Exception:
+                            skipped.append(str(user))
+                            continue
+                    if role not in member.roles:
+                        try:
+                            await member.add_roles(role, reason="Scrim signup")
+                            assigned.append(member)
+                        except Exception as e:
+                            logger.warning("Could not assign scrim role to %s: %s", member, e)
+                            skipped.append(member.display_name)
+                    else:
+                        assigned.append(member)  # already has it, count as success
+                return assigned, skipped
+
+            lines = []
+            if region_value != "MIX":
+                lines.append(
+                    f"Region filter: **{region_value}** — {len(first_pool)} of {len(reactors)} "
+                    f"signup(s) hold the **{region_role_name}** role."
+                )
+
+            assigned, skipped = await _assign(first_lobby, player_role)
+            lines.append(f"Assigned **{player_role_name}** to {len(assigned)} player(s).")
+            if assigned:
+                lines.append(", ".join(m.display_name for m in assigned))
+            if skipped:
+                lines.append(f"Could not assign to: {', '.join(skipped)}")
+
+            if second_lobby:
+                assigned_2, skipped_2 = await _assign(second_lobby, player_role_2)
+                lines.append(f"Assigned **{player_role_2_name}** to {len(assigned_2)} player(s).")
+                if assigned_2:
+                    lines.append(", ".join(m.display_name for m in assigned_2))
+                if skipped_2:
+                    lines.append(f"Could not assign to: {', '.join(skipped_2)}")
+
+            if overflow_count > 0:
+                if player_role_2 is None:
+                    lines.append(
+                        f"{overflow_count} additional signup(s) beyond the first 10 were not assigned — "
+                        f"set `scrim_player_role_2` in config.json to enable a second lobby."
+                    )
+                else:
+                    lines.append(f"{overflow_count} additional signup(s) beyond 20 were not assigned.")
+
+            await interaction.followup.send("\n".join(lines))
+        finally:
+            self._role_lock.release()
 
     @role_group.command(name="remove", description="Remove one or both lobbies' scrim player role(s) and their reactions")
     @app_commands.describe(lobby="Which lobby to clear — 1 (scrim_player_role), 2 (scrim_player_role_2), or Both")
@@ -3297,69 +3392,74 @@ class ScrimCog(commands.Cog):
                 "You don't have permission to use this command.", ephemeral=True
             )
             return
-
-        await interaction.response.defer()
-        guild = interaction.guild
-
-        if lobby.value == 3:
-            role_keys = ["scrim_player_role", "scrim_player_role_2"]
-        else:
-            role_keys = ["scrim_player_role" if lobby.value == 1 else "scrim_player_role_2"]
-
-        lines = []
-        any_removed = False
-        for role_key in role_keys:
-            role_name = self._cfg(role_key, "")
-            if not role_name:
-                lines.append(f"No `{role_key}` set in config.json.")
-                continue
-            role = discord.utils.get(guild.roles, name=role_name)
-            if role is None:
-                lines.append(f"Role **{role_name}** not found in this server.")
-                continue
-            # Snapshot before mutating — role.members would shrink as we remove the role below.
-            members = list(role.members)
-            if not members:
-                lines.append(f"Nobody currently has the **{role_name}** role.")
-                continue
-            removed, failed = [], []
-            for member in members:
-                try:
-                    await member.remove_roles(role, reason="Scrim cleanup")
-                    removed.append(member.display_name)
-                except Exception as e:
-                    logger.warning("Could not remove scrim role from %s: %s", member, e)
-                    failed.append(member.display_name)
-            any_removed = True
-            lines.append(f"Removed **{role_name}** from {len(removed)} member(s).")
-            if failed:
-                lines.append(f"Could not remove from: {', '.join(failed)}")
-
-        if not any_removed:
-            # Nothing actually changed — same as the old single-lobby early
-            # return, don't reset the queue for no reason.
-            await interaction.followup.send("\n".join(lines))
+        if not await self._acquire_role_lock_or_reject(interaction):
             return
 
-        # Only relevant when a single lobby was explicitly targeted — clearing
-        # both makes this warning moot, since the untargeted lobby isn't
-        # untargeted anymore.
-        if lobby.value != 3:
-            other_key = "scrim_player_role_2" if lobby.value == 1 else "scrim_player_role"
-            other_role_name = self._cfg(other_key, "")
-            other_role = discord.utils.get(guild.roles, name=other_role_name) if other_role_name else None
-            if other_role and other_role.members:
-                lines.append(
-                    f"⚠️ **{other_role_name}** still has active players — their reactions were cleared too, "
-                    f"so they'll need to react again as well."
-                )
+        try:
+            await interaction.response.defer()
+            guild = interaction.guild
 
-        # Delete and repost the signup message rather than clearing its reaction in
-        # place — see _delete_and_repost_signup_message() for why (avoids both the old
-        # per-user race and bulk-clear's stale client-side "who reacted" display).
-        # Exactly one call regardless of how many role_keys were processed above —
-        # this already resets BOTH lobbies' reactions at once, see the docstring note.
-        await self._delete_and_repost_signup_message()
+            if lobby.value == 3:
+                role_keys = ["scrim_player_role", "scrim_player_role_2"]
+            else:
+                role_keys = ["scrim_player_role" if lobby.value == 1 else "scrim_player_role_2"]
 
-        lines.append("All signup reactions were reset — everyone will need to react again to rejoin the queue.")
-        await interaction.followup.send("\n".join(lines))
+            lines = []
+            any_removed = False
+            for role_key in role_keys:
+                role_name = self._cfg(role_key, "")
+                if not role_name:
+                    lines.append(f"No `{role_key}` set in config.json.")
+                    continue
+                role = discord.utils.get(guild.roles, name=role_name)
+                if role is None:
+                    lines.append(f"Role **{role_name}** not found in this server.")
+                    continue
+                # Snapshot before mutating — role.members would shrink as we remove the role below.
+                members = list(role.members)
+                if not members:
+                    lines.append(f"Nobody currently has the **{role_name}** role.")
+                    continue
+                removed, failed = [], []
+                for member in members:
+                    try:
+                        await member.remove_roles(role, reason="Scrim cleanup")
+                        removed.append(member.display_name)
+                    except Exception as e:
+                        logger.warning("Could not remove scrim role from %s: %s", member, e)
+                        failed.append(member.display_name)
+                any_removed = True
+                lines.append(f"Removed **{role_name}** from {len(removed)} member(s).")
+                if failed:
+                    lines.append(f"Could not remove from: {', '.join(failed)}")
+
+            if not any_removed:
+                # Nothing actually changed — same as the old single-lobby early
+                # return, don't reset the queue for no reason.
+                await interaction.followup.send("\n".join(lines))
+                return
+
+            # Only relevant when a single lobby was explicitly targeted — clearing
+            # both makes this warning moot, since the untargeted lobby isn't
+            # untargeted anymore.
+            if lobby.value != 3:
+                other_key = "scrim_player_role_2" if lobby.value == 1 else "scrim_player_role"
+                other_role_name = self._cfg(other_key, "")
+                other_role = discord.utils.get(guild.roles, name=other_role_name) if other_role_name else None
+                if other_role and other_role.members:
+                    lines.append(
+                        f"⚠️ **{other_role_name}** still has active players — their reactions were cleared too, "
+                        f"so they'll need to react again as well."
+                    )
+
+            # Delete and repost the signup message rather than clearing its reaction in
+            # place — see _delete_and_repost_signup_message() for why (avoids both the old
+            # per-user race and bulk-clear's stale client-side "who reacted" display).
+            # Exactly one call regardless of how many role_keys were processed above —
+            # this already resets BOTH lobbies' reactions at once, see the docstring note.
+            await self._delete_and_repost_signup_message()
+
+            lines.append("All signup reactions were reset — everyone will need to react again to rejoin the queue.")
+            await interaction.followup.send("\n".join(lines))
+        finally:
+            self._role_lock.release()

@@ -29,11 +29,36 @@ _CARD_TRAY_CENTER_X = 966
 _CARD_TRAY_CARD_Y = 943
 _CARD_TRAY_CARD_WIDTH = 76
 
-# Vertical centre of a player card's portrait box, for dropping a player-targeted
-# card directly onto a specific player (2026-09-14) — see _player_portrait_target().
-# Matches the centre of game/player_cards_v2.py's player_cards_portrait_rows ([70,
-# 110]), which is fixed regardless of player count; only the x recentres per-lobby.
+# Vertical centre of a player card's portrait box in its normal, undragged
+# position, for dropping a player-targeted card directly onto a specific player
+# (2026-09-14) — see _player_portrait_target(). Matches the centre of
+# game/player_cards_v2.py's player_cards_portrait_rows ([70, 110]), which is
+# fixed regardless of player count; only the x recentres per-lobby.
 _PLAYER_PORTRAIT_TARGET_Y = 90
+
+# How far the whole player bar shifts DOWN specifically while a player-targeted
+# card is being dragged (2026-09-16, found live: a give_wood reward landed on
+# whoever currently had POV instead of the intended target). The game shows a
+# "CHOOSE <target> TO <effect>" banner above the player bar during this drag
+# (e.g. "CHOOSE INMATE TO GIVE WOOD"), which pushes the whole bar down by the
+# banner's own height — _PLAYER_PORTRAIT_TARGET_Y alone (calibrated against the
+# bar's normal position) lands too high once that banner is up, landing above
+# the intended portrait and hitting whatever's actually there instead (in the
+# observed case, the currently-spectated player's portrait). Best-estimate
+# value — not yet pixel-measured against a live drag frame, since reproducing
+# one on demand isn't easy (see _player_portrait_target()'s docstring). Tune
+# this one constant if drops are still landing off-target.
+_PLAYER_TARGETED_DRAG_Y_OFFSET = 70
+
+# How long to hold the mouse down at a player's portrait before releasing, once the
+# drag arrives there (2026-09-15) — found live: a give_wood reward's drop missed and
+# happened "too fast to tell where it landed." A plain drag releases the instant the
+# move animation ends, with no settle time — see card_actions.play_card()'s
+# hold_at_target_seconds docstring for the full reasoning. 0.15s, a defensive
+# margin, not a measured value — only applied to portrait drops (the
+# _PLAYER_TARGETED_CARDS scheduled-dispatch branch and _give_reward_card()), not
+# zone- or fixed-target drops, since only portraits have shown this symptom so far.
+_PORTRAIT_DROP_HOLD_SECONDS = 0.15
 
 # Fixed drop target per "plain" card type (not zone-targeted, not player-targeted,
 # not zone_close) — every one of these currently drops dead center of the screen.
@@ -53,13 +78,37 @@ _CARD_DROP_TARGETS: dict[str, tuple[int, int]] = {
 _ZONE_CLOSE_DROP_TARGET = (1750, 1000)
 
 # Director-points OCR crop — 2-digit numerator only (not the "/10"). Calibrated at
-# 1920×1080. Moved out of config.json (2026-09-07).
-_DIRECTOR_POINTS_REGION = (808, 1002, 20, 24)
+# 1920×1080. Moved out of config.json (2026-09-07). x shifted 808 -> 811 (2026-09-15):
+# measured directly against 3 real live-captured, correctly-read fixtures
+# (tests/fixtures/director_points/) — every one had 3-6px of unused blank space on
+# the LEFT before the digit ink started, while the ink already touched the RIGHT
+# edge flush (zero margin) in all three. Shifting right by 3 (the smallest observed
+# left margin, so no case loses any digit) trades that wasted left-side space for a
+# few pixels of much-needed margin on the right, where it was actually needed.
+# Doesn't fix the wider, separately-documented clipping incident in that same
+# fixtures README (a numerator on a tan-background frame needed ~33px total width,
+# far beyond what a small shift can recover within a 20px-wide crop) — that one
+# still needs either a real width increase or confirmation of whether it's a rarer,
+# differently-scaled render state before touching the crop further.
+_DIRECTOR_POINTS_REGION = (811, 1002, 20, 24)
 
 # Director-points pip pixel-sampling calibration — dormant while director_points_use_pips
 # (still a real config toggle) is false, kept for if pip reading is ever revisited.
 # Moved out of config.json (2026-09-07).
 _DIRECTOR_POINTS_PIPS = {"x_start": 862, "y": 1012, "spacing": 26, "count": 10}
+
+# A pip fills via a radial wipe, not an instant color swap (see game/ocr.py's
+# read_director_point_pips() docstring) — its fraction can clear
+# _PIP_FILLED_GROUP_FLOOR (0.80) while still visibly climbing toward its
+# settled ~0.90+ range. Two consecutive polls landing in that climbing-but-
+# already-past-the-floor window can satisfy _update_points_reading()'s
+# agreement ratchet before the fill has actually finished — found live
+# (2026-09-20): Electromania at 6:30 fired the instant a 2->3 jump was
+# confirmed by two reads roughly a second apart, and the recording showed the
+# 3rd pip visibly not yet fully filled at the moment the card was played
+# in-game (which the game then rejected, cascading into every card after it
+# failing too — see _wait_for_points()'s settle delay for the fix).
+_POINTS_SETTLE_SECONDS = 1.5
 
 # Damage/kill feed text patterns (2026-09-10) — each entry is (event_kind,
 # compiled regex), checked against one physical feed line at a time (see
@@ -418,7 +467,14 @@ class MatchRunner:
         # and the press skipped) since the match is either underway or about to be
         # torn down either way; _reset_session() covers the teardown case regardless.
         self._session.unlock_pov()
-        poll_interval = self._config.get("screen_poll_interval_seconds", 12)
+        # Default lowered 12 -> 2 (2026-09-17) to match _wait_for_points()'s own
+        # already-proven 2s cadence — see this constant's config.json comment and
+        # _update_points_display()'s docstring for why: at 12s, background polls
+        # were often slower than the real points regen rate, so two consecutive
+        # polls rarely landed on the same value and the confirmed baseline (and
+        # anything downstream of it, like the OBS display) updated far less often
+        # than points actually changed.
+        poll_interval = self._config.get("screen_poll_interval_seconds", 2)
 
         # recording_enabled: false skips creating/starting the recorder entirely — no
         # local file gets written, and recording_path stays None throughout, so
@@ -475,13 +531,14 @@ class MatchRunner:
 
                 # Continuously sample director points throughout the match, not just
                 # reactively when a card is about to fire — a small, steady cost (one
-                # screenshot + OCR read every poll_interval) that means
-                # _wait_for_points() usually already has a recent confirmed value to
-                # check against instead of needing a fresh, possibly-failed read at the
-                # exact moment a card needs to check affordability. Same
-                # confirm-before-trusting logic as everywhere else (see
-                # _update_points_reading) — a bad read here is disregarded, not trusted,
-                # and doesn't cost an extra read either way (see that method's
+                # screenshot + OCR read every poll_interval, 2s by default since
+                # 2026-09-17 — see this method's own poll_interval comment above for
+                # why) that means _wait_for_points() usually already has a recent
+                # confirmed value to check against instead of needing a fresh,
+                # possibly-failed read at the exact moment a card needs to check
+                # affordability. Same confirm-before-trusting logic as everywhere else
+                # (see _update_points_reading) — a bad read here is disregarded, not
+                # trusted, and doesn't cost an extra read either way (see that method's
                 # docstring for why agreement is checked against the last valid read
                 # instead of forcing a fresh confirmation attempt).
                 now_ts = time.monotonic()
@@ -632,6 +689,21 @@ class MatchRunner:
         obs_stream_enabled is false or obs_points_source isn't configured
         (empty by default — this is opt-in, unlike obs_game_number_source,
         since it needs an OBS source the streamer hasn't necessarily set up).
+
+        **Deliberately shows the validated (confirmed-baseline) number, not a
+        live raw read (2026-09-17, reverted the same day it was tried):** a
+        version of this briefly pushed the raw `_read_points()` result
+        immediately, decoupled from `_update_points_reading()`'s confirmation
+        ratchet, since that ratchet's "two consecutive reads must agree"
+        requirement made the display look like it only ever updated right
+        after a card play (background polls rarely landed two-in-a-row on
+        the same value at the then-current polling cadence). Reverted back
+        to showing only the confirmed value — the actual fix for slow
+        confirmations is polling for points faster than the true regen rate
+        (see `screen_poll_interval_seconds` in `config.json`, and this
+        method's own docstring history for the reasoning), not showing an
+        unconfirmed number on-screen while the underlying poll rate stays
+        mismatched to reality.
         """
         if not self._points_display_source:
             return
@@ -1196,7 +1268,8 @@ class MatchRunner:
         # explicitly instead, to keep this reward visible on the
         # ladder's live feed like any other card play.
         self._emit("card_play", card=event.card_type, name=event.name)
-        self._play_tray_card(event, target, card_label, next_event=None, broadcast_open=False)
+        self._play_tray_card(event, target, card_label, next_event=None, broadcast_open=False,
+                             hold_at_target_seconds=_PORTRAIT_DROP_HOLD_SECONDS)
 
     def _give_first_blood_reward(self, killer_index: int, deck_pos: int) -> None:
         """See _give_reward_card() — first-blood's give_wood reward."""
@@ -1267,19 +1340,45 @@ class MatchRunner:
         it would for any other rejection, same as if the deck had no
         favorite_player cards left.
         """
-        if not self._advanced_cards_enabled:
-            return False
-        if self._past_last_scheduled_card():
-            return False
-        if self._favorite_reward_target is not None:
-            return False
-        if not (0 <= player_index < len(self._player_alive) and self._player_alive[player_index]):
-            return False
-        if self._next_available_deck_pos(self._positions_for_card_type("favorite_player")) is None:
+        if self.favorite_reward_rejection_reason(player_index) is not None:
             return False
         self._favorite_reward_target = player_index
         logger.info("Crowd Favorite reward queued for %s", self._slot_name(player_index))
         return True
+
+    def favorite_reward_rejection_reason(self, player_index: int) -> Optional[str]:
+        """Read-only mirror of try_queue_favorite_reward()'s eligibility
+        checks, in the same order, without reserving anything — returns
+        None if player_index would be accepted right now, or a short
+        viewer-facing reason if not.
+
+        Exists so bot/twitch_bot.py can tell a Twitch chatter WHY their
+        Crowd Favorite redemption was refunded (2026-09-20, found live: a
+        viewer redeemed several times in a row with no reward and no
+        explanation — every one was refunded because the match's card
+        schedule had already finished, but a bare Twitch refund gives the
+        redeemer no way to know that). try_queue_favorite_reward() itself
+        still only returns a bare bool — this is a separate call so a
+        caller that only cares about the reason doesn't have to also
+        re-derive the accept/reject decision by hand.
+
+        A benign race is possible: this is called cross-thread (same
+        convention as try_queue_favorite_reward()), so match-thread state
+        can change between this call and an actual queue attempt. Harmless
+        here since the only consumer is an explanatory chat message, not
+        the real accept/reject decision.
+        """
+        if not self._advanced_cards_enabled:
+            return "bonus card rewards are turned off for this match"
+        if self._past_last_scheduled_card():
+            return "the match's card schedule has already finished"
+        if self._favorite_reward_target is not None:
+            return "another Crowd Favorite redemption is already queued"
+        if not (0 <= player_index < len(self._player_alive) and self._player_alive[player_index]):
+            return "that player isn't in this match, or is no longer alive"
+        if self._next_available_deck_pos(self._positions_for_card_type("favorite_player")) is None:
+            return "no Crowd Favorite cards left in the deck"
+        return None
 
     def _maybe_fire_favorite_reward(self, elapsed: float, card_schedule: list["CardEvent"]) -> None:
         """Called every main-loop iteration (match thread) — the
@@ -1349,19 +1448,17 @@ class MatchRunner:
         """Screen coordinate to drop a player-targeted card directly onto that
         player's own portrait — game/player_cards_v2.py's live geometry
         (self._player_slot_xs, the same data already used for name/alive
-        polling) gives the x; _PLAYER_PORTRAIT_TARGET_Y is fixed regardless
-        of player count. No camera POV switch needed to target them this
-        way (2026-09-14) — replaces the old POV-switch-then-drop-at-center
-        mechanic reward cards used (see _give_reward_card()) and the
-        never-calibrated player_target_coordinates config scheduled
-        player-targeted cards used (see _fire_card_event()). One known
-        wrinkle, not specially handled: the spectated player's own portrait
-        renders enlarged, so a card landing while its target happens to
-        already be spectated (unrelated to this play — e.g. default POV-1
-        at match start, or a viewer's own /pov) is dropping onto a
-        differently-sized box than this coordinate assumes. Not expected to
-        cause a miss in practice (the enlargement grows around the same
-        centre), but untested against a live enlarged case.
+        polling) gives the x; the y is _PLAYER_PORTRAIT_TARGET_Y shifted down
+        by _PLAYER_TARGETED_DRAG_Y_OFFSET, since the game pushes the whole
+        player bar down by a "CHOOSE <target> TO <effect>" banner's height
+        while this exact kind of card is being dragged (see that constant's
+        comment — found live 2026-09-16, a give_wood reward missed its
+        target and hit whoever had POV instead). No camera POV switch needed
+        to target a player this way (2026-09-14) — replaces the old
+        POV-switch-then-drop-at-center mechanic reward cards used (see
+        _give_reward_card()) and the never-calibrated
+        player_target_coordinates config scheduled player-targeted cards used
+        (see _fire_card_event()).
 
         Returns None if player_index is out of range of what's currently
         tracked — the player-bar snapshot failed or hasn't run yet — so the
@@ -1369,7 +1466,8 @@ class MatchRunner:
         """
         if not (0 <= player_index < len(self._player_slot_xs)):
             return None
-        return (self._player_slot_xs[player_index], _PLAYER_PORTRAIT_TARGET_Y)
+        target_y = _PLAYER_PORTRAIT_TARGET_Y + _PLAYER_TARGETED_DRAG_Y_OFFSET
+        return (self._player_slot_xs[player_index], target_y)
 
     def _elapsed_ms(self) -> int:
         if self._match_started_at is None:
@@ -1425,54 +1523,66 @@ class MatchRunner:
 
     def _read_points(self, screenshot) -> int | None:
         """
-        Read current director points conservatively.
-        Pips are always decremented by 1 to guard against a partially-filled pip being
-        counted as full. OCR is used for cross-validation: if it agrees with pip-1, we
-        log as confirmed; if it's exactly one higher, the last pip is trusted as genuinely
-        full. On any other disagreement we take the lower of the two, not pip-1 unconditionally
-        — pip reads can be biased either direction (a partially-filled pip undercounts, but a
-        single bright background pixel at a pip's sample coordinate overcounts), so only the
-        lower reading is guaranteed safe against a false "enough points" pass, whichever source
-        it came from.
-        Falls back to whichever source is available.
+        Read current director points. When director_points_use_pips is on,
+        **trusts pips alone** (game.ocr.read_director_point_pips, a
+        self-referential split search over the pip row — see its docstring
+        for how it works) — OCR (game.ocr.read_director_points) is still
+        read every single call, but purely to log alongside pips for later
+        per-match analysis (see the INFO line below), not to validate or
+        veto the pip read in any way.
 
-        director_points_use_pips (config, default True) gates the pip path entirely — set to
-        False to read OCR alone. Added 2026-09-04: single-pixel brightness sampling at some pip
-        coordinates was catching bright background elements and over-reading, causing cards to
-        be attempted before enough points actually existed. The pip-reading code and the
-        director_points_pips calibration itself are both left in place (same "disconnected, not
-        deleted" precedent as zone_close's legacy per-zone logic) in case pip reading is
-        revisited later (e.g. multi-pixel voting instead of single-pixel sampling).
+        **This is a deliberate, explicitly temporary downgrade from the
+        previous cross-validated design (2026-09-17), for live testing
+        only** — the user's own request, to gauge whether pips alone are
+        reliable enough to drop OCR from this function permanently. Every
+        live comparison run so far (a 12-frame burst that originally
+        motivated cross-validating in the first place, and a later
+        structured 74-frame session comparing both signals directly against
+        what was actually on screen) found OCR to be the less trustworthy of
+        the two — not just missing more often, but occasionally producing a
+        confident, plausible, WRONG digit (see CLAUDE.md's Director points
+        reading section for both incidents in detail). Cross-validating
+        against a signal that's itself the weaker one was costing real
+        confirmations any time OCR alone whiffed or misread, for comparatively
+        little protection in return. This is exactly the kind of claim that
+        needs a real per-match dataset before being trusted long-term, though
+        — hence logging both signals unconditionally below, not just quietly
+        switching over.
+
+        Falls back to OCR alone, unchanged from before pips existed, when
+        director_points_use_pips is False (the default) — this is the exact
+        same OCR path either way; nothing about turning pips off changes
+        OCR's own behavior.
+
+        Superseded, in order: the previous cross-validated version (both
+        signals sampled, agreement required only when both succeeded, either
+        trusted alone when the other was simply unavailable — see git
+        history / CLAUDE.md for its own full lineage) — that in turn had
+        superseded a single-pixel-per-pip brightness check (found live to
+        overcount against a same-colored background element, see
+        count_director_point_pips()'s docstring — left in place, unused,
+        pending deletion once the pip method above is validated in
+        production) — that in turn had superseded pure OCR with no cross-
+        validation at all (found live: a corrupted OCR frame could latch in
+        as the confirmed baseline for the rest of a match with nothing to
+        catch it, see CLAUDE.md's Director points reading section for the
+        full incident history).
         """
-        from game.ocr import count_director_point_pips, read_director_points
-        pip_count = None
-        ocr_count = None
-
-        pips_cfg = _DIRECTOR_POINTS_PIPS if self._config.get("director_points_use_pips", True) else None
-        if pips_cfg:
-            raw = count_director_point_pips(screenshot, pips_cfg)
-            if raw is not None:
-                pip_count = max(0, raw - 1)
+        from game.ocr import read_director_point_pips, read_director_points
 
         ocr_count = read_director_points(screenshot, _DIRECTOR_POINTS_REGION)
+        if not self._config.get("director_points_use_pips", True):
+            return ocr_count
 
-        if pip_count is not None:
-            if ocr_count is not None:
-                if ocr_count == pip_count:
-                    logger.debug("Points confirmed: %d (pips and OCR agree)", pip_count)
-                elif ocr_count == pip_count + 1:
-                    logger.debug("Points: pip-1=%d ocr=%d — OCR confirms last pip full, trusting OCR", pip_count, ocr_count)
-                    return ocr_count
-                else:
-                    safe = min(pip_count, ocr_count)
-                    logger.debug(
-                        "Points: pip-1=%d ocr=%d — discrepancy, using the lower reading (%d)",
-                        pip_count, ocr_count, safe,
-                    )
-                    return safe
-            return pip_count
+        pip_count = read_director_point_pips(screenshot, _DIRECTOR_POINTS_PIPS)
 
-        return ocr_count
+        if ocr_count is not None and pip_count is not None:
+            agreement = "agree" if ocr_count == pip_count else "DISAGREE"
+        else:
+            agreement = "n/a"
+        logger.info("Points signals: ocr=%s pips=%s (%s) -- trusting pips only", ocr_count, pip_count, agreement)
+
+        return pip_count
 
     def _update_points_reading(self, current: Optional[int], context: str) -> Optional[int]:
         """Merge a fresh points read into self._last_confirmed_points, requiring
@@ -1590,6 +1700,28 @@ class MatchRunner:
         read used to make this return immediately as if points were sufficient, and the
         card would then be attempted without actually having enough.
 
+        Waits out a short settle delay before actually declaring ready, once the
+        threshold is first met (_POINTS_SETTLE_SECONDS, 2026-09-20 fix, found live)
+        — a pip crossing _PIP_FILLED_GROUP_FLOOR can still be visibly climbing
+        toward its settled fraction for a bit longer, and _update_points_reading()'s
+        agreement ratchet only needs two polls to land on the same resolved pip
+        count, which happens easily within a second or two of first crossing the
+        floor — well before the animation (and, it turned out, the game's own
+        authoritative point count) has actually finished. Confirmed live: an
+        Electromania play fired the instant a 2->3 jump was confirmed, but the 3rd
+        pip hadn't visibly finished filling on the recording — the game rejected the
+        play, and every card after it then computed the wrong tray position (see
+        self._deck_played) since nothing verifies zone_close/tray removal by design
+        (verify_card_plays), cascading into every remaining card that match.
+
+        This is a plain delay, not a re-verification — once two reads have agreed,
+        a single later disagreeing read can't undo that on its own either (the
+        ratchet needs its own second agreeing read to move the value in either
+        direction), so re-reading here wouldn't actually catch a wrong-but-already-
+        confirmed value. The delay is what does the real work: giving the fill
+        animation (and whatever server-side tick backs it) a moment to finish
+        before anything gets spent against it.
+
         If broadcast_open and we actually need to wait, announces 'Waiting on points for X'
         async and immediately closes the broadcast so the 90s cooldown starts ticking.
         Returns True if the broadcast was closed (caller should try to reopen when ready).
@@ -1603,6 +1735,8 @@ class MatchRunner:
             confirmed = self._update_points_reading(current, card_name)
 
             if confirmed is not None and confirmed >= needed:
+                if self._stop.wait(_POINTS_SETTLE_SECONDS):
+                    return closed_broadcast
                 logger.info("Points ready for '%s': %d/%d", card_name, confirmed, needed)
                 return closed_broadcast
 
@@ -1688,7 +1822,8 @@ class MatchRunner:
                         broadcast_open = tts.try_open_broadcast()
                 if not self._stop.is_set():
                     tts.speak_cable(f"Deploying {card_label}")
-                    self._play_tray_card(event, target, card_label, next_event, broadcast_open)
+                    self._play_tray_card(event, target, card_label, next_event, broadcast_open,
+                                         hold_at_target_seconds=_PORTRAIT_DROP_HOLD_SECONDS)
         elif not event.drop_target:
             logger.warning("Card event '%s' has no drop_target configured — skipping", event.name)
         else:
@@ -1711,6 +1846,7 @@ class MatchRunner:
         card_label: str,
         next_event: Optional[CardEvent],
         broadcast_open: bool,
+        hold_at_target_seconds: float = 0.0,
     ) -> None:
         """
         Shared play/verify/announce logic for zone-targeted, player-targeted, and plain
@@ -1723,6 +1859,10 @@ class MatchRunner:
         - not self._verify_plays (verify_card_plays: false): plays once and trusts it
           worked — no before/after screenshots, no retry loop.
         - default: the original before/after tray-pixel verify with up to 2 attempts.
+
+        hold_at_target_seconds: forwarded to card_actions.play_card() — see its
+        docstring and _PORTRAIT_DROP_HOLD_SECONDS above. Callers pass this for
+        player-portrait targets only; 0.0 (no change) for zone/fixed targets.
         """
         from game import tts
         from game.card_actions import play_card
@@ -1736,7 +1876,8 @@ class MatchRunner:
             self._deck_played.add(event.deck_position)
             played = True
         elif not self._verify_plays:
-            play_card(slot_coordinate=slot_coord, target_coordinate=target, card_name=event.name)
+            play_card(slot_coordinate=slot_coord, target_coordinate=target, card_name=event.name,
+                      hold_at_target_seconds=hold_at_target_seconds)
             self._deck_played.add(event.deck_position)
             played = True
         else:
@@ -1751,7 +1892,8 @@ class MatchRunner:
                 if attempt > 1:
                     tts.speak_cable("Retrying")
                 play_card(slot_coordinate=slot_coord, target_coordinate=target,
-                          card_name=event.name, keep_shift=True)
+                          card_name=event.name, keep_shift=True,
+                          hold_at_target_seconds=hold_at_target_seconds)
                 time.sleep(0.4)
                 after = take_screenshot()
                 if self._verify_card_removed(slot_coord, before, after):

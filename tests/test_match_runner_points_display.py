@@ -6,6 +6,15 @@ balance is live on the OBS layout, without tailing the log.
 Only fires on an actual value change (see the call sites in _update_points_reading()/
 _debit_points()) — not on every poll — since a websocket round trip on every ~2s
 _wait_for_points() tick would add real, avoidable latency to card-timing precision.
+
+**Deliberately shows the validated (confirmed-baseline) number, not a live raw
+read (2026-09-17):** a same-day experiment pushed the raw pip read immediately,
+decoupled from the confirmation ratchet, since that ratchet rarely confirmed a
+background-poll change before the true value had already moved again at the
+polling cadence then in use. Reverted back to this simpler behavior — see
+_update_points_display()'s own docstring for the reasoning; the actual fix for
+slow confirmations is polling for points faster than the regen rate
+(screen_poll_interval_seconds), not showing an unconfirmed number.
 """
 from unittest.mock import patch
 

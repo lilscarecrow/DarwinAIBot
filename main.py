@@ -210,6 +210,18 @@ def main():
         asyncio.run(_run(config, session))
     except KeyboardInterrupt:
         logger.info("Darwin Bot shut down")
+    except Exception:
+        # Python's default top-level exception handler prints an uncaught
+        # traceback to the console only — it never goes through the `logging`
+        # module, so it was invisible in logs/darwin_bot.log (found live,
+        # 2026-09-17: a process death overnight left the log with no trace of
+        # why, forcing a much slower investigation to rule out everything
+        # else first). logger.exception() writes the full traceback to the
+        # log file (and console, via the existing StreamHandler) before the
+        # process exits the same way it always did — re-raised, not
+        # swallowed, so behavior on a genuine crash is otherwise unchanged.
+        logger.exception("Darwin Bot crashed with an unhandled exception")
+        raise
 
 
 if __name__ == "__main__":

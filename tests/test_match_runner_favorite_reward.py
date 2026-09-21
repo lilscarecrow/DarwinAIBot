@@ -9,7 +9,7 @@ a permanent one-shot latch.
 """
 from unittest.mock import patch
 
-from game.match_runner import MatchRunner, CardEvent, _PLAYER_PORTRAIT_TARGET_Y
+from game.match_runner import MatchRunner, CardEvent, _PLAYER_PORTRAIT_TARGET_Y, _PLAYER_TARGETED_DRAG_Y_OFFSET
 from session.state import SessionState
 
 
@@ -86,6 +86,54 @@ def test_rejects_once_all_favorite_player_copies_are_already_played():
     runner = make_runner(deck_layout=["favorite_player"])
     runner._deck_played.add(0)
     assert runner.try_queue_favorite_reward(1) is False
+
+
+# ---- favorite_reward_rejection_reason (2026-09-20) --------------------------
+#
+# A viewer-facing counterpart to try_queue_favorite_reward()'s bare bool —
+# bot/twitch_bot.py calls this to tell a Twitch chatter WHY their redemption
+# was refunded instead of leaving a silent refund. Same eligibility checks,
+# same order, read-only (never sets self._favorite_reward_target).
+
+def test_rejection_reason_is_none_for_an_eligible_redemption():
+    runner = make_runner()
+    assert runner.favorite_reward_rejection_reason(1) is None
+    assert runner._favorite_reward_target is None  # read-only — nothing reserved
+
+
+def test_rejection_reason_when_advanced_cards_is_off():
+    runner = make_runner(config={"advanced_cards": False})
+    assert "turned off" in runner.favorite_reward_rejection_reason(1)
+
+
+def test_rejection_reason_when_one_is_already_queued():
+    runner = make_runner()
+    runner._favorite_reward_target = 0
+    assert "already queued" in runner.favorite_reward_rejection_reason(1)
+
+
+def test_rejection_reason_for_an_out_of_range_index():
+    runner = make_runner()  # 3 players, indices 0-2
+    assert "isn't in this match" in runner.favorite_reward_rejection_reason(5)
+
+
+def test_rejection_reason_for_an_eliminated_target():
+    runner = make_runner(alive=[True, False, True])
+    assert "no longer alive" in runner.favorite_reward_rejection_reason(1)
+
+
+def test_rejection_reason_when_the_deck_has_no_favorite_player_card():
+    runner = make_runner(deck_layout=["electromania", "beach_party"])
+    assert "no Crowd Favorite cards left" in runner.favorite_reward_rejection_reason(1)
+
+
+def test_rejection_reason_once_the_schedule_is_exhausted():
+    runner = make_runner()
+    schedule = make_schedule(200, 400)
+    for e in schedule:
+        e.done = True
+    runner._card_schedule = schedule
+    assert "schedule has already finished" in runner.favorite_reward_rejection_reason(1)
 
 
 # ---- _past_last_scheduled_card gating (2026-09-10) --------------------------
@@ -228,7 +276,7 @@ def test_give_favorite_reward_plays_directly_on_the_targets_portrait():
     press.assert_not_called()
     play.assert_called_once()
     event, target, *_ = play.call_args[0]
-    assert target == (runner._player_slot_xs[1], _PLAYER_PORTRAIT_TARGET_Y)
+    assert target == (runner._player_slot_xs[1], _PLAYER_PORTRAIT_TARGET_Y + _PLAYER_TARGETED_DRAG_Y_OFFSET)
     assert event.card_type == "favorite_player"
     assert event.deck_position == 0
     assert runner._session.is_pov_locked() is False

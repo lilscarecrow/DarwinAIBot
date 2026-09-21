@@ -38,6 +38,14 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def mock_announce(bot):
+    """_refund() now posts an explanatory chat line via announce() (2026-09-20)
+    — patched out in every test that triggers a refund so it doesn't try to
+    open a real aiohttp session against Twitch's API."""
+    from unittest.mock import patch
+    return patch.object(bot, "announce", new_callable=AsyncMock)
+
+
 # ---- event_custom_redemption_add: dispatch by title ------------------------
 
 def test_dispatches_pov_titled_redemption_to_the_pov_handler():
@@ -88,7 +96,8 @@ def patch_handler(bot, name):
 def test_refunds_invalid_input():
     bot = make_bot()
     payload = make_payload("Crowd Favorite", "not a number")
-    run(bot._handle_favorite_redemption(payload))
+    with mock_announce(bot):
+        run(bot._handle_favorite_redemption(payload))
     payload.refund.assert_called_once()
     payload.fulfill.assert_not_called()
 
@@ -97,7 +106,8 @@ def test_refunds_when_no_match_is_in_progress():
     bot = make_bot()
     bot.active_runner = None
     payload = make_payload("Crowd Favorite", "5")
-    run(bot._handle_favorite_redemption(payload))
+    with mock_announce(bot):
+        run(bot._handle_favorite_redemption(payload))
     payload.refund.assert_called_once()
     payload.fulfill.assert_not_called()
 
@@ -118,10 +128,19 @@ def test_refunds_when_the_runner_rejects_the_queue_attempt():
     bot = make_bot()
     bot.active_runner = MagicMock()
     bot.active_runner.try_queue_favorite_reward.return_value = False
+    bot.active_runner.favorite_reward_rejection_reason.return_value = "no Crowd Favorite cards left in the deck"
     payload = make_payload("Crowd Favorite", "5")
-    run(bot._handle_favorite_redemption(payload))
+    with mock_announce(bot) as announce:
+        run(bot._handle_favorite_redemption(payload))
     payload.refund.assert_called_once()
     payload.fulfill.assert_not_called()
+    # 2026-09-20: the specific reason (not a vague catch-all) goes to chat,
+    # tagging the redeemer, so a refund is no longer silent on Twitch's end.
+    bot.active_runner.favorite_reward_rejection_reason.assert_called_once_with(4)  # "5" -> index 4
+    announce.assert_called_once()
+    message = announce.call_args[0][0]
+    assert "viewer" in message
+    assert "no Crowd Favorite cards left in the deck" in message
 
 
 def test_accepts_pov_style_prefixed_input_too():

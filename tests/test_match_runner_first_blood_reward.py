@@ -15,7 +15,10 @@ from unittest.mock import patch
 
 import pytest
 
-from game.match_runner import MatchRunner, CardEvent, _PLAYER_PORTRAIT_TARGET_Y
+from game.match_runner import (
+    MatchRunner, CardEvent, _PLAYER_PORTRAIT_TARGET_Y, _PLAYER_TARGETED_DRAG_Y_OFFSET,
+    _PORTRAIT_DROP_HOLD_SECONDS,
+)
 from session.state import SessionState
 
 
@@ -232,7 +235,7 @@ def test_give_plays_the_card_directly_on_the_targets_portrait():
     press.assert_not_called()  # no camera switch anymore
     play.assert_called_once()
     event, target, *_ = play.call_args[0]
-    assert target == (runner._player_slot_xs[1], _PLAYER_PORTRAIT_TARGET_Y)
+    assert target == (runner._player_slot_xs[1], _PLAYER_PORTRAIT_TARGET_Y + _PLAYER_TARGETED_DRAG_Y_OFFSET)
     assert event.card_type == "give_wood"
     assert event.deck_position == 0
     assert event.drop_target == target
@@ -259,6 +262,21 @@ def test_give_emits_a_card_play_event_like_any_other_card():
     with patch.object(runner, "_play_tray_card"):
         runner._give_first_blood_reward(killer_index=1, deck_pos=0)
     assert ("card_play", {"card": "give_wood", "name": "First Blood Reward (Give wood)", "elapsed_ms": 0}) in ds.events
+
+
+def test_give_holds_at_the_portrait_before_releasing():
+    """2026-09-15 fix: a give_wood reward's drop onto a player's portrait
+    missed live, happening "too fast to tell where it landed" — a plain
+    drag releases the instant it arrives, with no dwell time for the game to
+    register the drop. _give_reward_card() must forward
+    _PORTRAIT_DROP_HOLD_SECONDS into _play_tray_card() (which threads it on
+    to card_actions.play_card()) so portrait drops get a brief hold; other
+    drop kinds are unaffected — see the scheduled-dispatch test below."""
+    ds = FakeDraftLifecycle()
+    runner = make_runner(ds=ds)
+    with patch.object(runner, "_press"), patch.object(runner, "_play_tray_card") as play:
+        runner._give_first_blood_reward(killer_index=1, deck_pos=0)
+    assert play.call_args.kwargs["hold_at_target_seconds"] == _PORTRAIT_DROP_HOLD_SECONDS
 
 
 def test_give_skips_without_playing_when_no_portrait_coordinate_is_tracked():
