@@ -89,6 +89,20 @@ def test_updates_the_obs_banner_with_the_current_game_number():
     set_text.assert_called_once_with(runner._game_number_source, "Game 3")
 
 
+def test_obs_banner_includes_the_region_when_last_selected_region_is_set():
+    """2026-09-23: so the banner reads "Game N NA"/"Game N EU"/etc. --
+    last_selected_region (config) is persisted by discord_bot.py's
+    _do_create_custom() and always current by the time a match starts."""
+    runner, ds = make_runner(config={"last_selected_region": "EU"})
+    ds.game_index = 3
+    with patch("game.screen_detection.take_screenshot", return_value=None), \
+         patch("game.player_cards_v2.detect_cards", return_value=[]), \
+         patch("game.obs_control.is_enabled", return_value=True), \
+         patch("game.obs_control.set_source_text") as set_text:
+        runner._init_player_bar_and_push()
+    set_text.assert_called_once_with(runner._game_number_source, "Game 3 EU")
+
+
 def test_does_not_touch_obs_when_streaming_is_disabled():
     runner, ds = make_runner()
     with patch("game.screen_detection.take_screenshot", return_value=None), \

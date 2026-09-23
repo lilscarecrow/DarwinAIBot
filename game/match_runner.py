@@ -77,24 +77,9 @@ _CARD_DROP_TARGETS: dict[str, tuple[int, int]] = {
 # the card tray layout above.
 _ZONE_CLOSE_DROP_TARGET = (1750, 1000)
 
-# Director-points OCR crop — 2-digit numerator only (not the "/10"). Calibrated at
-# 1920×1080. Moved out of config.json (2026-09-07). x shifted 808 -> 811 (2026-09-15):
-# measured directly against 3 real live-captured, correctly-read fixtures
-# (tests/fixtures/director_points/) — every one had 3-6px of unused blank space on
-# the LEFT before the digit ink started, while the ink already touched the RIGHT
-# edge flush (zero margin) in all three. Shifting right by 3 (the smallest observed
-# left margin, so no case loses any digit) trades that wasted left-side space for a
-# few pixels of much-needed margin on the right, where it was actually needed.
-# Doesn't fix the wider, separately-documented clipping incident in that same
-# fixtures README (a numerator on a tan-background frame needed ~33px total width,
-# far beyond what a small shift can recover within a 20px-wide crop) — that one
-# still needs either a real width increase or confirmation of whether it's a rarer,
-# differently-scaled render state before touching the crop further.
-_DIRECTOR_POINTS_REGION = (811, 1002, 20, 24)
-
-# Director-points pip pixel-sampling calibration — dormant while director_points_use_pips
-# (still a real config toggle) is false, kept for if pip reading is ever revisited.
-# Moved out of config.json (2026-09-07).
+# Director-points pip pixel-sampling calibration — the sole director-points signal
+# as of 2026-09-23 (see _read_points()'s docstring for why OCR was dropped
+# entirely). Moved out of config.json (2026-09-07).
 _DIRECTOR_POINTS_PIPS = {"x_start": 862, "y": 1012, "spacing": 26, "count": 10}
 
 # A pip fills via a radial wipe, not an instant color swap (see game/ocr.py's
@@ -575,13 +560,16 @@ class MatchRunner:
                 # (see _update_points_reading) — a bad read here is disregarded, not
                 # trusted, and doesn't cost an extra read either way (see that method's
                 # docstring for why agreement is checked against the last valid read
-                # instead of forcing a fresh confirmation attempt).
-                now_ts = time.monotonic()
-                if now_ts - self._last_points_sample_time >= poll_interval:
-                    from game.screen_detection import take_screenshot as _take_ss2
-                    sample = self._read_points(_take_ss2())
-                    self._update_points_reading(sample, "background poll")
-                    self._last_points_sample_time = now_ts
+                # instead of forcing a fresh confirmation attempt). Stopped once
+                # _points_still_needed() says nothing left in the match could spend
+                # them (2026-09-23) — see that method's own docstring.
+                if self._points_still_needed():
+                    now_ts = time.monotonic()
+                    if now_ts - self._last_points_sample_time >= poll_interval:
+                        from game.screen_detection import take_screenshot as _take_ss2
+                        sample = self._read_points(_take_ss2())
+                        self._update_points_reading(sample, "background poll")
+                        self._last_points_sample_time = now_ts
 
                 # First-blood reward (give_wood) — see _maybe_fire_first_blood_reward
                 # for the full "safe to fire" checklist. Cheap no-op most
@@ -689,24 +677,34 @@ class MatchRunner:
             logger.warning("Player bar init/roster push failed: %s", e)
 
     def _update_game_number_banner(self) -> None:
-        """Push "Game N" to an OBS text source so viewers know which game in
-        the set is currently being played (2026-09-11). self._ds.game_index
-        is the freshest signal available at this point: DraftLifecycle's
-        on_match_start() just above re-opens the draft with this match's
-        roster, and that reply's next_game_index (see game/ds_lifecycle.py)
-        re-seeds it every single match start, not just at /custom — so this
-        reflects the server's own bookkeeping, not a locally-guessed count.
-        No "of 4" suffix: a tournament lobby's set can be capped at fewer
-        games server-side, and the bot has no reliable way to know that
-        limit, so claiming a total would risk being wrong. No-ops if
-        obs_stream_enabled is false or there's no draft lifecycle at all.
+        """Push "Game N" (plus the region, see below) to an OBS text source so
+        viewers know which game in the set is currently being played
+        (2026-09-11). self._ds.game_index is the freshest signal available at
+        this point: DraftLifecycle's on_match_start() just above re-opens the
+        draft with this match's roster, and that reply's next_game_index (see
+        game/ds_lifecycle.py) re-seeds it every single match start, not just
+        at /custom — so this reflects the server's own bookkeeping, not a
+        locally-guessed count. No "of 4" suffix: a tournament lobby's set can
+        be capped at fewer games server-side, and the bot has no reliable way
+        to know that limit, so claiming a total would risk being wrong.
+        No-ops if obs_stream_enabled is false or there's no draft lifecycle
+        at all.
+
+        Region suffix (2026-09-23): last_selected_region (config) is the
+        region /custom most recently set the game to — persisted by
+        discord_bot.py's _do_create_custom() and always accurate by the time
+        a match actually starts, so "Game 3 NA"/"Game 3 EU"/"Game 3 APAC"
+        tells viewers the region without a separate source. Omitted if the
+        key isn't set yet (e.g. before any /custom has ever run).
         """
         if self._ds is None:
             return
         from game import obs_control
         if not obs_control.is_enabled():
             return
-        obs_control.set_source_text(self._game_number_source, f"Game {self._ds.game_index}")
+        region = self._config.get("last_selected_region")
+        text = f"Game {self._ds.game_index} {region}" if region else f"Game {self._ds.game_index}"
+        obs_control.set_source_text(self._game_number_source, text)
 
     def _update_points_display(self) -> None:
         """Push self._last_confirmed_points to an OBS text source (2026-09-14),
@@ -1405,6 +1403,28 @@ class MatchRunner:
         """
         return bool(self._card_schedule) and all(e.done for e in self._card_schedule)
 
+    def _points_still_needed(self) -> bool:
+        """True if anything left in the match could still consult
+        self._last_confirmed_points, i.e. whether run()'s main loop should
+        keep paying for a background points sample every poll_interval
+        (2026-09-23).
+
+        While the card schedule has cards left (not _past_last_scheduled_card()),
+        every one of them needs a fresh confirmed value to check affordability
+        against, so sampling continues unconditionally. Once the schedule is
+        exhausted, the only thing that could still spend points is a
+        first-blood give_wood reward still waiting to fire (queued but not
+        yet resolved) — Crowd Favorite doesn't count, since favorite_player
+        costs 0 points and try_queue_favorite_reward() already refuses new
+        redemptions once the schedule is exhausted anyway (see
+        _past_last_scheduled_card()'s own docstring). Once both are false,
+        nothing this match will ever read self._last_confirmed_points again,
+        so there is no reason to keep spending a screenshot+OCR read on it.
+        """
+        if not self._past_last_scheduled_card():
+            return True
+        return self._first_blood_reward_slot is not None and not self._first_blood_reward_resolved
+
     def try_queue_favorite_reward(self, player_index: int, redeemer_name: Optional[str] = None) -> bool:
         """Reserves the Crowd Favorite reward for player_index, if — and
         only if — nothing is already pending, player_index is a real,
@@ -1634,66 +1654,44 @@ class MatchRunner:
 
     def _read_points(self, screenshot) -> int | None:
         """
-        Read current director points. When director_points_use_pips is on,
-        **trusts pips alone** (game.ocr.read_director_point_pips, a
-        self-referential split search over the pip row — see its docstring
-        for how it works) — OCR (game.ocr.read_director_points) is still
-        read every single call, but purely to log alongside pips for later
-        per-match analysis (see the INFO line below), not to validate or
-        veto the pip read in any way.
+        Read current director points via pips alone (game.ocr.read_director_point_pips,
+        a self-referential split search over the pip row — see its docstring for how it
+        works).
 
-        **This is a deliberate, explicitly temporary downgrade from the
-        previous cross-validated design (2026-09-17), for live testing
-        only** — the user's own request, to gauge whether pips alone are
-        reliable enough to drop OCR from this function permanently. Every
-        live comparison run so far (a 12-frame burst that originally
-        motivated cross-validating in the first place, and a later
-        structured 74-frame session comparing both signals directly against
-        what was actually on screen) found OCR to be the less trustworthy of
-        the two — not just missing more often, but occasionally producing a
-        confident, plausible, WRONG digit (see CLAUDE.md's Director points
-        reading section for both incidents in detail). Cross-validating
-        against a signal that's itself the weaker one was costing real
-        confirmations any time OCR alone whiffed or misread, for comparatively
-        little protection in return. This is exactly the kind of claim that
-        needs a real per-match dataset before being trusted long-term, though
-        — hence logging both signals unconditionally below, not just quietly
-        switching over.
+        **OCR was dropped from this function entirely (2026-09-23), after a live
+        dataset settled the question this design was built to answer.** From
+        2026-09-17 through this change, pips were trusted exclusively while OCR
+        (game.ocr.read_director_points) was still sampled every call purely to log
+        alongside pips for later comparison — see git history for that version.
+        Analysis of ~43,000 logged comparisons across 6 days of real matches found
+        OCR added no protection worth keeping: pips had a higher hit rate (60% vs
+        49%), pips agreed with themselves between consecutive reads far more often
+        (only 4.6% of consecutive pip reads jumped by 2+, vs 34% for OCR), and 86%
+        of every OCR/pip disagreement happened specifically when the true value was
+        10 — where OCR was wrong or silent 71% of the time (36% failed outright,
+        29% misread as 0, both usually sustained across several consecutive polls,
+        not one-off noise). Of the disagreements with a clear signal for who was
+        right, pips was corroborated by its own neighboring reads over OCR by
+        roughly 31:1. See CLAUDE.md's Director points reading section for the full
+        writeup. `read_director_points()` and its dedicated preprocessing were
+        deleted from game/ocr.py along with this change — nothing else called them.
 
-        Falls back to OCR alone, unchanged from before pips existed, when
-        director_points_use_pips is False (the default) — this is the exact
-        same OCR path either way; nothing about turning pips off changes
-        OCR's own behavior.
-
-        Superseded, in order: the previous cross-validated version (both
+        Superseded, in order: the OCR-logged-for-comparison version just described
+        — that in turn had superseded a genuinely cross-validated design (both
         signals sampled, agreement required only when both succeeded, either
-        trusted alone when the other was simply unavailable — see git
-        history / CLAUDE.md for its own full lineage) — that in turn had
-        superseded a single-pixel-per-pip brightness check (found live to
-        overcount against a same-colored background element, see
-        count_director_point_pips()'s docstring — left in place, unused,
-        pending deletion once the pip method above is validated in
-        production) — that in turn had superseded pure OCR with no cross-
-        validation at all (found live: a corrupted OCR frame could latch in
-        as the confirmed baseline for the rest of a match with nothing to
-        catch it, see CLAUDE.md's Director points reading section for the
-        full incident history).
+        trusted alone when the other was simply unavailable — see git history /
+        CLAUDE.md for its own full lineage) — that in turn had superseded a
+        single-pixel-per-pip brightness check (found live to overcount against a
+        same-colored background element, see count_director_point_pips()'s
+        docstring — left in place, unused, pending deletion) — that in turn had
+        superseded pure OCR with no cross-validation at all (found live: a
+        corrupted OCR frame could latch in as the confirmed baseline for the rest
+        of a match with nothing to catch it, see CLAUDE.md's Director points
+        reading section for the full incident history).
         """
-        from game.ocr import read_director_point_pips, read_director_points
+        from game.ocr import read_director_point_pips
 
-        ocr_count = read_director_points(screenshot, _DIRECTOR_POINTS_REGION)
-        if not self._config.get("director_points_use_pips", True):
-            return ocr_count
-
-        pip_count = read_director_point_pips(screenshot, _DIRECTOR_POINTS_PIPS)
-
-        if ocr_count is not None and pip_count is not None:
-            agreement = "agree" if ocr_count == pip_count else "DISAGREE"
-        else:
-            agreement = "n/a"
-        logger.info("Points signals: ocr=%s pips=%s (%s) -- trusting pips only", ocr_count, pip_count, agreement)
-
-        return pip_count
+        return read_director_point_pips(screenshot, _DIRECTOR_POINTS_PIPS)
 
     def _update_points_reading(self, current: Optional[int], context: str) -> Optional[int]:
         """Merge a fresh points read into self._last_confirmed_points, requiring

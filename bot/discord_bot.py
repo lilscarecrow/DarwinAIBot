@@ -1402,11 +1402,17 @@ class DirectorCog(commands.Cog):
             # for a brand-new set — see DraftLifecycle.open_lobby()), so this is
             # correct even before /start. MatchRunner refreshes it again at every
             # subsequent match start in the same lobby (_update_game_number_banner()).
+            # Region suffix (2026-09-23): last_selected_region is already correct by
+            # this point regardless of which path _do_create_custom took (skipped the
+            # PLAY-screen check because it already matched, or just changed and
+            # persisted it) — see that method's own region-handling comment above.
             if obs_control.is_enabled() and self._ds.game_index:
+                region_code = self.bot.config.get("last_selected_region")
+                banner_text = f"Game {self._ds.game_index} {region_code}" if region_code else f"Game {self._ds.game_index}"
                 await loop.run_in_executor(
                     None, obs_control.set_source_text,
                     self.bot.config.get("obs_game_number_source", "Game Number"),
-                    f"Game {self._ds.game_index}",
+                    banner_text,
                 )
 
             # Start a background watcher that fires the match runner if the lobby
