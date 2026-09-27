@@ -38,6 +38,15 @@ def _extract_pov_key(text: Optional[str]) -> Optional[str]:
 # checking real post-migration state rather than racing it.
 _RESUBSCRIBE_GRACE_SECONDS = 8
 
+# How often _eventsub_watchdog_loop() re-checks subscription health independently of
+# any reconnect event (2026-09-27) — see that method's own docstring for why this
+# exists at all: event_websocket_welcome()-triggered recovery assumes a welcome
+# eventually fires again, which isn't guaranteed. 5 minutes is frequent enough that a
+# dead connection is caught well within a single stream session, without hammering
+# Twitch's API for what's normally a no-op check (fetch_eventsub_subscriptions is a
+# lightweight read).
+_EVENTSUB_HEALTH_CHECK_INTERVAL_SECONDS = 300
+
 # Global cooldown between channel-points-triggered POV changes from regular viewers
 # (see event_custom_redemption_add). Does not apply to /pov or !pov — both are
 # already mod/admin-gated with no cooldown, and mods/the broadcaster bypass this
@@ -101,6 +110,9 @@ class DarwinTwitchBot(commands.Bot):
         self.startup_done = asyncio.Event()
         self.chat_subscribed: bool = False
         self.events_subscribed: tuple[int, int] = (0, 0)  # (succeeded, attempted)
+        # The periodic EventSub health-check task — see _eventsub_watchdog_loop().
+        # Started at the end of setup_hook(); cancelled in close() below.
+        self._eventsub_watchdog_task: Optional[asyncio.Task] = None
         super().__init__(
             client_id=config["twitch_client_id"],
             client_secret=config["twitch_client_secret"],
@@ -122,8 +134,19 @@ class DarwinTwitchBot(commands.Bot):
         self.events_subscribed = await self._subscribe_events()
         await self._ensure_pov_reward()
         await self._ensure_favorite_reward()
+        # Independent periodic health check (2026-09-27) — see
+        # _eventsub_watchdog_loop()'s own docstring for the incident this closes.
+        self._eventsub_watchdog_task = asyncio.create_task(self._eventsub_watchdog_loop())
         self.startup_done.set()
         logger.info("Twitch bot: setup complete, listening for !pov")
+
+    async def close(self) -> None:
+        """Cancels the watchdog task before the usual Client.close() teardown, so
+        shutdown doesn't leave it pending (an "asyncio.sleep" task with nothing
+        left to wake it — harmless, but logs a noisy warning if left dangling)."""
+        if self._eventsub_watchdog_task is not None:
+            self._eventsub_watchdog_task.cancel()
+        await super().close()
 
     async def event_websocket_welcome(self, payload) -> None:
         """Fires on every new EventSub websocket session — the initial connect AND
@@ -136,8 +159,9 @@ class DarwinTwitchBot(commands.Bot):
             return
         await self._resubscribe_missing()
 
-    async def _resubscribe_missing(self) -> None:
-        """Reconnect safety net for event_websocket_welcome().
+    async def _resubscribe_missing(self, *, grace: bool = True) -> None:
+        """Reconnect safety net for event_websocket_welcome() — also called
+        periodically by _eventsub_watchdog_loop() (grace=False there, see below).
 
         An earlier version of this called _subscribe_chat()/_subscribe_events()
         unconditionally on every reconnect. That was found live to double every
@@ -156,8 +180,13 @@ class DarwinTwitchBot(commands.Bot):
         mode (the internal migration 400ing and never being retried) without
         risking a duplicate when the internal migration already worked, which is
         the common case.
+
+        grace=False skips the initial sleep — used by the periodic watchdog, which
+        isn't reacting to a reconnect that just happened, so there's nothing of
+        TwitchIO's own to wait out.
         """
-        await asyncio.sleep(_RESUBSCRIBE_GRACE_SECONDS)
+        if grace:
+            await asyncio.sleep(_RESUBSCRIBE_GRACE_SECONDS)
 
         enabled_types: set[str] | None = set()
         try:
@@ -177,6 +206,41 @@ class DarwinTwitchBot(commands.Bot):
         if enabled_types is None or "channel.chat.message" not in enabled_types:
             await self._subscribe_chat()
         await self._subscribe_events(skip_types=enabled_types)
+
+    async def _eventsub_watchdog_loop(self) -> None:
+        """Runs for the lifetime of the bot, re-checking EventSub subscription
+        health every _EVENTSUB_HEALTH_CHECK_INTERVAL_SECONDS regardless of whether
+        a reconnect event has fired (2026-09-27, found live).
+
+        Found live: a burst of 3 EventSub reconnects inside about 30 seconds ended
+        with the connection simply never coming back — no further
+        "session_welcome", no further error, nothing logged for the EventSub
+        subsystem at all for the next 12 hours, until a manual restart. Chat,
+        channel-points redemptions, and sub/cheer shoutouts were all silently dead
+        the whole time; everything else (Discord, OBS, the plain-REST Twitch calls
+        like ad breaks/predictions/stream title) kept working fine, masking the
+        outage exactly the way the original 2026-09-05 incident did.
+
+        The existing recovery path (_resubscribe_missing(), triggered by
+        event_websocket_welcome()) assumes a welcome eventually fires again after a
+        reconnect — that's the one thing this incident didn't do. This loop doesn't
+        wait on that signal at all: it just calls the same fetch-and-recreate logic
+        on a fixed timer, so a connection that's gone quiet gets caught and healed
+        within one interval instead of requiring a human to notice and restart.
+        grace=False since there's no reconnect to wait out here.
+
+        Known limit: this can only recover by re-subscribing — if
+        subscribe_websocket() itself can't succeed (e.g. the underlying token is
+        actually invalid, not just the connection), this can't fix that on its own;
+        the warning below is still the visible signal something's wrong. Swallows
+        its own exceptions so one bad cycle can't kill the loop.
+        """
+        while True:
+            await asyncio.sleep(_EVENTSUB_HEALTH_CHECK_INTERVAL_SECONDS)
+            try:
+                await self._resubscribe_missing(grace=False)
+            except Exception as e:
+                logger.warning("Twitch bot: EventSub health check failed: %s", e)
 
     async def _subscribe_chat(self) -> bool:
         try:
