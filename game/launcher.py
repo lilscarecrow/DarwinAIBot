@@ -10,6 +10,13 @@ GAME_PROCESS_NAME = "Darwin-Win64-Shipping.exe"
 # Darwin Project's Steam App ID (fixed — not machine-specific, see appmanifest_544920.acf).
 STEAM_APP_ID = "544920"
 
+# Unreal's own crash handler process, which launches as a separate GUI process
+# ("Darwin Crash Reporter") when Darwin-Win64-Shipping.exe crashes — see
+# close_crash_reporter(). Confirmed live 2026-09-28: ships under the game's own
+# Engine folder (Engine\Binaries\Win64\CrashReportClient.exe), not
+# machine-specific.
+CRASH_REPORTER_PROCESS_NAME = "CrashReportClient.exe"
+
 
 def launch_game(exe_path: str, timeout: int = 60) -> bool:
     """
@@ -64,6 +71,30 @@ def close_game():
             proc.terminate()
             return
     logger.warning("close_game called but game process not found")
+
+
+def is_crash_reporter_open() -> bool:
+    target = CRASH_REPORTER_PROCESS_NAME.lower()
+    for proc in psutil.process_iter(["name"]):
+        if (proc.info["name"] or "").lower() == target:
+            return True
+    return False
+
+
+def close_crash_reporter():
+    """Terminate the crash reporter process, mirroring close_game()'s pattern.
+
+    Killing this process is enough to dismiss the "Darwin Crash Reporter"
+    dialog it owns — no click/UI-automation needed, since this closes the
+    whole window along with the process behind it (same effect "Close
+    Without Sending" would have had, minus actually sending the report).
+    """
+    for proc in psutil.process_iter(["name"]):
+        if proc.info["name"] == CRASH_REPORTER_PROCESS_NAME:
+            logger.info("Terminating crash reporter process (pid %d)", proc.pid)
+            proc.terminate()
+            return
+    logger.warning("close_crash_reporter called but crash reporter process not found")
 
 
 def monitor_game_process(on_unexpected_exit):

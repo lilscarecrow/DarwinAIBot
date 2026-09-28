@@ -289,7 +289,15 @@ class _EndConfirmView(discord.ui.View):
         self._cog._stop_event.set()
         if self._cog._active_runner is not None:
             self._cog._active_runner.stop()
-        from game.launcher import close_game
+        from game.launcher import close_game, is_crash_reporter_open, close_crash_reporter
+        # /quit is also the manual recovery path if the game crashed and the
+        # auto-close in MatchRunner.run()'s main loop either didn't catch it
+        # (crash happened outside a live match — see that feature's "not
+        # covered" note in CLAUDE.md) or the bot was never told to try. Same
+        # check, same close — killing CrashReportClient.exe dismisses its
+        # dialog with no UI click needed.
+        if is_crash_reporter_open():
+            close_crash_reporter()
         close_game()
         self._cog._reset_session("quit")
         self.stop()

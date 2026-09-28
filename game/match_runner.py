@@ -266,6 +266,12 @@ class MatchRunner:
         self._session.lock_pov()
         self._on_action_update = on_action_update
         self._stop = threading.Event()
+        # Set True only when run() detects and auto-closes the crash reporter
+        # (game.launcher.is_crash_reporter_open()) — distinct from a plain
+        # self._stop set by /quit's force-stop, so discord_bot.py can tell the
+        # two apart after run() returns and skip steps that assume the game
+        # window still exists (e.g. _do_post_match_return()'s MAIN MENU click).
+        self.crashed = False
         self._skip_start = skip_start
         self._profile = profile
         self._bypass = config.get("ahk_bypass_mode", False)
@@ -515,6 +521,28 @@ class MatchRunner:
             while not self._stop.is_set():
                 elapsed = time.monotonic() - start_time
 
+                # Unreal's own crash handler pops up as a separate process
+                # (CrashReportClient.exe) when Darwin-Win64-Shipping.exe
+                # crashes mid-match — found live 2026-09-28: the match loop
+                # otherwise just spins forever, since _match_has_ended() can
+                # never detect a results screen that will never appear. A
+                # cheap psutil process-name check (same cost as is_game_running(),
+                # negligible next to a screenshot) catches this every
+                # iteration; closing the reporter process is enough to dismiss
+                # its dialog outright (no UI click needed — see
+                # game.launcher.close_crash_reporter()'s docstring). Treated
+                # like a force-stop from here (breaks the loop, self._stop
+                # semantics apply to every wait below) but flagged via
+                # self.crashed so discord_bot.py can skip post-match steps
+                # that assume the game window still exists.
+                from game.launcher import is_crash_reporter_open, close_crash_reporter
+                if is_crash_reporter_open():
+                    logger.error("Game crash detected (crash reporter open) at %.1fs elapsed — closing it", elapsed)
+                    close_crash_reporter()
+                    self.crashed = True
+                    self._stop.set()
+                    break
+
                 # Fire any card events whose time has arrived
                 for event in card_schedule:
                     if not event.done and elapsed >= event.trigger_seconds:
@@ -617,6 +645,10 @@ class MatchRunner:
             # match. Same "always finalize" reasoning as the recorder above.
             self._last_confirmed_points = None
             self._update_points_display()
+
+        if self.crashed:
+            self._emit("aborted", reason="game crashed")
+            return "Match ended early — the game crashed. Crash reporter closed automatically."
 
         if self._stop.is_set():
             self._emit("aborted", reason="force stopped")
