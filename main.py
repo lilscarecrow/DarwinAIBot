@@ -47,8 +47,10 @@ def validate_config(config: dict) -> list[str]:
     if not config.get("discord_bot_token"):
         errors.append("discord_bot_token is missing or empty")
 
-    if not config.get("discord_required_role"):
-        errors.append("discord_required_role is missing or empty")
+    # Admin roles are Discord role IDs (not names) so a role rename doesn't break the bot.
+    for key in ("discord_required_role", "scrim_admin_role"):
+        if not str(config.get(key, "")).strip().isdigit():
+            errors.append(f"{key} must be a numeric Discord role ID (got {config.get(key)!r})")
 
     strategy = config.get("zone_selection_strategy", "")
     if strategy not in valid_strategy_names():

@@ -111,7 +111,7 @@ States: `IDLE → LAUNCHING → IN_MENU → IN_CUSTOM → MATCH_IN_PROGRESS → 
 2. `_state_check` — ephemeral error if command invalid in current state
 3. `_acquire_lock_or_reject` — ephemeral error (and no-op) if another long-running operation is already holding the session lock; claims it atomically otherwise — see below
 
-**`discord_required_role` is intentionally the same value as `scrim_admin_role`** (currently `"PC Scrim Admin"`) — merged so the same role gates both Director automation (`/launch`, `/custom`, `/start`, `/quit`, `/deck`) and scrim admin actions (`/role add`, `/role remove`). This means anyone with `PC Scrim Admin` can force-close the game or edit the live card deck, not just manage scrim signups — that's a deliberate scope decision, not an oversight, but worth remembering if the role is ever handed out more broadly.
+**`discord_required_role` is intentionally the same value as `scrim_admin_role`** (currently role ID `663105141867806742`, the "PC Scrim Admin" role — both keys hold a Discord **role ID**, not a name, since 2026-10-07, so the role can be renamed in Discord without touching config; `main.py` rejects a non-numeric value at startup, and the queue-full ping mentions it as `<@&id>`) — merged so the same role gates both Director automation (`/launch`, `/custom`, `/start`, `/quit`, `/deck`) and scrim admin actions (`/role add`, `/role remove`). This means anyone with `PC Scrim Admin` can force-close the game or edit the live card deck, not just manage scrim signups — that's a deliberate scope decision, not an oversight, but worth remembering if the role is ever handed out more broadly.
 
 **Guild command sync doesn't self-clean.** `discord_guild_ids` controls which guilds get `tree.sync()`'d on startup, but removing a guild from that list does **not** un-register the commands Discord already has stored for it — they stay registered (and visible/callable) in that guild indefinitely. If a guild is dropped from config (e.g. after a server migration), its stale command list will drift from the code over time. Not dangerous as long as nobody in that guild holds `discord_required_role`, but worth an occasional check via `GET /applications/{app_id}/guilds/{guild_id}/commands` if a guild is meant to be fully decommissioned.
 
@@ -363,7 +363,7 @@ No raw reaction events fire for a deleted message, so `_signup_order` and the re
 | `scrim_region_message_id` | Auto-persisted — do not edit manually. The live region-breakdown message below the signup message, see above |
 | `scrim_player_role` | `PC Scrim Player` |
 | `scrim_player_role_2` | `PC Scrim Player 2` — optional; second-lobby role for signups 11-20, see "Two-lobby overflow" above |
-| `scrim_admin_role` | `PC Scrim Admin` (same value as `discord_required_role`) |
+| `scrim_admin_role` | `663105141867806742` — role **ID** of "PC Scrim Admin" (same value as `discord_required_role`) |
 | `scrim_min_players` | `8` |
 | `scrim_reaction_emoji` | `✅` |
 | `region_role_na` / `region_role_eu` | `"NA"` / `"EU"` — Discord role names checked by the live region-breakdown message below the signup message |
@@ -951,7 +951,7 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
 {
     "game_executable_path": "",          // Full path to DarwinProject.exe
     "discord_bot_token": "",             // Discord bot token (keep secret)
-    "discord_required_role": "PC Scrim Admin",   // Intentionally the same value as scrim_admin_role — see merge note in Discord Bot section
+    "discord_required_role": "663105141867806742",   // Role ID, not name. Intentionally the same value as scrim_admin_role — see merge note in Discord Bot section
     "discord_guild_ids": ["..."],        // Guild IDs for instant slash command sync — removing an ID here does NOT un-register commands already synced to that guild, see note above
     "zone_selection_strategy": "weighted_outer",
     "active_profile": "standard",        // Match card play profile (see game/profiles.py)
@@ -1037,7 +1037,7 @@ Adding new profiles: add an entry to `PROFILES` dict in `game/profiles.py`. The 
     "scrim_region_message_id": null,     // Auto-persisted — live region-breakdown message posted below the signup message
     "scrim_player_role": "PC Scrim Player",
     "scrim_player_role_2": "PC Scrim Player 2", // optional — second-lobby role for signups 11-20
-    "scrim_admin_role": "PC Scrim Admin", // same value as discord_required_role — see merge note above
+    "scrim_admin_role": "663105141867806742", // role ID; same value as discord_required_role — see merge note above
     "scrim_min_players": 8,
     "scrim_reaction_emoji": "✅",
     "region_role_na": "NA",               // Discord role name checked by the live region-breakdown message

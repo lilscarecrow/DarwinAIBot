@@ -90,6 +90,23 @@ def _try_force_sync() -> bool:
         return False
 
 
+def _role_id(value) -> int | None:
+    """Parse a configured role id (string or int) — None if unset/invalid.
+
+    Admin roles are configured by Discord role ID rather than name, so the
+    role can be renamed in Discord without breaking the bot.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _member_has_role_id(member, role_id) -> bool:
+    rid = _role_id(role_id)
+    return rid is not None and any(r.id == rid for r in getattr(member, "roles", []))
+
+
 async def _acquire_lock_or_reject(lock: asyncio.Lock, interaction: discord.Interaction, busy_message: str) -> bool:
     """Atomically claim `lock`, or reject with `busy_message` if it's already
     held (2026-09-15) — shared by DirectorCog's `_session_lock` (`/launch`,
@@ -900,8 +917,7 @@ class DirectorCog(commands.Cog):
     # ------------------------------------------------------------------
 
     def _has_role(self, interaction: discord.Interaction) -> bool:
-        required = self.bot.config.get("discord_required_role", "")
-        return any(r.name == required for r in interaction.user.roles)
+        return _member_has_role_id(interaction.user, self.bot.config.get("discord_required_role"))
 
     def _close_ds_draft(self, reason: str):
         """Fire-and-forget close of the ladder draft on the executor.
@@ -2569,7 +2585,7 @@ class ScrimCog(commands.Cog):
                                   right below it (see _ensure_region_message/_update_region_message)
       scrim_player_role        — role name given to the first 10 signed-up players
       scrim_player_role_2      — optional role name given to the next 10 (11-20) — second lobby
-      scrim_admin_role         — role name pinged when the queue is full
+      scrim_admin_role         — role ID gating /role and pinged when the queue is full
       scrim_min_players        — number of reactions that triggers the ping (default 8)
       scrim_reaction_emoji     — emoji to count (default ✅)
     """
@@ -3005,8 +3021,7 @@ class ScrimCog(commands.Cog):
         return int(self._cfg("scrim_min_players", 8))
 
     def _has_scrim_admin(self, interaction: discord.Interaction) -> bool:
-        role_name = self._cfg("scrim_admin_role", "")
-        return any(r.name == role_name for r in interaction.user.roles)
+        return _member_has_role_id(interaction.user, self._cfg("scrim_admin_role"))
 
     async def _acquire_role_lock_or_reject(self, interaction: discord.Interaction) -> bool:
         """Claim `self._role_lock` for /role add and /role remove, or reject
@@ -3199,8 +3214,8 @@ class ScrimCog(commands.Cog):
             guild = self.bot.get_guild(payload.guild_id)
             if guild is None:
                 return
-            admin_role = discord.utils.get(guild.roles, name=self._cfg("scrim_admin_role", ""))
-            mention = admin_role.mention if admin_role else f"@{self._cfg('scrim_admin_role')}"
+            admin_role_id = _role_id(self._cfg("scrim_admin_role"))
+            mention = f"<@&{admin_role_id}>" if admin_role_id else "@scrim admins"
 
             notify_ch = self.bot.get_channel(_AI_DIRECTOR_CHANNEL_ID)
             if notify_ch is None:
